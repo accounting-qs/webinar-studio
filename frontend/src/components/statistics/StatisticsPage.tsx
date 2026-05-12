@@ -827,11 +827,12 @@ export function StatisticsPage() {
    *    "—" cells for unloaded metrics.
    * 2. Drop future webinars (date > today, or today-but-not-yet-sent):
    *    they have no real data yet.
-   * 3. Stream the rest in date-desc order through a pool of CONCURRENCY
-   *    workers — each replaces its placeholder as it arrives. No priority
-   *    head: per-webinar fetches are I/O-bound and 30+s each, so running
-   *    one alone first just delays the rest of the page by that much. The
-   *    auto-expanded row is the first one the pool picks up anyway. */
+   * 3. Fetch the most-recently-passed webinar alone first, then resume the
+   *    pool for the rest. Per-webinar queries are ~30s each, so this adds
+   *    ~30s to total wall time — but it guarantees the latest webinar
+   *    (the auto-expanded row, the one you care about) populates before
+   *    older ones, instead of whichever happens to finish first on the
+   *    backend. */
   useEffect(() => {
     let cancelled = false;
     const CONCURRENCY = 4;
@@ -907,10 +908,16 @@ export function StatisticsPage() {
         }
       };
 
-      // Worker pool — all visible webinars fire in parallel from the start
-      // (subject to CONCURRENCY). The auto-expanded most-recently-passed
-      // webinar is at queue[0] so it's the first one a worker picks up.
-      const queue = [...summaries];
+      // Priority head: load the most-recently-passed webinar alone first
+      // so it always appears before older webinars on the page, regardless
+      // of which query happens to complete first on the backend.
+      if (summaries.length > 0) {
+        await loadOne(summaries[0].id, summaries[0].webinarId);
+        if (cancelled) return;
+      }
+
+      // Worker pool for the rest.
+      const queue = summaries.slice(1);
       const workers = Array.from(
         { length: Math.min(CONCURRENCY, queue.length) },
         async () => {
