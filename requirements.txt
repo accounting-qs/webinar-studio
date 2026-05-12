@@ -14,7 +14,7 @@ pydantic-settings==2.6.1
 httpx==0.28.1
 
 # Anthropic (Claude)
-anthropic==0.40.0
+anthropic==0.101.0
 
 # Deepgram
 deepgram-sdk==3.7.7

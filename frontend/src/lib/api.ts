@@ -1635,6 +1635,37 @@ export async function deleteOpenAiApiKey(): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete OpenAI API key");
 }
 
+/* ── Connectors: Anthropic (Claude chat) ───────────────────────────────── */
+
+export interface AnthropicCredentialStatus {
+  configured: boolean;
+  api_key_masked?: string | null;
+}
+
+export async function fetchAnthropicStatus(): Promise<AnthropicCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/anthropic`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch Anthropic status");
+  return res.json();
+}
+
+export async function saveAnthropicApiKey(api_key: string): Promise<AnthropicCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/anthropic`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ api_key }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to save Anthropic API key"));
+  return res.json();
+}
+
+export async function deleteAnthropicApiKey(): Promise<void> {
+  const res = await fetch(`${API_URL}/connectors/anthropic`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to delete Anthropic API key");
+}
+
 /* ── Connectors: GoHighLevel ───────────────────────────────────────────── */
 
 export interface GhlCredentialStatus {

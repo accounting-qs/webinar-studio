@@ -49,6 +49,7 @@ router = APIRouter(dependencies=[Depends(require_auth)])
 PROVIDER = "webinargeek"
 OPENAI_PROVIDER = "openai"
 GHL_PROVIDER = "ghl"
+ANTHROPIC_PROVIDER = "anthropic"
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +499,67 @@ async def set_openai_credential(body: SetCredentialRequest, db: AsyncSession = D
 @router.delete("/openai")
 async def delete_openai_credential(db: AsyncSession = Depends(get_db)):
     await db.execute(delete(ConnectorCredential).where(ConnectorCredential.provider == OPENAI_PROVIDER))
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Anthropic credentials (used by the Statistics chat assistant)
+# ---------------------------------------------------------------------------
+@router.get("/anthropic", response_model=CredentialStatus)
+async def get_anthropic_status(db: AsyncSession = Depends(get_db)):
+    """Status of the Anthropic credential. Single 'default' row — matches
+    the OpenAI pattern. Used by the chat assistant on the Statistics page."""
+    row = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.provider == ANTHROPIC_PROVIDER,
+            ConnectorCredential.name == "default",
+        )
+    )).scalar_one_or_none()
+    if not row:
+        return CredentialStatus(configured=False)
+    return CredentialStatus(configured=True, api_key_masked=_mask(row.api_key))
+
+
+@router.put("/anthropic", response_model=CredentialStatus)
+async def set_anthropic_credential(body: SetCredentialRequest, db: AsyncSession = Depends(get_db)):
+    api_key = body.api_key.strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    # Validate by making the cheapest possible Claude call. A 401/403 means
+    # the key is bad; any other error is a transient issue and we let it
+    # bubble so the user can retry rather than store a key we can't confirm.
+    try:
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        await client.models.list(limit=1)
+    except anthropic.AuthenticationError:
+        raise HTTPException(status_code=400, detail="Invalid Anthropic API key")
+    except anthropic.PermissionDeniedError:
+        raise HTTPException(status_code=400, detail="Anthropic API key lacks permission")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to verify key: {exc}")
+
+    stmt = pg_insert(ConnectorCredential).values(
+        provider=ANTHROPIC_PROVIDER,
+        name="default",
+        api_key=api_key,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["provider", "name"],
+        set_={"api_key": api_key, "updated_at": datetime.now(timezone.utc)},
+    )
+    await db.execute(stmt)
+    return CredentialStatus(configured=True, api_key_masked=_mask(api_key))
+
+
+@router.delete("/anthropic")
+async def delete_anthropic_credential(db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        delete(ConnectorCredential).where(
+            ConnectorCredential.provider == ANTHROPIC_PROVIDER,
+            ConnectorCredential.name == "default",
+        )
+    )
     return {"deleted": True}
 
 

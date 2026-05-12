@@ -21,6 +21,7 @@ import {
   isGroupBoundary,
   type MetricColumn,
 } from "./metricRegistry";
+import { ChatPanel } from "./ChatPanel";
 
 /* ─── Identity columns (pinned left side of table) ────────────────────── */
 
@@ -751,6 +752,10 @@ export function StatisticsPage() {
   const [infoModalCol, setInfoModalCol] = useState<MetricColumn | null>(null);
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  /** Statistics chat panel — slides in from the right. Conversation lives in
+   * the panel's own state; closing the panel does not clear it, but a page
+   * refresh does. */
+  const [chatOpen, setChatOpen] = useState(false);
 
   const toggleSort = (key: string) => {
     if (sortKey === key) {
@@ -1070,6 +1075,20 @@ export function StatisticsPage() {
               placeholder="Search webinars..."
               className="w-56 bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
             />
+            <button
+              onClick={() => setChatOpen((v) => !v)}
+              title="Ask the AI assistant about this data"
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors ${
+                chatOpen
+                  ? "bg-violet-600 text-white"
+                  : "bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 text-zinc-700 dark:text-zinc-300 hover:bg-violet-500/10 hover:text-violet-500 hover:border-violet-500/40"
+              }`}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+              </svg>
+              Ask AI
+            </button>
           </div>
         </div>
       </div>
@@ -1277,6 +1296,9 @@ export function StatisticsPage() {
       {infoModalCol && (
         <MetricInfoModal col={infoModalCol} onClose={() => setInfoModalCol(null)} />
       )}
+
+      {/* ── AI chat panel ──────────────────────────────────────────── */}
+      <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} webinars={webinars} />
     </div>
   );
 }
