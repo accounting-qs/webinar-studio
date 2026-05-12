@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { streamChat, type ChatTurn, type ChatUsage } from "@/lib/chat";
 import type { ApiStatisticsWebinar } from "@/lib/api";
 
@@ -22,11 +24,36 @@ interface Turn extends ChatTurn {
   usage?: ChatUsage;
 }
 
+// Panel width — operator-resizable via the left drag handle, persisted to
+// localStorage so it's stable across page loads.
+const WIDTH_STORAGE_KEY = "stats-chat-panel-width-px";
+const DEFAULT_WIDTH = 420;
+const MIN_WIDTH = 320;
+// Hard cap so the panel can't fully cover the table. Drag is also clamped
+// to 90% of viewport at drag time (handles narrow windows / window resize).
+const MAX_WIDTH = 1100;
+
+function readSavedWidth(): number {
+  if (typeof window === "undefined") return DEFAULT_WIDTH;
+  try {
+    const raw = window.localStorage.getItem(WIDTH_STORAGE_KEY);
+    const parsed = raw ? parseInt(raw, 10) : NaN;
+    if (Number.isFinite(parsed) && parsed >= MIN_WIDTH) {
+      return Math.min(parsed, MAX_WIDTH);
+    }
+  } catch {
+    /* localStorage blocked — fall back to default */
+  }
+  return DEFAULT_WIDTH;
+}
+
 export function ChatPanel({ open, onClose, webinars }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [width, setWidth] = useState<number>(readSavedWidth);
+  const [resizing, setResizing] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -44,6 +71,50 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
       setSending(false);
     }
   }, [open]);
+
+  // Persist width changes so it's stable across reloads. We write on every
+  // width change rather than only on drag-end because the drag itself
+  // already calls setWidth on every move — one write per drag is fine.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WIDTH_STORAGE_KEY, String(width));
+    } catch {
+      /* localStorage blocked — ignore */
+    }
+  }, [width]);
+
+  function startResize(e: React.MouseEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = width;
+    setResizing(true);
+
+    // Cap to 90% of the current viewport so the drag can't fully cover the
+    // table even on narrow windows. Recomputing at drag-start handles
+    // window resize between drags without extra resize listeners.
+    const cap = Math.min(MAX_WIDTH, Math.floor(window.innerWidth * 0.9));
+
+    function onMove(ev: MouseEvent) {
+      // Panel is anchored to the right; dragging left grows the width.
+      const delta = startX - ev.clientX;
+      const next = Math.min(cap, Math.max(MIN_WIDTH, startWidth + delta));
+      setWidth(next);
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      setResizing(false);
+    }
+
+    // While dragging, the cursor stays as col-resize even when it strays
+    // off the handle; suppress text selection so the body doesn't highlight.
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   async function handleSend() {
     const text = input.trim();
@@ -126,10 +197,32 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
 
   return (
     <aside
-      className="fixed top-0 right-0 bottom-0 z-40 w-[420px] max-w-[100vw] flex flex-col bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800/60 shadow-2xl"
+      className="fixed top-0 right-0 bottom-0 z-40 max-w-[100vw] flex flex-col bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800/60 shadow-2xl"
+      style={{ width: `${width}px` }}
       role="dialog"
       aria-label="Statistics chat assistant"
     >
+      {/* Drag-to-resize handle on the left edge. The 6px hit area is wider
+       * than the visible 2px line so the handle is easy to grab without
+       * being intrusive. Highlights on hover and during an active drag. */}
+      <div
+        onMouseDown={startResize}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize chat panel"
+        title="Drag to resize"
+        className={`absolute top-0 bottom-0 left-0 w-1.5 -ml-0.5 cursor-col-resize group z-50 ${
+          resizing ? "" : ""
+        }`}
+      >
+        <div
+          className={`absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-0.5 transition-colors ${
+            resizing
+              ? "bg-violet-500"
+              : "bg-transparent group-hover:bg-violet-500/60"
+          }`}
+        />
+      </div>
       {/* Header */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-zinc-200 dark:border-zinc-800/60">
         <div className="flex items-center gap-2">
@@ -238,14 +331,19 @@ function TurnBubble({ turn }: { turn: Turn }) {
   return (
     <div className={isUser ? "flex justify-end" : "flex justify-start"}>
       <div
-        className={`max-w-[88%] rounded-lg px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap break-words ${
+        className={`max-w-[88%] rounded-lg px-3 py-2 text-xs leading-relaxed break-words ${
           isUser
-            ? "bg-violet-600 text-white"
+            ? "bg-violet-600 text-white whitespace-pre-wrap"
             : "bg-zinc-100 dark:bg-zinc-800/60 text-zinc-800 dark:text-zinc-200"
         }`}
       >
-        {turn.content || (turn.streaming ? <StreamingDots /> : null)}
-        {turn.streaming && turn.content && <span className="inline-block w-1.5 h-3 ml-0.5 bg-zinc-500 animate-pulse align-middle" />}
+        {isUser ? (
+          turn.content
+        ) : turn.content ? (
+          <AssistantMarkdown text={turn.content} streaming={!!turn.streaming} />
+        ) : turn.streaming ? (
+          <StreamingDots />
+        ) : null}
         {turn.usage && (
           <div className="mt-1.5 text-[9px] opacity-60 font-mono">
             {turn.usage.cache_read_input_tokens > 0
@@ -254,6 +352,93 @@ function TurnBubble({ turn }: { turn: Turn }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ─── Assistant markdown renderer ─────────────────────────────────────
+ * The chat panel is narrow, so we tune typography for that:
+ * - small headings (no oversized h1/h2 that eats the bubble width)
+ * - tight list spacing
+ * - tables scroll horizontally inside the bubble
+ * - inline code highlighted; fenced code blocks wrap (no h-scroll line of
+ *   one giant SQL query that the operator can't see).
+ * GitHub-flavored markdown (tables, task lists, strikethrough) is enabled
+ * via remark-gfm — Claude routinely uses tables for comparisons. */
+function AssistantMarkdown({ text, streaming }: { text: string; streaming: boolean }) {
+  return (
+    <div className="chat-md">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => <h1 className="text-sm font-bold mt-2 mb-1 first:mt-0">{children}</h1>,
+          h2: ({ children }) => <h2 className="text-[13px] font-bold mt-2 mb-1 first:mt-0">{children}</h2>,
+          h3: ({ children }) => <h3 className="text-xs font-bold mt-2 mb-1 first:mt-0 uppercase tracking-wide text-zinc-600 dark:text-zinc-400">{children}</h3>,
+          p: ({ children }) => <p className="my-1.5 first:mt-0 last:mb-0">{children}</p>,
+          strong: ({ children }) => <strong className="font-semibold text-zinc-900 dark:text-zinc-100">{children}</strong>,
+          em: ({ children }) => <em className="italic">{children}</em>,
+          ul: ({ children }) => <ul className="list-disc pl-4 my-1.5 space-y-0.5 marker:text-zinc-400">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal pl-4 my-1.5 space-y-0.5 marker:text-zinc-400">{children}</ol>,
+          li: ({ children }) => <li className="pl-0.5">{children}</li>,
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-violet-500 hover:text-violet-400 underline underline-offset-2 decoration-violet-500/40"
+            >
+              {children}
+            </a>
+          ),
+          code: ({ className, children, ...rest }) => {
+            // react-markdown 10 doesn't expose `inline` on the props — we
+            // detect block code by the language- class set on fenced blocks.
+            const isBlock = /language-/.test(className || "");
+            if (isBlock) {
+              return (
+                <code className={`${className ?? ""} block`} {...rest}>
+                  {children}
+                </code>
+              );
+            }
+            return (
+              <code
+                className="px-1 py-0.5 rounded bg-zinc-200/70 dark:bg-zinc-900/80 text-[11px] font-mono text-zinc-800 dark:text-zinc-100 break-words"
+                {...rest}
+              >
+                {children}
+              </code>
+            );
+          },
+          pre: ({ children }) => (
+            <pre className="my-2 px-2.5 py-2 rounded-md bg-zinc-900 text-zinc-100 text-[11px] font-mono leading-relaxed whitespace-pre-wrap break-words overflow-x-auto">
+              {children}
+            </pre>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="my-2 pl-3 border-l-2 border-violet-500/40 text-zinc-600 dark:text-zinc-400 italic">
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div className="my-2 -mx-1 overflow-x-auto">
+              <table className="w-full text-[11px] border-collapse">{children}</table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="bg-zinc-200/50 dark:bg-zinc-900/60">{children}</thead>,
+          tr: ({ children }) => <tr className="border-b border-zinc-200 dark:border-zinc-800/60">{children}</tr>,
+          th: ({ children }) => <th className="px-2 py-1 text-left font-semibold text-zinc-700 dark:text-zinc-200">{children}</th>,
+          td: ({ children }) => <td className="px-2 py-1 align-top">{children}</td>,
+          hr: () => <hr className="my-3 border-zinc-300 dark:border-zinc-700/60" />,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+      {streaming && (
+        // Caret follows the last character; the inline-block + align-baseline
+        // keeps it on the final line rather than dropping to its own line.
+        <span className="inline-block w-1.5 h-3 ml-0.5 bg-zinc-500 animate-pulse align-baseline" aria-hidden />
+      )}
     </div>
   );
 }
