@@ -118,6 +118,40 @@ def _invite_response_regex(webinar_number: int, response: str) -> str:
     return rf"\ye{webinar_number}-{response}\y"
 
 
+async def _csv_mode_for_webinar(db: AsyncSession, webinar_id: str) -> bool:
+    """Return True when a completed Added-to-Calendar CSV with response data
+    exists for this webinar. When True, Yes/Maybe metrics source from
+    webinar_calendar_invites instead of parsing GHL response history regex."""
+    from sqlalchemy import text as sa_text
+    r = await db.execute(sa_text(
+        """
+        SELECT 1 FROM webinar_calendar_uploads
+        WHERE webinar_id = CAST(:wid AS uuid)
+          AND status = 'complete'
+          AND has_responses = TRUE
+        LIMIT 1
+        """
+    ).bindparams(wid=webinar_id))
+    return r.scalar() is not None
+
+
+def _csv_yes_maybe_ctes() -> str:
+    """CTE prefix yielding csv_yes(lem) and csv_maybe(lem) — lowercased emails.
+    Caller must bind :wid to the webinar id and prefix this to its SQL."""
+    return """
+        WITH csv_yes AS (
+            SELECT LOWER(email) AS lem FROM webinar_calendar_invites
+            WHERE webinar_id = CAST(:wid AS uuid)
+              AND LOWER(calendar_invite_response) = 'yes'
+        ),
+        csv_maybe AS (
+            SELECT LOWER(email) AS lem FROM webinar_calendar_invites
+            WHERE webinar_id = CAST(:wid AS uuid)
+              AND LOWER(calendar_invite_response) = 'maybe'
+        )
+    """
+
+
 def _webinar_series_regex(webinar_number: int) -> str:
     """PostgreSQL regex to find e{N} token in calendar_webinar_series_history.
 
@@ -651,8 +685,37 @@ class GoHighLevelStatisticsSource:
             relevant_window_pred = ""
             self_reg_filter = "FALSE"
 
+        # When an Added-to-Calendar CSV with responses exists for this
+        # webinar, NLD Yes/Maybe count CSV rows with matched_assignment_id
+        # IS NULL — emails that landed in the CSV but didn't match any list
+        # for this specific webinar_id. The unplanned/booked/lp_regs
+        # aggregates stay GHL-driven (those signals don't come from the
+        # CSV).
+        csv_mode_nld = await _csv_mode_for_webinar(db, wid)
+        if csv_mode_nld:
+            nld_yes_pred = "lem IN (SELECT lem FROM csv_yes)"
+            nld_maybe_pred = "lem IN (SELECT lem FROM csv_maybe)"
+            nld_csv_prefix = f"""
+                csv_yes AS (
+                    SELECT LOWER(email) AS lem FROM webinar_calendar_invites
+                    WHERE webinar_id = CAST(:wid AS uuid)
+                      AND LOWER(calendar_invite_response) = 'yes'
+                ),
+                csv_maybe AS (
+                    SELECT LOWER(email) AS lem FROM webinar_calendar_invites
+                    WHERE webinar_id = CAST(:wid AS uuid)
+                      AND LOWER(calendar_invite_response) = 'maybe'
+                ),
+            """
+            nld_params["wid"] = wid
+        else:
+            nld_yes_pred = "irh ~* :yes_re"
+            nld_maybe_pred = "irh ~* :maybe_re"
+            nld_csv_prefix = ""
+
         nld_counts_sql = f"""
             WITH
+            {nld_csv_prefix}
             relevant AS (
                 SELECT g.ghl_contact_id, LOWER(g.email) AS lem,
                        g.calendar_invite_response_history AS irh,
@@ -681,8 +744,8 @@ class GoHighLevelStatisticsSource:
             )
             SELECT
                 COUNT(DISTINCT ghl_contact_id)                          AS total_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE irh ~* :yes_re)   AS yes_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE irh ~* :maybe_re) AS maybe_unplanned,
+                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {nld_yes_pred})   AS yes_unplanned,
+                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {nld_maybe_pred}) AS maybe_unplanned,
                 COUNT(DISTINCT ghl_contact_id) FILTER (WHERE bcws = :N)        AS booked_unplanned,
                 COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {self_reg_filter}) AS lp_regs_unplanned
             FROM unplanned
@@ -694,10 +757,14 @@ class GoHighLevelStatisticsSource:
             if row else (0, 0, 0, 0, 0)
         )
 
+        # NLD contacts are *not* part of the invite pool — we didn't send
+        # them invites; they appeared via GHL signals or as unmatched CSV
+        # rows. Setting `invited` to None blanks the column in the table
+        # and zeroes-out the per-1k Yes/Maybe ratios that divide by it.
         nld_metrics: dict[str, float | None] = {
             "accountsNeeded": None,
-            "invited": total_u,
-            "actuallyUsed": None,  # not from our planning system → fallback to invited
+            "invited": None,
+            "actuallyUsed": None,
             "yesMarked": yes_u,
             "maybeMarked": maybe_u,
             "selfRegMarked": lp_regs_u,
@@ -808,16 +875,35 @@ class GoHighLevelStatisticsSource:
 
         has_window = bool(prev_date and current_date)
 
+        # When an Added-to-Calendar CSV with responses exists for this
+        # webinar, source Yes/Maybe from webinar_calendar_invites
+        # (calendar_invite_response = 'Yes'/'Maybe') instead of regex-parsing
+        # ghl_contact.calendar_invite_response_history. CSV is the primary
+        # source; the regex path remains as fallback when no CSV exists.
+        csv_mode = await _csv_mode_for_webinar(db, wid)
+        if csv_mode:
+            yes_pred = "LOWER(c.email) IN (SELECT lem FROM csv_yes)"
+            maybe_pred = "LOWER(c.email) IN (SELECT lem FROM csv_maybe)"
+            csv_cte_prefix = _csv_yes_maybe_ctes()
+        else:
+            yes_pred = "g.calendar_invite_response_history ~* :yes_re"
+            maybe_pred = "g.calendar_invite_response_history ~* :maybe_re"
+            csv_cte_prefix = ""
+
         # ── Batch A: ghl_contact-only counts (one scan of the planned join) ─
         # Includes yes/maybe marked, gcal invited, yes/maybe bookings,
         # self-reg, self-reg bookings, unsubscribes.
+        # In CSV mode the SQL doesn't reference :yes_re/:maybe_re — and
+        # SQLAlchemy's text() rejects bind params that aren't in the SQL —
+        # so they're only added when the regex fallback is active.
         ghl_params: dict[str, Any] = {
             "wid": wid,
-            "yes_re": yes_re,
-            "maybe_re": maybe_re,
             "series_re": series_re,
             "N": N,
         }
+        if not csv_mode:
+            ghl_params["yes_re"] = yes_re
+            ghl_params["maybe_re"] = maybe_re
         window_filter_marker = "FALSE"
         if has_window:
             ghl_params["sr_start"] = prev_date
@@ -827,13 +913,14 @@ class GoHighLevelStatisticsSource:
         else:
             unsub_filter = "FALSE"
         ghl_sql = f"""
+            {csv_cte_prefix}
             SELECT
                 c.assignment_id,
-                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_invite_response_history ~* :yes_re) AS yes_marked,
-                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_invite_response_history ~* :maybe_re) AS maybe_marked,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {yes_pred}) AS yes_marked,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {maybe_pred}) AS maybe_marked,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_webinar_series_history ~* :series_re) AS gcal_invited_ghl,
-                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_invite_response_history ~* :yes_re AND g.booked_call_webinar_series = :N) AS yes_bookings,
-                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_invite_response_history ~* :maybe_re AND g.booked_call_webinar_series = :N) AS maybe_bookings,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {yes_pred} AND g.booked_call_webinar_series = :N) AS yes_bookings,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {maybe_pred} AND g.booked_call_webinar_series = :N) AS maybe_bookings,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {window_filter_marker}) AS self_reg_marked,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE ({window_filter_marker}) AND g.booked_call_webinar_series = :N) AS self_reg_bookings,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {unsub_filter}) AS unsubscribes
@@ -868,14 +955,16 @@ class GoHighLevelStatisticsSource:
             wg_params: dict[str, Any] = {
                 "wid": wid,
                 "bid": broadcast_id,
-                "yes_re": yes_re,
-                "maybe_re": maybe_re,
             }
+            if not csv_mode:
+                wg_params["yes_re"] = yes_re
+                wg_params["maybe_re"] = maybe_re
             if has_window:
                 wg_params["sr_start"] = prev_date
                 wg_params["sr_end"] = current_date
 
             wg_sql = f"""
+                {csv_cte_prefix}
                 SELECT
                     c.assignment_id,
                     COUNT(DISTINCT LOWER(c.email)) AS total_regs,
@@ -883,12 +972,12 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10) AS total_10m,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30) AS total_30m,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.has_sms_click_tag = TRUE) AS sms_attended,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re) AS yes_attended,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re AND wgs.minutes_viewing >= 10) AS yes_10m,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re AND g.has_sms_click_tag = TRUE) AS yes_sms,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re) AS maybe_attended,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re AND wgs.minutes_viewing >= 10) AS maybe_10m,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re AND g.has_sms_click_tag = TRUE) AS maybe_sms,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred}) AS yes_attended,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred} AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred} AND g.has_sms_click_tag = TRUE) AS yes_sms,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred}) AS maybe_attended,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM contacts c
@@ -1058,12 +1147,28 @@ class GoHighLevelStatisticsSource:
         maybe_re = _invite_response_regex(N, "Maybe")
         has_window = bool(prev_date and current_date)
 
+        # CSV-source Yes/Maybe takes precedence over GHL regex when a
+        # complete Added-to-Calendar upload with responses exists for this
+        # webinar (see _csv_mode_for_webinar). At the aggregate path the
+        # email reference is g.email (no contacts join here).
+        csv_mode = await _csv_mode_for_webinar(db, w.id)
+        if csv_mode:
+            yes_pred = "LOWER(g.email) IN (SELECT lem FROM csv_yes)"
+            maybe_pred = "LOWER(g.email) IN (SELECT lem FROM csv_maybe)"
+            csv_cte_prefix = _csv_yes_maybe_ctes()
+        else:
+            yes_pred = "g.calendar_invite_response_history ~* :yes_re"
+            maybe_pred = "g.calendar_invite_response_history ~* :maybe_re"
+            csv_cte_prefix = ""
+
         # ── Batch A: ghl_contact-only counts (one scan) ──────────────────
-        ghl_params: dict[str, Any] = {
-            "yes_re": yes_re,
-            "maybe_re": maybe_re,
-            "N": N,
-        }
+        # See per-list note: only bind :yes_re/:maybe_re in fallback mode.
+        ghl_params: dict[str, Any] = {"N": N}
+        if csv_mode:
+            ghl_params["wid"] = w.id
+        else:
+            ghl_params["yes_re"] = yes_re
+            ghl_params["maybe_re"] = maybe_re
         if has_window:
             ghl_params["sr_start"] = prev_date
             ghl_params["sr_end"] = current_date
@@ -1073,11 +1178,12 @@ class GoHighLevelStatisticsSource:
             window_filter = "FALSE"
             unsub_filter = "FALSE"
         ghl_sql = f"""
+            {csv_cte_prefix}
             SELECT
-                COUNT(g.ghl_contact_id) FILTER (WHERE g.calendar_invite_response_history ~* :yes_re) AS yes_marked,
-                COUNT(g.ghl_contact_id) FILTER (WHERE g.calendar_invite_response_history ~* :maybe_re) AS maybe_marked,
-                COUNT(g.ghl_contact_id) FILTER (WHERE g.calendar_invite_response_history ~* :yes_re AND g.booked_call_webinar_series = :N) AS yes_bookings,
-                COUNT(g.ghl_contact_id) FILTER (WHERE g.calendar_invite_response_history ~* :maybe_re AND g.booked_call_webinar_series = :N) AS maybe_bookings,
+                COUNT(g.ghl_contact_id) FILTER (WHERE {yes_pred}) AS yes_marked,
+                COUNT(g.ghl_contact_id) FILTER (WHERE {maybe_pred}) AS maybe_marked,
+                COUNT(g.ghl_contact_id) FILTER (WHERE {yes_pred} AND g.booked_call_webinar_series = :N) AS yes_bookings,
+                COUNT(g.ghl_contact_id) FILTER (WHERE {maybe_pred} AND g.booked_call_webinar_series = :N) AS maybe_bookings,
                 COUNT(g.ghl_contact_id) FILTER (WHERE {window_filter}) AS self_reg_marked,
                 COUNT(g.ghl_contact_id) FILTER (WHERE ({window_filter}) AND g.booked_call_webinar_series = :N) AS self_reg_bookings,
                 COUNT(g.ghl_contact_id) FILTER (WHERE {unsub_filter}) AS unsubscribes
@@ -1103,28 +1209,40 @@ class GoHighLevelStatisticsSource:
         if broadcast_id:
             ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
             wg_window_filter = window_filter if has_window else "FALSE"
-            wg_params: dict[str, Any] = {
-                "bid": broadcast_id,
-                "yes_re": yes_re,
-                "maybe_re": maybe_re,
-            }
+            wg_params: dict[str, Any] = {"bid": broadcast_id}
+            if csv_mode:
+                wg_params["wid"] = w.id
+            else:
+                wg_params["yes_re"] = yes_re
+                wg_params["maybe_re"] = maybe_re
             if has_window:
                 wg_params["sr_start"] = prev_date
                 wg_params["sr_end"] = current_date
 
+            # In CSV mode, predicates resolve via the csv_yes/csv_maybe CTEs;
+            # rows are matched on LOWER(wgs.email) since not every WG
+            # attendee has a ghl_contact row (LEFT JOIN below).
+            if csv_mode:
+                yes_pred_wg = "LOWER(wgs.email) IN (SELECT lem FROM csv_yes)"
+                maybe_pred_wg = "LOWER(wgs.email) IN (SELECT lem FROM csv_maybe)"
+            else:
+                yes_pred_wg = "g.calendar_invite_response_history ~* :yes_re"
+                maybe_pred_wg = "g.calendar_invite_response_history ~* :maybe_re"
+
             wg_sql = f"""
+                {csv_cte_prefix}
                 SELECT
                     COUNT(*) AS total_regs,
                     COUNT(*) FILTER (WHERE {ATT}) AS total_attended,
                     COUNT(*) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10) AS total_10m,
                     COUNT(*) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30) AS total_30m,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.has_sms_click_tag = TRUE) AS sms_attended,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re) AS yes_attended,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re AND wgs.minutes_viewing >= 10) AS yes_10m,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :yes_re AND g.has_sms_click_tag = TRUE) AS yes_sms,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re) AS maybe_attended,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re AND wgs.minutes_viewing >= 10) AS maybe_10m,
-                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.calendar_invite_response_history ~* :maybe_re AND g.has_sms_click_tag = TRUE) AS maybe_sms,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg}) AS yes_attended,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg} AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg} AND g.has_sms_click_tag = TRUE) AS yes_sms,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg}) AS maybe_attended,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
