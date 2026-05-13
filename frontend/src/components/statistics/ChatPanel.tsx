@@ -47,8 +47,28 @@ function readSavedWidth(): number {
   return DEFAULT_WIDTH;
 }
 
+// Conversation persistence — survives both panel close/reopen (component
+// unmount) and full page reloads. The `streaming` flag is stripped on save
+// since any half-streamed turn is stale by the next mount.
+const TURNS_STORAGE_KEY = "stats-chat-panel-turns";
+
+function readSavedTurns(): Turn[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(TURNS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((t) => t && (t.role === "user" || t.role === "assistant") && typeof t.content === "string")
+      .map((t): Turn => ({ role: t.role, content: t.content, usage: t.usage }));
+  } catch {
+    return [];
+  }
+}
+
 export function ChatPanel({ open, onClose, webinars }: Props) {
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const [turns, setTurns] = useState<Turn[]>(readSavedTurns);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +76,19 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
   const [resizing, setResizing] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Persist the conversation on every change so closing/reopening the panel
+  // — or refreshing the whole page — keeps it. We strip the transient
+  // `streaming` flag before writing; a partially-streamed message is just
+  // saved as its current text and the in-flight stream is aborted on unmount.
+  useEffect(() => {
+    try {
+      const stripped = turns.map((t) => ({ role: t.role, content: t.content, usage: t.usage }));
+      window.localStorage.setItem(TURNS_STORAGE_KEY, JSON.stringify(stripped));
+    } catch {
+      /* quota exceeded or storage blocked — drop silently */
+    }
+  }, [turns]);
 
   // Auto-scroll to the latest message as text streams in.
   useEffect(() => {
@@ -188,16 +221,27 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
   }
 
   function handleReset() {
+    if (!confirm("Clear this conversation? The webinar data on the page stays.")) return;
     if (abortRef.current) abortRef.current.abort();
     setTurns([]);
     setError(null);
+    // The turns effect will also write [] — but be explicit so the storage
+    // entry doesn't outlive the cleared state if the effect is skipped.
+    try {
+      window.localStorage.removeItem(TURNS_STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
   }
 
   if (!open) return null;
 
   return (
+    // top-12 matches TopNav's h-12 (48px) so the panel sits flush under the
+    // app header instead of being clipped behind it (the nav has z-50 and
+    // would otherwise cover the panel's own header controls).
     <aside
-      className="fixed top-0 right-0 bottom-0 z-40 max-w-[100vw] flex flex-col bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800/60 shadow-2xl"
+      className="fixed top-12 right-0 bottom-0 z-40 max-w-[100vw] flex flex-col bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800/60 shadow-2xl"
       style={{ width: `${width}px` }}
       role="dialog"
       aria-label="Statistics chat assistant"
@@ -240,21 +284,24 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
           {turns.length > 0 && (
             <button
               onClick={handleReset}
-              title="Clear conversation"
-              className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800/60 text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors"
+              title="Clear conversation — wipes saved history"
+              className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800/60 text-zinc-500 hover:text-red-500 transition-colors"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v6h6M20 20v-6h-6M4 10a8 8 0 0114-3M20 14a8 8 0 01-14 3" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a2 2 0 012-2h2a2 2 0 012 2v3" />
               </svg>
             </button>
           )}
           <button
             onClick={onClose}
-            title="Close (Esc)"
+            title="Minimize (conversation kept — reopen to continue)"
             className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800/60 text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors"
           >
+            {/* Chevron pointing right — visually "tucks the panel to the
+                edge", reads as collapse/minimize rather than destructive
+                close. The conversation is preserved across this. */}
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
             </svg>
           </button>
         </div>
@@ -275,7 +322,7 @@ export function ChatPanel({ open, onClose, webinars }: Props) {
               <li>· Which lists or senders are underperforming?</li>
             </ul>
             <p className="mt-3 text-[10px] text-zinc-400">
-              The assistant only sees the webinars currently loaded on this page. Conversations are not saved — refreshing the page starts fresh.
+              The assistant only sees the webinars currently loaded on this page. Conversations are saved in your browser; minimize anytime and pick up where you left off. Use the trash icon to clear.
             </p>
           </div>
         )}
