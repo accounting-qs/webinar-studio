@@ -28,14 +28,15 @@ import { ChatPanel } from "./ChatPanel";
 const IDENTITY_COL_COUNT = 8; // expand, webinar#, status, note, description, copy, url, sendInfo
 
 /* ─── Sticky identity columns ─────────────────────────────────────────────
- * Description, Copy, URL, and Send Info stay visible while the wide metric
- * band scrolls horizontally. Each column is a fixed width; left offsets
- * are cumulative so they line up as a single frozen panel:
- *   Description: 240px wide  @ left-0
- *   Copy:        260px wide  @ left-[240px]
- *   URL:          32px wide  @ left-[500px]
- *   Send Info:   120px wide  @ left-[532px]
- *   (total sticky pane: 652px)
+ * Webinar #, Description, Copy, URL, and Send Info stay visible while the
+ * wide metric band scrolls horizontally. Each column is a fixed width; left
+ * offsets are cumulative so they line up as a single frozen panel:
+ *   Webinar #:   200px wide  @ left-0
+ *   Description: 240px wide  @ left-[200px]
+ *   Copy:        260px wide  @ left-[440px]
+ *   URL:          32px wide  @ left-[700px]
+ *   Send Info:   120px wide  @ left-[732px]
+ *   (total sticky pane: 852px)
  * Each row type gets its own background so scrolling content doesn't
  * bleed through the sticky cells. */
 
@@ -51,36 +52,43 @@ const BG_LIST = "bg-white dark:bg-zinc-950";
 const BG_SPECIAL = "bg-zinc-50 dark:bg-zinc-900";
 
 // Sticky left offsets — full class strings so Tailwind can pick them up
-const L_DESC = "sticky left-0";
-const L_COPY = "sticky left-[240px]";
-const L_URL = "sticky left-[500px]";
-const L_SEND = "sticky left-[532px]";
+const L_NUM = "sticky left-0";
+const L_DESC = "sticky left-[200px]";
+const L_COPY = "sticky left-[440px]";
+const L_URL = "sticky left-[700px]";
+const L_SEND = "sticky left-[732px]";
 
 // Fixed widths — use w-[] to lock each sticky column
+const W_NUM = "w-[200px] min-w-[200px] max-w-[200px]";
 const W_DESC = "w-[240px] min-w-[240px] max-w-[240px]";
 const W_COPY = "w-[260px] min-w-[260px] max-w-[260px]";
 const W_URL = "w-[32px] min-w-[32px] max-w-[32px]";
 const W_SEND = "w-[120px] min-w-[120px] max-w-[120px]";
 
 // Composite classes (left + z + bg) per row type / column
+const sNumH = `${L_NUM} ${Z_HEADER} ${BG_HEADER}`;
 const sDescH = `${L_DESC} ${Z_HEADER} ${BG_HEADER}`;
 const sCopyH = `${L_COPY} ${Z_HEADER} ${BG_HEADER}`;
 const sUrlH = `${L_URL} ${Z_HEADER} ${BG_HEADER}`;
 const sSendH = `${L_SEND} ${Z_HEADER} ${BG_HEADER}`;
 
+const sNumP = `${L_NUM} ${Z_ROW} ${BG_PARENT}`;
 const sDescP = `${L_DESC} ${Z_ROW} ${BG_PARENT}`;
 // (parent-row's colSpan={4} cell spans Desc+Copy+URL+Send, one sticky cell)
 
+const sNumG = `${L_NUM} ${Z_ROW} ${BG_GROUP}`;
 const sDescG = `${L_DESC} ${Z_ROW} ${BG_GROUP}`;
 const sCopyG = `${L_COPY} ${Z_ROW} ${BG_GROUP}`;
 const sUrlG = `${L_URL} ${Z_ROW} ${BG_GROUP}`;
 const sSendG = `${L_SEND} ${Z_ROW} ${BG_GROUP}`;
 
+const sNumL = `${L_NUM} ${Z_ROW} ${BG_LIST}`;
 const sDescL = `${L_DESC} ${Z_ROW} ${BG_LIST}`;
 const sCopyL = `${L_COPY} ${Z_ROW} ${BG_LIST}`;
 const sUrlL = `${L_URL} ${Z_ROW} ${BG_LIST}`;
 const sSendL = `${L_SEND} ${Z_ROW} ${BG_LIST}`;
 
+const sNumSp = `${L_NUM} ${Z_ROW} ${BG_SPECIAL}`;
 const sDescSp = `${L_DESC} ${Z_ROW} ${BG_SPECIAL}`;
 const sCopySp = `${L_COPY} ${Z_ROW} ${BG_SPECIAL}`;
 const sUrlSp = `${L_URL} ${Z_ROW} ${BG_SPECIAL}`;
@@ -547,6 +555,7 @@ function renderGroupedRows(
 
   const renderListRow = (row: ApiStatisticsRow) => {
     const isSpecial = row.kind !== "list";
+    const num = isSpecial ? sNumSp : sNumL;
     const desc = isSpecial ? sDescSp : sDescL;
     const copy = isSpecial ? sCopySp : sCopyL;
     const url = isSpecial ? sUrlSp : sUrlL;
@@ -561,7 +570,7 @@ function renderGroupedRows(
       }`}
     >
       <td className="px-2 py-1.5"></td>
-      <td className="px-2 py-1.5"></td>
+      <td className={`px-2 py-1.5 ${W_NUM} ${num}`}></td>
       <td className="px-2 py-1.5">
         {!isSpecial && <StatusBadge status={row.status} />}
       </td>
@@ -652,7 +661,7 @@ function renderGroupedRows(
             <path d="M9 18l6-6-6-6"/>
           </svg>
         </td>
-        <td className="px-2 py-2"></td>
+        <td className={`px-2 py-2 ${W_NUM} ${sNumG}`}></td>
         <td className="px-2 py-2"></td>
         <td className="px-2 py-2"></td>
         <td className={`px-2 py-2 ${W_DESC} ${sDescG}`}>
@@ -752,6 +761,10 @@ export function StatisticsPage() {
   const [infoModalCol, setInfoModalCol] = useState<MetricColumn | null>(null);
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  /** Sender filter — empty string means "all senders". When set, only list
+   * rows whose sendInfo equals this value are shown, special rows (Nonjoiners /
+   * NO LIST DATA) are hidden, and webinars with no matching rows drop out. */
+  const [senderFilter, setSenderFilter] = useState<string>("");
   /** Statistics chat panel — slides in from the right. Conversation lives in
    * the panel's own state; closing the panel does not clear it, but a page
    * refresh does. */
@@ -941,23 +954,58 @@ export function StatisticsPage() {
     return () => { cancelled = true; };
   }, []);
 
-  /* ── Search filter ──────────────────────────────────────────────── */
+  /* ── Unique senders (for the filter dropdown) ──────────────────── */
+  const allSenders = useMemo(() => {
+    const seen = new Map<string, string | null>();
+    for (const w of webinars) {
+      for (const r of w.rows) {
+        if (r.sendInfo && !seen.has(r.sendInfo)) {
+          seen.set(r.sendInfo, r.senderColor);
+        }
+      }
+    }
+    return Array.from(seen.entries())
+      .map(([name, color]) => ({ name, color }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [webinars]);
+
+  /* ── Search + sender filter ────────────────────────────────────── */
   const filteredWebinars = useMemo(() => {
-    if (!searchQuery.trim()) return webinars;
-    const q = searchQuery.toLowerCase();
-    return webinars.filter((w) => {
-      if (String(w.number).includes(q)) return true;
-      if (w.variantLabel?.toLowerCase().includes(q)) return true;
-      if (w.title?.toLowerCase().includes(q)) return true;
-      if (w.date?.toLowerCase().includes(q)) return true;
-      return w.rows.some(
-        (r) =>
-          r.description?.toLowerCase().includes(q) ||
-          r.note?.toLowerCase().includes(q) ||
-          r.sendInfo?.toLowerCase().includes(q)
-      );
-    });
-  }, [webinars, searchQuery]);
+    let list = webinars;
+    if (senderFilter) {
+      list = list
+        .map((w) => ({
+          ...w,
+          rows: w.rows.filter((r) => r.kind === "list" && r.sendInfo === senderFilter),
+        }))
+        .filter((w) => w.rows.length > 0);
+    }
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter((w) => {
+        if (String(w.number).includes(q)) return true;
+        if (w.variantLabel?.toLowerCase().includes(q)) return true;
+        if (w.title?.toLowerCase().includes(q)) return true;
+        if (w.date?.toLowerCase().includes(q)) return true;
+        return w.rows.some(
+          (r) =>
+            r.description?.toLowerCase().includes(q) ||
+            r.note?.toLowerCase().includes(q) ||
+            r.sendInfo?.toLowerCase().includes(q)
+        );
+      });
+    }
+    return list;
+  }, [webinars, searchQuery, senderFilter]);
+
+  /** When a sender filter is active, force-expand every matching webinar so
+   * the user immediately sees the filtered lists (otherwise the filter looks
+   * like it did nothing on collapsed rows). Plain `expandedIds` is preserved
+   * for when the filter is cleared. */
+  const effectiveExpandedIds = useMemo(() => {
+    if (!senderFilter) return expandedIds;
+    return new Set(filteredWebinars.map((w) => w.id));
+  }, [senderFilter, expandedIds, filteredWebinars]);
 
   /* ── Global summary stats ───────────────────────────────────────── */
   const globalStats = useMemo(() => {
@@ -1071,6 +1119,44 @@ export function StatisticsPage() {
                 )}
               </div>
             )}
+            {allSenders.length > 0 && (
+              <div className="flex items-center gap-1.5">
+                <select
+                  value={senderFilter}
+                  onChange={(e) => setSenderFilter(e.target.value)}
+                  title="Show only lists for a single sender"
+                  className="bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-2 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 max-w-[200px]"
+                  style={
+                    senderFilter
+                      ? {
+                          color: allSenders.find((s) => s.name === senderFilter)?.color ?? undefined,
+                          borderColor: allSenders.find((s) => s.name === senderFilter)?.color ?? undefined,
+                        }
+                      : undefined
+                  }
+                >
+                  <option value="">All senders</option>
+                  {allSenders.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+                {senderFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setSenderFilter("")}
+                    title="Clear sender filter"
+                    className="text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors p-1"
+                    aria-label="Clear sender filter"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            )}
             <input
               type="text"
               value={searchQuery}
@@ -1102,7 +1188,7 @@ export function StatisticsPage() {
           <thead className="sticky top-0 z-30">
             {/* Row 1: Group spans */}
             <tr className="bg-zinc-50 dark:bg-zinc-900/90 border-b border-zinc-100 dark:border-zinc-800/20">
-              <th colSpan={IDENTITY_COL_COUNT} className={`px-2 py-1 ${L_DESC} ${Z_HEADER} ${BG_HEADER}`}></th>
+              <th colSpan={IDENTITY_COL_COUNT} className={`px-2 py-1 ${L_NUM} ${Z_HEADER} ${BG_HEADER}`}></th>
               {METRIC_GROUPS.map((g) => (
                 <th
                   key={g}
@@ -1116,7 +1202,7 @@ export function StatisticsPage() {
             {/* Row 2: Individual column labels */}
             <tr className="bg-zinc-50 dark:bg-zinc-900/90 border-b border-zinc-200 dark:border-zinc-800/40">
               <th className="w-8 px-2 py-2"></th>
-              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[140px]">Webinar #</th>
+              <th className={`text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] ${W_NUM} ${sNumH}`}>Webinar #</th>
               <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Status</th>
               <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[120px]">Note</th>
               <th className={`text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] ${W_DESC} ${sDescH}`}>Description</th>
@@ -1167,7 +1253,7 @@ export function StatisticsPage() {
           </thead>
 
           {filteredWebinars.map((w) => {
-            const isExpanded = expandedIds.has(w.id);
+            const isExpanded = effectiveExpandedIds.has(w.id);
             const isLoading = loadingIds.has(w.id);
             const summary = summariesById.get(w.id);
             // Use rows[] when loaded; fall back to the lightweight summary
@@ -1193,7 +1279,7 @@ export function StatisticsPage() {
                       <path d="M9 18l6-6-6-6" />
                     </svg>
                   </td>
-                  <td className="px-2 py-2.5">
+                  <td className={`px-2 py-2.5 ${W_NUM} ${sNumP}`}>
                     <div className="flex items-center gap-2">
                       <span className="text-zinc-900 dark:text-zinc-100 font-bold text-sm">{w.number}</span>
                       {w.variantLabel && (
@@ -1286,7 +1372,11 @@ export function StatisticsPage() {
       {/* ── Empty state ────────────────────────────────────────────── */}
       {!loading && filteredWebinars.length === 0 && (
         <div className="text-center py-20 text-zinc-500">
-          {searchQuery ? "No webinars match your search." : "No statistics data available."}
+          {senderFilter
+            ? `No lists from ${senderFilter}${searchQuery ? " match your search" : ""}.`
+            : searchQuery
+            ? "No webinars match your search."
+            : "No statistics data available."}
         </div>
       )}
 
