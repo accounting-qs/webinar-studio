@@ -553,7 +553,7 @@ export function PlanningPage() {
   const [wgCredentials, setWgCredentials] = useState<ApiWgCredential[]>([]);
 
   // Edit Webinar modal state
-  const [editWebinar, setEditWebinar] = useState<{ id: string; number: number; date: string; broadcastId: string; status: string; registrationLink: string; unsubscribeLink: string } | null>(null);
+  const [editWebinar, setEditWebinar] = useState<{ id: string; number: number; date: string; broadcastId: string; status: string; registrationLink: string; unsubscribeLink: string; variantLabel: string } | null>(null);
 
   // Assignment form state — scoped to one webinar at a time
   const [assigningWebinarId, setAssigningWebinarId] = useState<string | null>(null);
@@ -677,7 +677,7 @@ export function PlanningPage() {
     }
   };
 
-  const handleUpdateWebinar = async (webinarId: string, field: "main_title" | "broadcast_id" | "status" | "number" | "date" | "registration_link" | "unsubscribe_link", value: string | number) => {
+  const handleUpdateWebinar = async (webinarId: string, field: "main_title" | "broadcast_id" | "status" | "number" | "date" | "registration_link" | "unsubscribe_link" | "variant_label", value: string | number | null) => {
     // Optimistic update
     setWebinars((prev) => prev.map((w) => {
       if (w.id !== webinarId) return w;
@@ -687,6 +687,7 @@ export function PlanningPage() {
       if (field === "unsubscribe_link") return { ...w, unsubscribeLink: value as string };
       if (field === "status") return { ...w, status: (value as string).charAt(0).toUpperCase() + (value as string).slice(1) };
       if (field === "number") return { ...w, number: value as number };
+      if (field === "variant_label") return { ...w, variantLabel: (value as string | null) || null };
       if (field === "date") {
         const d = new Date((value as string) + "T00:00:00");
         return { ...w, date: d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }) };
@@ -1743,6 +1744,7 @@ export function PlanningPage() {
                                 status: w.status.toLowerCase(),
                                 registrationLink: w.registrationLink,
                                 unsubscribeLink: w.unsubscribeLink,
+                                variantLabel: w.variantLabel ?? "",
                               });
                             }} className="p-0.5 rounded hover:bg-zinc-200 dark:hover:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors" title="Edit webinar">
                               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
@@ -2918,6 +2920,16 @@ export function PlanningPage() {
                   className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors [color-scheme:dark] cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-70 [&::-webkit-calendar-picker-indicator]:invert [&::-webkit-calendar-picker-indicator]:cursor-pointer" />
               </div>
               <div>
+                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5 flex items-center gap-2">
+                  Variant Label
+                  <span className="text-zinc-500 normal-case font-normal">(optional for a single webinar; required for A/B variants)</span>
+                </label>
+                <input type="text" value={editWebinar.variantLabel}
+                  onChange={(e) => setEditWebinar({ ...editWebinar, variantLabel: e.target.value })}
+                  placeholder='e.g. "Account A" / "WG-Skarpe"'
+                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
+              </div>
+              <div>
                 <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Broadcast ID</label>
                 <input type="text" value={editWebinar.broadcastId}
                   onChange={(e) => setEditWebinar({ ...editWebinar, broadcastId: e.target.value })}
@@ -2970,6 +2982,10 @@ export function PlanningPage() {
                   if (ew.registrationLink !== w.registrationLink) await handleUpdateWebinar(ew.id, "registration_link", ew.registrationLink);
                   if (ew.unsubscribeLink !== w.unsubscribeLink) await handleUpdateWebinar(ew.id, "unsubscribe_link", ew.unsubscribeLink);
                   if (ew.status !== w.status.toLowerCase()) await handleUpdateWebinar(ew.id, "status", ew.status);
+                  const trimmedLabel = ew.variantLabel.trim();
+                  if (trimmedLabel !== (w.variantLabel ?? "")) {
+                    await handleUpdateWebinar(ew.id, "variant_label", trimmedLabel || null);
+                  }
                   setEditWebinar(null);
                 }}
                 disabled={!editWebinar.number || !editWebinar.date}
