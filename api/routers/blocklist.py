@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Chunk size for bulk INSERT ... ON CONFLICT. Postgres caps a single
+# statement at 32,767 bind parameters; with 5 cols per blocklist row,
+# 1000 rows = 5000 params, well under the limit. Matches the batch
+# size used by services/ghl_sync.py.
+_BACKFILL_CHUNK_SIZE = 1000
+
+
+async def _chunked_blocklist_upsert(db: AsyncSession, payload: list[dict]) -> int:
+    added = 0
+    for i in range(0, len(payload), _BACKFILL_CHUNK_SIZE):
+        chunk = payload[i : i + _BACKFILL_CHUNK_SIZE]
+        stmt = pg_insert(BlocklistEntry).values(chunk).on_conflict_do_nothing(
+            index_elements=["user_id", "email"]
+        )
+        result = await db.execute(stmt)
+        added += result.rowcount or 0
+    return added
+
 
 class BlocklistAddRequest(BaseModel):
     email: str
@@ -201,11 +219,7 @@ async def backfill_blocklist(
             "source_ref": sub_id,
         })
     if wg_payload:
-        stmt = pg_insert(BlocklistEntry).values(wg_payload).on_conflict_do_nothing(
-            index_elements=["user_id", "email"]
-        )
-        result = await db.execute(stmt)
-        added_wg = result.rowcount or 0
+        added_wg = await _chunked_blocklist_upsert(db, wg_payload)
 
     # GHL cold-calendar unsubscribes
     ghl_rows = (await db.execute(
@@ -230,11 +244,7 @@ async def backfill_blocklist(
             "source_ref": contact_id,
         })
     if ghl_payload:
-        stmt = pg_insert(BlocklistEntry).values(ghl_payload).on_conflict_do_nothing(
-            index_elements=["user_id", "email"]
-        )
-        result = await db.execute(stmt)
-        added_ghl = result.rowcount or 0
+        added_ghl = await _chunked_blocklist_upsert(db, ghl_payload)
 
     return {
         "wg_scanned": len(wg_rows),
