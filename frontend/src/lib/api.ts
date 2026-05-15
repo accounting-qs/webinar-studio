@@ -1883,6 +1883,8 @@ export interface ApiCalendarUpload {
   id: string;
   webinar_id: string;
   webinar_label: string | null;
+  sender_id: string | null;
+  sender_name: string | null;
   file_name: string;
   status: string;
   progress: number;
@@ -1916,11 +1918,17 @@ export async function presignCalendarUpload(
   filename: string,
   fileSize: number,
   webinarId: string,
+  senderId?: string | null,
 ): Promise<{ upload_id: string; signed_url: string; storage_path: string }> {
   const res = await fetch(`${API_URL}/calendar-uploads/presign`, {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ filename, file_size: fileSize, webinar_id: webinarId }),
+    body: JSON.stringify({
+      filename,
+      file_size: fileSize,
+      webinar_id: webinarId,
+      sender_id: senderId ?? null,
+    }),
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to get signed URL"));
   return res.json();
@@ -2009,10 +2017,21 @@ export interface ApiAccountHealthRow {
   per_webinar: Record<string, ApiAccountHealthCell>;
 }
 
+export interface ApiAccountHealthSender {
+  id: string;
+  name: string;
+  color: string | null;
+}
+
 export interface CalendarAccountHealthResponse {
   webinars: ApiAccountHealthWebinar[];
   accounts: ApiAccountHealthRow[];
   totals: Record<string, ApiAccountHealthCell>;
+  senders: ApiAccountHealthSender[];
+  /** sender_map[webinar_id][calendar_account] = sender_id */
+  sender_map: Record<string, Record<string, string>>;
+  /** sender_names[sender_id] = name */
+  sender_names: Record<string, string>;
 }
 
 export async function fetchCalendarAccountHealth(): Promise<CalendarAccountHealthResponse> {
@@ -2020,5 +2039,19 @@ export async function fetchCalendarAccountHealth(): Promise<CalendarAccountHealt
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch account health"));
+  return res.json();
+}
+
+export async function setCalendarAccountSendersBulk(
+  webinarId: string,
+  senderId: string,
+  accounts: string[],
+): Promise<{ webinar_id: string; sender_id: string; saved: number }> {
+  const res = await fetch(`${API_URL}/calendar-uploads/account-senders/bulk`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ webinar_id: webinarId, sender_id: senderId, accounts }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to save account senders"));
   return res.json();
 }

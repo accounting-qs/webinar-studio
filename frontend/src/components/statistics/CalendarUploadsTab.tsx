@@ -6,6 +6,7 @@ import {
   confirmCalendarUpload,
   deleteCalendarUpload,
   fetchCalendarUploads,
+  fetchSenders,
   fetchWebinars,
   pauseCalendarImport,
   presignCalendarUpload,
@@ -13,6 +14,7 @@ import {
   startCalendarImport,
   uploadToStorage,
   type ApiCalendarUpload,
+  type ApiSender,
   type ApiWebinar,
   type CalendarConfirmResponse,
 } from "@/lib/api";
@@ -50,6 +52,7 @@ function statusBadge(status: string): { className: string; label: string } {
 export function CalendarUploadsTab() {
   const [uploads, setUploads] = useState<ApiCalendarUpload[]>([]);
   const [webinars, setWebinars] = useState<ApiWebinar[]>([]);
+  const [senders, setSenders] = useState<ApiSender[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -57,9 +60,14 @@ export function CalendarUploadsTab() {
   const loadAll = useCallback(async () => {
     setLoadError(null);
     try {
-      const [u, w] = await Promise.all([fetchCalendarUploads(), fetchWebinars()]);
+      const [u, w, s] = await Promise.all([
+        fetchCalendarUploads(),
+        fetchWebinars(),
+        fetchSenders(),
+      ]);
       setUploads(u.uploads);
       setWebinars(w.webinars);
+      setSenders(s.senders);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -118,6 +126,7 @@ export function CalendarUploadsTab() {
       {modalOpen && (
         <UploadModal
           webinars={webinars}
+          senders={senders}
           onClose={() => setModalOpen(false)}
           onCreated={() => {
             setModalOpen(false);
@@ -164,6 +173,7 @@ function UploadsTable({
         <thead className="bg-zinc-50 dark:bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
           <tr>
             <th className="text-left px-3 py-2 font-semibold">Webinar</th>
+            <th className="text-left px-3 py-2 font-semibold">Sender</th>
             <th className="text-left px-3 py-2 font-semibold">File</th>
             <th className="text-left px-3 py-2 font-semibold">Uploaded</th>
             <th className="text-right px-3 py-2 font-semibold">Rows</th>
@@ -182,6 +192,9 @@ function UploadsTable({
             return (
               <tr key={u.id} className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
                 <td className="px-3 py-2 font-mono text-zinc-800 dark:text-zinc-200">{u.webinar_label ?? u.webinar_id.slice(0, 8)}</td>
+                <td className="px-3 py-2 text-zinc-700 dark:text-zinc-300">
+                  {u.sender_name ?? <span className="text-zinc-500">—</span>}
+                </td>
                 <td className="px-3 py-2 max-w-[260px] truncate text-zinc-700 dark:text-zinc-300" title={u.file_name}>{u.file_name}</td>
                 <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{dateLabel}</td>
                 <td className="px-3 py-2 text-right font-mono">{u.total_rows.toLocaleString()}</td>
@@ -265,14 +278,17 @@ type ModalStep = "pick" | "uploading" | "confirmed" | "starting";
 
 function UploadModal({
   webinars,
+  senders,
   onClose,
   onCreated,
 }: {
   webinars: ApiWebinar[];
+  senders: ApiSender[];
   onClose: () => void;
   onCreated: () => void;
 }) {
   const [webinarId, setWebinarId] = useState<string>("");
+  const [senderId, setSenderId] = useState<string>("");
   const [file, setFile] = useState<File | null>(null);
   const [step, setStep] = useState<ModalStep>("pick");
   const [progress, setProgress] = useState(0);
@@ -283,6 +299,10 @@ function UploadModal({
     () => [...webinars].sort((a, b) => b.number - a.number),
     [webinars],
   );
+  const sortedSenders = useMemo(
+    () => [...senders].sort((a, b) => a.display_order - b.display_order || a.name.localeCompare(b.name)),
+    [senders],
+  );
 
   const handleUpload = async () => {
     if (!file || !webinarId) return;
@@ -290,7 +310,12 @@ function UploadModal({
     setStep("uploading");
     setProgress(0);
     try {
-      const { upload_id, signed_url } = await presignCalendarUpload(file.name, file.size, webinarId);
+      const { upload_id, signed_url } = await presignCalendarUpload(
+        file.name,
+        file.size,
+        webinarId,
+        senderId || null,
+      );
       await uploadToStorage(signed_url, file, setProgress);
       const conf = await confirmCalendarUpload(upload_id, file.size);
       setConfirmed(conf);
@@ -349,6 +374,25 @@ function UploadModal({
                     <option key={w.id} value={w.id}>{webinarLabel(w)}</option>
                   ))}
                 </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">
+                  Sender <span className="text-zinc-500 font-normal">(optional)</span>
+                </label>
+                <select
+                  value={senderId}
+                  onChange={(e) => setSenderId(e.target.value)}
+                  className="w-full bg-zinc-50 dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                >
+                  <option value="">No sender (leave accounts unmapped)</option>
+                  {sortedSenders.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+                <div className="mt-1 text-[11px] text-zinc-500">
+                  Every calendar_account in this file will be mapped to the chosen sender. Re-uploading overrides existing mappings.
+                </div>
               </div>
 
               <div>

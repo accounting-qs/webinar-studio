@@ -34,8 +34,8 @@ from sqlalchemy import pool
 from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID
 from db.models import (
-    Contact, Webinar, WebinarCalendarInvite, WebinarCalendarUpload,
-    WebinarListAssignment,
+    CalendarAccountSender, Contact, OutreachSender, Webinar,
+    WebinarCalendarInvite, WebinarCalendarUpload, WebinarListAssignment,
 )
 from db.session import get_db
 
@@ -155,11 +155,17 @@ def _parse_int(value: str) -> int | None:
         return None
 
 
-def _upload_dict(u: WebinarCalendarUpload, webinar_label: str | None = None) -> dict:
+def _upload_dict(
+    u: WebinarCalendarUpload,
+    webinar_label: str | None = None,
+    sender_name: str | None = None,
+) -> dict:
     return {
         "id": u.id,
         "webinar_id": u.webinar_id,
         "webinar_label": webinar_label,
+        "sender_id": u.sender_id,
+        "sender_name": sender_name,
         "file_name": u.file_name,
         "status": u.status,
         "progress": u.progress,
@@ -208,8 +214,24 @@ async def list_calendar_uploads(
         for w in wresult.scalars().all():
             label_map[w.id] = _webinar_label(w)
 
+    sender_ids = list({u.sender_id for u in uploads if u.sender_id})
+    sender_name_map: dict[str, str] = {}
+    if sender_ids:
+        sresult = await db.execute(
+            select(OutreachSender).where(OutreachSender.id.in_(sender_ids))
+        )
+        for s in sresult.scalars().all():
+            sender_name_map[s.id] = s.name
+
     return {
-        "uploads": [_upload_dict(u, label_map.get(u.webinar_id)) for u in uploads]
+        "uploads": [
+            _upload_dict(
+                u,
+                label_map.get(u.webinar_id),
+                sender_name_map.get(u.sender_id) if u.sender_id else None,
+            )
+            for u in uploads
+        ]
     }
 
 
@@ -298,6 +320,32 @@ async def calendar_account_health(
         key=lambda x: (x == "(unknown)", x.lower()),
     )
 
+    # (webinar_id, calendar_account) → sender_id; plus sender id → name.
+    sender_map: dict[str, dict[str, str]] = {}
+    sender_names: dict[str, str] = {}
+    if webinar_ids:
+        cas = await db.execute(
+            select(
+                CalendarAccountSender.webinar_id,
+                CalendarAccountSender.calendar_account,
+                CalendarAccountSender.sender_id,
+            ).where(
+                CalendarAccountSender.user_id == LLOYD_USER_ID,
+                CalendarAccountSender.webinar_id.in_(webinar_ids),
+            )
+        )
+        for wid, acc, sid in cas.all():
+            sender_map.setdefault(wid, {})[acc] = sid
+
+    sresult = await db.execute(
+        select(OutreachSender)
+        .where(OutreachSender.user_id == LLOYD_USER_ID)
+        .order_by(OutreachSender.display_order.asc(), OutreachSender.name.asc())
+    )
+    senders = sresult.scalars().all()
+    for s in senders:
+        sender_names[s.id] = s.name
+
     return {
         "webinars": [
             {
@@ -314,6 +362,108 @@ async def calendar_account_health(
             for acc in sorted_accounts
         ],
         "totals": totals,
+        "senders": [
+            {"id": s.id, "name": s.name, "color": s.color}
+            for s in senders
+        ],
+        # sender_map[webinar_id][calendar_account] = sender_id
+        "sender_map": sender_map,
+        # sender_names[sender_id] = name (handy for frontend display)
+        "sender_names": sender_names,
+    }
+
+
+@router.post("/account-senders/bulk", status_code=200)
+async def set_account_senders_bulk(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Pattern B: upsert sender mappings for a list of calendar_accounts
+    on a single webinar. Body:
+        { webinar_id, sender_id, accounts: [str, ...] }
+    Accounts can be a newline- or comma-separated string OR a list; we
+    normalize either form. Existing (webinar, account) → sender rows are
+    overwritten (last write wins).
+    """
+    webinar_id = (body.get("webinar_id") or "").strip()
+    sender_id = (body.get("sender_id") or "").strip()
+    raw_accounts = body.get("accounts")
+
+    if not webinar_id:
+        raise HTTPException(400, "webinar_id is required")
+    if not sender_id:
+        raise HTTPException(400, "sender_id is required")
+
+    # Normalize accounts: accept list or newline/comma-separated string
+    accounts: list[str] = []
+    if isinstance(raw_accounts, list):
+        candidates = [str(a) for a in raw_accounts]
+    else:
+        text = str(raw_accounts or "")
+        candidates = [piece for line in text.splitlines() for piece in line.split(",")]
+    for a in candidates:
+        cleaned = a.strip().lower()
+        if cleaned:
+            accounts.append(cleaned)
+    # Dedupe, preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for a in accounts:
+        if a not in seen:
+            seen.add(a)
+            deduped.append(a)
+    accounts = deduped
+
+    if not accounts:
+        raise HTTPException(400, "No accounts provided")
+
+    # Verify webinar & sender belong to this user
+    wresult = await db.execute(
+        select(Webinar).where(
+            Webinar.id == webinar_id, Webinar.user_id == LLOYD_USER_ID
+        )
+    )
+    if not wresult.scalar_one_or_none():
+        raise HTTPException(404, "Webinar not found")
+
+    sresult = await db.execute(
+        select(OutreachSender).where(
+            OutreachSender.id == sender_id,
+            OutreachSender.user_id == LLOYD_USER_ID,
+        )
+    )
+    if not sresult.scalar_one_or_none():
+        raise HTTPException(404, "Sender not found")
+
+    now = datetime.now(tz=timezone.utc)
+    rows = [
+        {
+            "id": str(uuid.uuid4()),
+            "user_id": LLOYD_USER_ID,
+            "webinar_id": webinar_id,
+            "calendar_account": acc,
+            "sender_id": sender_id,
+            "updated_at": now,
+        }
+        for acc in accounts
+    ]
+
+    stmt = pg_insert(CalendarAccountSender.__table__).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_cas_webinar_account",
+        set_={
+            "sender_id": stmt.excluded.sender_id,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    )
+    await db.execute(stmt)
+    await db.flush()
+
+    return {
+        "webinar_id": webinar_id,
+        "sender_id": sender_id,
+        "saved": len(accounts),
     }
 
 
@@ -323,10 +473,14 @@ async def presign_calendar_upload(
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
-    """Step 1: signed URL for direct browser→Supabase upload. Requires webinar_id."""
+    """Step 1: signed URL for direct browser→Supabase upload. Requires webinar_id.
+    Optional sender_id (Pattern A): when set, every distinct calendar_account
+    in this CSV is mapped to that sender after import."""
     filename = (body.get("filename") or "calendar.csv").strip()
     file_size = int(body.get("file_size") or 0)
     webinar_id = (body.get("webinar_id") or "").strip()
+    raw_sender_id = body.get("sender_id")
+    sender_id = (raw_sender_id or "").strip() or None
 
     if not filename.endswith(".csv"):
         raise HTTPException(400, "Only CSV files are accepted")
@@ -341,6 +495,16 @@ async def presign_calendar_upload(
     )
     if not wresult.scalar_one_or_none():
         raise HTTPException(404, "Webinar not found")
+
+    if sender_id:
+        sresult = await db.execute(
+            select(OutreachSender).where(
+                OutreachSender.id == sender_id,
+                OutreachSender.user_id == LLOYD_USER_ID,
+            )
+        )
+        if not sresult.scalar_one_or_none():
+            raise HTTPException(404, "Sender not found")
 
     storage_path = f"{LLOYD_USER_ID}/calendar/{int(datetime.now().timestamp())}_{filename}"
 
@@ -371,6 +535,7 @@ async def presign_calendar_upload(
     upload = WebinarCalendarUpload(
         user_id=LLOYD_USER_ID,
         webinar_id=webinar_id,
+        sender_id=sender_id,
         file_name=filename,
         storage_path=storage_path,
         status="uploading",
@@ -489,7 +654,9 @@ async def start_calendar_import(
         _import_cancel_flags.pop(upload_id, None)
 
     task = asyncio.create_task(
-        _process_calendar_csv(upload_id, upload.webinar_id, upload.storage_path)
+        _process_calendar_csv(
+            upload_id, upload.webinar_id, upload.storage_path, upload.sender_id,
+        )
     )
     _active_import_tasks[upload_id] = task
     task.add_done_callback(_cleanup)
@@ -638,8 +805,15 @@ async def delete_calendar_upload(
 # Background import
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _process_calendar_csv(upload_id: str, webinar_id: str, storage_path: str):
-    """Stream-parse the CSV from Supabase Storage, upsert in batches of BATCH_SIZE."""
+async def _process_calendar_csv(
+    upload_id: str,
+    webinar_id: str,
+    storage_path: str,
+    sender_id: str | None,
+):
+    """Stream-parse the CSV from Supabase Storage, upsert in batches of BATCH_SIZE.
+    If sender_id is set, every distinct calendar_account in the CSV gets upserted
+    into calendar_account_senders on successful completion (Pattern A)."""
     engine = _bg_engine
     if not engine:
         print(f"[CAL_IMPORT] FAILED: no DATABASE_URL configured")
@@ -650,6 +824,7 @@ async def _process_calendar_csv(upload_id: str, webinar_id: str, storage_path: s
     matched = 0
     unmatched = 0
     upserted = 0
+    accounts_seen: set[str] = set()
 
     try:
         import httpx
@@ -864,6 +1039,8 @@ async def _process_calendar_csv(upload_id: str, webinar_id: str, storage_path: s
                 # Row had no email — count toward processed but skip
                 processed += 1
                 continue
+            if parsed.get("calendar_account"):
+                accounts_seen.add(parsed["calendar_account"])
             batch.append(parsed)
 
             if len(batch) >= BATCH_SIZE:
@@ -937,6 +1114,33 @@ async def _process_calendar_csv(upload_id: str, webinar_id: str, storage_path: s
                     completed_at=datetime.now(tz=timezone.utc),
                 )
             )
+
+        # Pattern A: stamp every distinct calendar_account in this CSV with
+        # the sender chosen at upload time. Last write wins.
+        if sender_id and accounts_seen:
+            now = datetime.now(tz=timezone.utc)
+            cas_rows = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "user_id": LLOYD_USER_ID,
+                    "webinar_id": webinar_id,
+                    "calendar_account": acc,
+                    "sender_id": sender_id,
+                    "updated_at": now,
+                }
+                for acc in accounts_seen
+            ]
+            async with engine.begin() as conn:
+                stmt = pg_insert(CalendarAccountSender.__table__).values(cas_rows)
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_cas_webinar_account",
+                    set_={
+                        "sender_id": stmt.excluded.sender_id,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                await conn.execute(stmt)
+            print(f"[CAL_IMPORT] Stamped {len(cas_rows)} accounts with sender {sender_id}")
 
         # Storage cleanup (best effort)
         try:

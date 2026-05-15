@@ -32,7 +32,7 @@ from db.models.ghl import (  # noqa: F401
 )
 from db.models.blocklist import BlocklistEntry  # noqa: F401
 from db.models.webinar_calendar import (  # noqa: F401
-    WebinarCalendarUpload, WebinarCalendarInvite,
+    WebinarCalendarUpload, WebinarCalendarInvite, CalendarAccountSender,
 )
 
 # Re-export Base so `from db.models import Base` keeps working
