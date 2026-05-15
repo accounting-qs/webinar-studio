@@ -2422,6 +2422,7 @@ export function PlanningPage() {
                             </td>
                             <td className="px-2 py-2"></td>
                             <td className="px-2 py-2"></td>
+                            <td className="px-2 py-2"></td>
                             <td className="px-2 py-2">
                               <div className="flex items-center gap-2">
                                 <span
@@ -2448,11 +2449,39 @@ export function PlanningPage() {
                                 )}
                               </div>
                             </td>
-                            <td className="px-2 py-2 text-right font-mono font-bold text-zinc-800 dark:text-zinc-100">
-                              {sumSize > 0 ? sumSize.toLocaleString() : ""}
+                            <td className="px-2 py-2 text-right">
+                              {sumSize > 0 ? (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    g.lists.forEach((l) => {
+                                      if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=all`, "_blank", "noopener,noreferrer");
+                                    });
+                                  }}
+                                  title={`Open ${g.lists.filter((l) => l.listVolumeRaw > 0).length} list${g.lists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
+                                  className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
+                                >
+                                  {sumSize.toLocaleString()}
+                                </button>
+                              ) : ""}
                             </td>
-                            <td className="px-2 py-2 text-right font-mono font-bold text-violet-400">
-                              {sumRemain > 0 ? sumRemain.toLocaleString() : ""}
+                            <td className="px-2 py-2 text-right">
+                              {sumRemain > 0 ? (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    g.lists.forEach((l) => {
+                                      if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=assigned`, "_blank", "noopener,noreferrer");
+                                    });
+                                  }}
+                                  title={`Open ${g.lists.filter((l) => l.listVolumeRaw > 0).length} list${g.lists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
+                                  className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
+                                >
+                                  {sumRemain.toLocaleString()}
+                                </button>
+                              ) : ""}
                             </td>
                             <td className="px-2 py-2"></td>
                             <td className="px-2 py-2"></td>
@@ -2527,6 +2556,7 @@ export function PlanningPage() {
                           </td>
                           <td className="px-2 py-2"></td>
                           <td className="px-2 py-2"></td>
+                          <td className="px-2 py-2"></td>
                           <td className="px-2 py-2">
                             <div className="flex items-center gap-2">
                               <span className="text-zinc-800 dark:text-zinc-100 text-xs font-bold italic">
@@ -2550,11 +2580,39 @@ export function PlanningPage() {
                               )}
                             </div>
                           </td>
-                          <td className="px-2 py-2 text-right font-mono font-bold text-zinc-800 dark:text-zinc-100">
-                            {sumSize > 0 ? sumSize.toLocaleString() : ""}
+                          <td className="px-2 py-2 text-right">
+                            {sumSize > 0 ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  singleListLists.forEach((l) => {
+                                    if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=all`, "_blank", "noopener,noreferrer");
+                                  });
+                                }}
+                                title={`Open ${singleListLists.filter((l) => l.listVolumeRaw > 0).length} list${singleListLists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
+                                className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
+                              >
+                                {sumSize.toLocaleString()}
+                              </button>
+                            ) : ""}
                           </td>
-                          <td className="px-2 py-2 text-right font-mono font-bold text-violet-400">
-                            {sumRemain > 0 ? sumRemain.toLocaleString() : ""}
+                          <td className="px-2 py-2 text-right">
+                            {sumRemain > 0 ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  singleListLists.forEach((l) => {
+                                    if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=assigned`, "_blank", "noopener,noreferrer");
+                                  });
+                                }}
+                                title={`Open ${singleListLists.filter((l) => l.listVolumeRaw > 0).length} list${singleListLists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
+                                className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
+                              >
+                                {sumRemain.toLocaleString()}
+                              </button>
+                            ) : ""}
                           </td>
                           <td className="px-2 py-2"></td>
                           <td className="px-2 py-2"></td>
