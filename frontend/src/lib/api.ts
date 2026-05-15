@@ -1989,3 +1989,36 @@ export async function deleteCalendarUpload(uploadId: string): Promise<{ id: stri
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to delete calendar upload"));
   return res.json();
 }
+
+export interface ApiAccountHealthWebinar {
+  id: string;
+  number: number;
+  variant_label: string | null;
+  label: string;
+  has_upload: boolean;
+}
+
+export interface ApiAccountHealthCell {
+  total_sent: number;
+  yes: number;
+  maybe: number;
+}
+
+export interface ApiAccountHealthRow {
+  calendar_account: string;
+  per_webinar: Record<string, ApiAccountHealthCell>;
+}
+
+export interface CalendarAccountHealthResponse {
+  webinars: ApiAccountHealthWebinar[];
+  accounts: ApiAccountHealthRow[];
+  totals: Record<string, ApiAccountHealthCell>;
+}
+
+export async function fetchCalendarAccountHealth(): Promise<CalendarAccountHealthResponse> {
+  const res = await fetch(`${API_URL}/calendar-uploads/account-health`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch account health"));
+  return res.json();
+}

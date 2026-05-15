@@ -213,6 +213,107 @@ async def list_calendar_uploads(
     }
 
 
+@router.get("/account-health")
+async def calendar_account_health(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Per-webinar, per-Calendar_account aggregates for the Account Health tab.
+
+    For each (webinar, calendar_account):
+      total_sent = COUNT(*) of invite rows
+      yes        = COUNT(*) WHERE calendar_invite_response = 'Yes'
+      maybe      = COUNT(*) WHERE calendar_invite_response = 'Maybe'
+
+    webinar_calendar_invites is unique on (webinar_id, email), so COUNT(*)
+    equals COUNT(DISTINCT email) — same result as the source spreadsheet's
+    COUNTUNIQUEIFS without needing DISTINCT.
+
+    Every webinar belonging to the user is returned (newest first by number);
+    `has_upload` flags whether any calendar upload exists for that webinar.
+    """
+    wresult = await db.execute(
+        select(Webinar)
+        .where(Webinar.user_id == LLOYD_USER_ID)
+        .order_by(Webinar.number.desc(), Webinar.id.asc())
+    )
+    webinars = wresult.scalars().all()
+    webinar_ids = [w.id for w in webinars]
+
+    with_upload: set[str] = set()
+    if webinar_ids:
+        ur = await db.execute(
+            select(WebinarCalendarUpload.webinar_id)
+            .where(
+                WebinarCalendarUpload.user_id == LLOYD_USER_ID,
+                WebinarCalendarUpload.webinar_id.in_(webinar_ids),
+            )
+            .distinct()
+        )
+        with_upload = {row[0] for row in ur.all()}
+
+    invite = WebinarCalendarInvite.__table__
+    agg_rows: list = []
+    if webinar_ids:
+        agg = await db.execute(
+            select(
+                invite.c.webinar_id,
+                invite.c.calendar_account,
+                sa_func.count().label("total_sent"),
+                sa_func.count()
+                .filter(invite.c.calendar_invite_response == "Yes")
+                .label("yes"),
+                sa_func.count()
+                .filter(invite.c.calendar_invite_response == "Maybe")
+                .label("maybe"),
+            )
+            .where(invite.c.webinar_id.in_(webinar_ids))
+            .group_by(invite.c.webinar_id, invite.c.calendar_account)
+        )
+        agg_rows = agg.all()
+
+    accounts_map: dict[str, dict[str, dict[str, int]]] = {}
+    totals: dict[str, dict[str, int]] = {}
+    for r in agg_rows:
+        acc = (r.calendar_account or "").strip() or "(unknown)"
+        cell = {
+            "total_sent": int(r.total_sent or 0),
+            "yes": int(r.yes or 0),
+            "maybe": int(r.maybe or 0),
+        }
+        accounts_map.setdefault(acc, {})[r.webinar_id] = cell
+        t = totals.setdefault(
+            r.webinar_id, {"total_sent": 0, "yes": 0, "maybe": 0}
+        )
+        t["total_sent"] += cell["total_sent"]
+        t["yes"] += cell["yes"]
+        t["maybe"] += cell["maybe"]
+
+    # Sort accounts: "(unknown)" last, everything else alphabetical
+    sorted_accounts = sorted(
+        accounts_map.keys(),
+        key=lambda x: (x == "(unknown)", x.lower()),
+    )
+
+    return {
+        "webinars": [
+            {
+                "id": w.id,
+                "number": w.number,
+                "variant_label": w.variant_label,
+                "label": _webinar_label(w),
+                "has_upload": w.id in with_upload,
+            }
+            for w in webinars
+        ],
+        "accounts": [
+            {"calendar_account": acc, "per_webinar": accounts_map[acc]}
+            for acc in sorted_accounts
+        ],
+        "totals": totals,
+    }
+
+
 @router.post("/presign", status_code=201)
 async def presign_calendar_upload(
     body: dict,
