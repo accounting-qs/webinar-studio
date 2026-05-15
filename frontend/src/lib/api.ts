@@ -1173,6 +1173,45 @@ export async function markContactsUsed(
   return res.json();
 }
 
+export interface AssignmentGroupContactsResponse {
+  group: {
+    assignment_ids: string[];
+    bucket_name: string | null;
+    webinar_number: number | null;
+    webinar_date: string | null;
+    list_count: number;
+    volume: number;
+    volume_raw: number;
+    blocklisted_total: number;
+  };
+  contacts: ApiContact[];
+  counts: { assigned: number; used: number; total: number };
+}
+
+export async function fetchAssignmentGroupContacts(
+  assignmentIds: string[],
+  status: "assigned" | "used" | "all" = "assigned"
+): Promise<AssignmentGroupContactsResponse> {
+  const ids = assignmentIds.join(",");
+  const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts?ids=${encodeURIComponent(ids)}&status=${status}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch group contacts");
+  return res.json();
+}
+
+export async function markGroupContactsUsed(
+  contactIds: string[]
+): Promise<{ marked: number; by_assignment: Record<string, number> }> {
+  const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts/mark-used`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ contact_ids: contactIds }),
+  });
+  if (!res.ok) throw new Error("Failed to mark group contacts as used");
+  return res.json();
+}
+
 /* ── Statistics ─────────────────────────────────────────────────────────── */
 
 export interface StatisticsMetrics {

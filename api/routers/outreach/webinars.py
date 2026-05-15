@@ -735,6 +735,164 @@ async def mark_contacts_used(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ASSIGNMENT GROUP CONTACTS (bulk view across multiple assignments)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Cap to avoid pathological requests; bucket groups in practice are 2–10 lists.
+_GROUP_CONTACTS_MAX_IDS = 50
+
+
+@router.get("/assignment-groups/contacts")
+async def get_group_contacts(
+    ids: str = Query(..., description="Comma-separated assignment IDs"),
+    status: str = Query("assigned", regex="^(assigned|used|all)$"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    assignment_ids = [s for s in (x.strip() for x in ids.split(",")) if s]
+    if not assignment_ids:
+        raise HTTPException(400, "ids is required")
+    # Dedup while preserving order.
+    seen: set[str] = set()
+    assignment_ids = [a for a in assignment_ids if not (a in seen or seen.add(a))]
+    if len(assignment_ids) > _GROUP_CONTACTS_MAX_IDS:
+        raise HTTPException(400, f"Too many ids (max {_GROUP_CONTACTS_MAX_IDS})")
+
+    asgn_result = await db.execute(
+        select(WebinarListAssignment)
+        .where(
+            WebinarListAssignment.id.in_(assignment_ids),
+            WebinarListAssignment.user_id == LLOYD_USER_ID,
+        )
+        .options(selectinload(WebinarListAssignment.bucket), selectinload(WebinarListAssignment.webinar))
+    )
+    assignments = asgn_result.scalars().all()
+    if len(assignments) != len(assignment_ids):
+        raise HTTPException(404, "One or more assignments not found")
+
+    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+
+    q = select(Contact).where(
+        Contact.assignment_id.in_(assignment_ids),
+        Contact.user_id == LLOYD_USER_ID,
+        not_blocklisted,
+    )
+    if status != "all":
+        q = q.where(Contact.outreach_status == status)
+    q = q.order_by(Contact.first_name, Contact.email)
+
+    result = await db.execute(q)
+    contacts = result.scalars().all()
+
+    count_result = await db.execute(
+        select(Contact.outreach_status, sa_func.count())
+        .where(
+            Contact.assignment_id.in_(assignment_ids),
+            Contact.user_id == LLOYD_USER_ID,
+            not_blocklisted,
+        )
+        .group_by(Contact.outreach_status)
+    )
+    counts = {row[0]: row[1] for row in count_result}
+
+    bl_counts = await compute_blocklist_counts_per_assignment(db, assignment_ids)
+    blocklisted_total = sum((v.get("total", 0) for v in bl_counts.values()), 0)
+
+    bucket_names = {a.bucket.name for a in assignments if a.bucket and a.bucket.name}
+    webinar_numbers = {a.webinar.number for a in assignments if a.webinar}
+    webinar_dates = {a.webinar.date.isoformat() for a in assignments if a.webinar and a.webinar.date}
+
+    attached_total = counts.get("assigned", 0) + counts.get("used", 0)
+
+    return {
+        "group": {
+            "assignment_ids": assignment_ids,
+            "bucket_name": next(iter(bucket_names)) if len(bucket_names) == 1 else None,
+            "webinar_number": next(iter(webinar_numbers)) if len(webinar_numbers) == 1 else None,
+            "webinar_date": next(iter(webinar_dates)) if len(webinar_dates) == 1 else None,
+            "list_count": len(assignments),
+            "volume": attached_total,
+            "volume_raw": sum((a.volume or 0) for a in assignments),
+            "blocklisted_total": blocklisted_total,
+        },
+        "contacts": [
+            {
+                "id": c.id,
+                "email": c.email,
+                "first_name": c.first_name,
+                "outreach_status": c.outreach_status,
+                "used_at": c.used_at.isoformat() if c.used_at else None,
+            }
+            for c in contacts
+        ],
+        "counts": {
+            "assigned": counts.get("assigned", 0),
+            "used": counts.get("used", 0),
+            "total": sum(counts.values()),
+        },
+    }
+
+
+class GroupMarkUsedRequest(BaseModel):
+    contact_ids: list[str]
+
+
+@router.put("/assignment-groups/contacts/mark-used")
+async def mark_group_contacts_used(
+    body: GroupMarkUsedRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    if not body.contact_ids:
+        return {"marked": 0, "by_assignment": {}}
+
+    now = datetime.now(timezone.utc)
+
+    # Find the contacts (filtered by user) and their source assignments before
+    # the update so we know which assignment counters to decrement.
+    src_result = await db.execute(
+        select(Contact.id, Contact.assignment_id)
+        .where(
+            Contact.id.in_(body.contact_ids),
+            Contact.user_id == LLOYD_USER_ID,
+            Contact.outreach_status == "assigned",
+        )
+    )
+    rows = src_result.all()
+    target_ids = [r.id for r in rows]
+    if not target_ids:
+        return {"marked": 0, "by_assignment": {}}
+
+    per_assignment: dict[str, int] = {}
+    for r in rows:
+        per_assignment[r.assignment_id] = per_assignment.get(r.assignment_id, 0) + 1
+
+    update_result = await db.execute(
+        update(Contact)
+        .where(Contact.id.in_(target_ids))
+        .values(outreach_status="used", used_at=now)
+    )
+    marked = update_result.rowcount or 0
+
+    # Decrement each affected assignment's remaining counter atomically in the
+    # same transaction. Bound at zero to mirror the single-assignment endpoint.
+    if per_assignment:
+        affected = await db.execute(
+            select(WebinarListAssignment).where(
+                WebinarListAssignment.id.in_(list(per_assignment.keys())),
+                WebinarListAssignment.user_id == LLOYD_USER_ID,
+            )
+        )
+        for asgn in affected.scalars().all():
+            dec = per_assignment.get(asgn.id, 0)
+            if dec:
+                asgn.remaining = max(0, (asgn.remaining or 0) - dec)
+    await db.flush()
+
+    return {"marked": marked, "by_assignment": per_assignment}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # WEBINAR LIST EXPORT (background CSV of assigned contacts + list names)
 # ═══════════════════════════════════════════════════════════════════════════
 

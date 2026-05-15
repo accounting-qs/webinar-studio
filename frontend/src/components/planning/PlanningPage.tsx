@@ -2450,38 +2450,48 @@ export function PlanningPage() {
                               </div>
                             </td>
                             <td className="px-2 py-2 text-right">
-                              {sumSize > 0 ? (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    g.lists.forEach((l) => {
-                                      if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=all`, "_blank", "noopener,noreferrer");
-                                    });
-                                  }}
-                                  title={`Open ${g.lists.filter((l) => l.listVolumeRaw > 0).length} list${g.lists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
-                                  className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
-                                >
-                                  {sumSize.toLocaleString()}
-                                </button>
-                              ) : ""}
+                              {sumSize > 0 ? (() => {
+                                const linkable = g.lists.filter((l) => l.listVolumeRaw > 0);
+                                const href = linkable.length > 0
+                                  ? `/contacts/group?ids=${linkable.map((l) => l.id).join(",")}&tab=all`
+                                  : null;
+                                return href ? (
+                                  <a
+                                    href={href}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    title={`Open combined view of ${linkable.length} list${linkable.length === 1 ? "" : "s"}`}
+                                    className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
+                                  >
+                                    {sumSize.toLocaleString()}
+                                  </a>
+                                ) : (
+                                  <span className="font-mono font-bold text-zinc-800 dark:text-zinc-100">{sumSize.toLocaleString()}</span>
+                                );
+                              })() : ""}
                             </td>
                             <td className="px-2 py-2 text-right">
-                              {sumRemain > 0 ? (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    g.lists.forEach((l) => {
-                                      if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=assigned`, "_blank", "noopener,noreferrer");
-                                    });
-                                  }}
-                                  title={`Open ${g.lists.filter((l) => l.listVolumeRaw > 0).length} list${g.lists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
-                                  className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
-                                >
-                                  {sumRemain.toLocaleString()}
-                                </button>
-                              ) : ""}
+                              {sumRemain > 0 ? (() => {
+                                const linkable = g.lists.filter((l) => l.listVolumeRaw > 0);
+                                const href = linkable.length > 0
+                                  ? `/contacts/group?ids=${linkable.map((l) => l.id).join(",")}&tab=assigned`
+                                  : null;
+                                return href ? (
+                                  <a
+                                    href={href}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    title={`Open combined view of ${linkable.length} list${linkable.length === 1 ? "" : "s"}`}
+                                    className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
+                                  >
+                                    {sumRemain.toLocaleString()}
+                                  </a>
+                                ) : (
+                                  <span className="font-mono font-bold text-violet-400">{sumRemain.toLocaleString()}</span>
+                                );
+                              })() : ""}
                             </td>
                             <td className="px-2 py-2"></td>
                             <td className="px-2 py-2"></td>
@@ -2581,38 +2591,48 @@ export function PlanningPage() {
                             </div>
                           </td>
                           <td className="px-2 py-2 text-right">
-                            {sumSize > 0 ? (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  singleListLists.forEach((l) => {
-                                    if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=all`, "_blank", "noopener,noreferrer");
-                                  });
-                                }}
-                                title={`Open ${singleListLists.filter((l) => l.listVolumeRaw > 0).length} list${singleListLists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
-                                className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
-                              >
-                                {sumSize.toLocaleString()}
-                              </button>
-                            ) : ""}
+                            {sumSize > 0 ? (() => {
+                              const linkable = singleListLists.filter((l) => l.listVolumeRaw > 0);
+                              const href = linkable.length > 0
+                                ? `/contacts/group?ids=${linkable.map((l) => l.id).join(",")}&tab=all`
+                                : null;
+                              return href ? (
+                                <a
+                                  href={href}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title={`Open combined view of ${linkable.length} list${linkable.length === 1 ? "" : "s"}`}
+                                  className="font-mono font-bold text-zinc-800 dark:text-zinc-100 hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-400/40 hover:decoration-violet-400/50 transition-colors"
+                                >
+                                  {sumSize.toLocaleString()}
+                                </a>
+                              ) : (
+                                <span className="font-mono font-bold text-zinc-800 dark:text-zinc-100">{sumSize.toLocaleString()}</span>
+                              );
+                            })() : ""}
                           </td>
                           <td className="px-2 py-2 text-right">
-                            {sumRemain > 0 ? (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  singleListLists.forEach((l) => {
-                                    if (l.listVolumeRaw > 0) window.open(`/contacts/${l.id}?tab=assigned`, "_blank", "noopener,noreferrer");
-                                  });
-                                }}
-                                title={`Open ${singleListLists.filter((l) => l.listVolumeRaw > 0).length} list${singleListLists.filter((l) => l.listVolumeRaw > 0).length === 1 ? "" : "s"} in new tabs`}
-                                className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
-                              >
-                                {sumRemain.toLocaleString()}
-                              </button>
-                            ) : ""}
+                            {sumRemain > 0 ? (() => {
+                              const linkable = singleListLists.filter((l) => l.listVolumeRaw > 0);
+                              const href = linkable.length > 0
+                                ? `/contacts/group?ids=${linkable.map((l) => l.id).join(",")}&tab=assigned`
+                                : null;
+                              return href ? (
+                                <a
+                                  href={href}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title={`Open combined view of ${linkable.length} list${linkable.length === 1 ? "" : "s"}`}
+                                  className="font-mono font-bold text-violet-400 hover:text-violet-300 underline underline-offset-2 decoration-violet-500/30 hover:decoration-violet-400/50 transition-colors"
+                                >
+                                  {sumRemain.toLocaleString()}
+                                </a>
+                              ) : (
+                                <span className="font-mono font-bold text-violet-400">{sumRemain.toLocaleString()}</span>
+                              );
+                            })() : ""}
                           </td>
                           <td className="px-2 py-2"></td>
                           <td className="px-2 py-2"></td>

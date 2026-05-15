@@ -1,27 +1,49 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   fetchAssignmentContacts,
+  fetchAssignmentGroupContacts,
   markContactsUsed,
+  markGroupContactsUsed,
   type ApiContact,
-  type AssignmentContactsResponse,
 } from "@/lib/api";
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 
 type StatusFilter = "assigned" | "used" | "all";
 
+type NormalizedHeader = {
+  title: string;
+  webinarNumber: number | null;
+  webinarDate: string | null;
+  volume: number;
+  fileBase: string;
+};
+
+type NormalizedData = {
+  header: NormalizedHeader;
+  contacts: ApiContact[];
+  counts: { assigned: number; used: number; total: number };
+};
+
+type ContactsPageProps =
+  | { assignmentId: string; groupAssignmentIds?: undefined; initialTab?: StatusFilter }
+  | { assignmentId?: undefined; groupAssignmentIds: string[]; initialTab?: StatusFilter };
+
 /* ─── Main Component ──────────────────────────────────────────────────────── */
 
-export function ContactsPage({
-  assignmentId,
-  initialTab = "assigned",
-}: {
-  assignmentId: string;
-  initialTab?: StatusFilter;
-}) {
-  const [data, setData] = useState<AssignmentContactsResponse | null>(null);
+export function ContactsPage(props: ContactsPageProps) {
+  const { initialTab = "assigned" } = props;
+  // Stable key for the group/assignment so useCallback deps don't see a new
+  // array identity on every render of the parent.
+  const groupKey = useMemo(
+    () => (props.groupAssignmentIds ? props.groupAssignmentIds.join(",") : ""),
+    [props.groupAssignmentIds],
+  );
+  const isGroup = !!props.groupAssignmentIds;
+
+  const [data, setData] = useState<NormalizedData | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<StatusFilter>(initialTab);
   const [selectCount, setSelectCount] = useState<number>(0);
@@ -34,14 +56,53 @@ export function ContactsPage({
 
   const load = useCallback(async (status: StatusFilter) => {
     try {
-      const result = await fetchAssignmentContacts(assignmentId, status);
-      setData(result);
+      if (isGroup) {
+        const ids = groupKey ? groupKey.split(",") : [];
+        const r = await fetchAssignmentGroupContacts(ids, status);
+        const title = r.group.bucket_name
+          ? (r.group.webinar_number != null
+            ? `W${r.group.webinar_number} — ${r.group.bucket_name}`
+            : r.group.bucket_name)
+          : `${r.group.list_count} lists combined`;
+        const fileBase = (r.group.bucket_name || `group_${r.group.list_count}_lists`)
+          .replace(/[^a-zA-Z0-9_-]/g, "_");
+        setData({
+          header: {
+            title,
+            webinarNumber: r.group.webinar_number,
+            webinarDate: r.group.webinar_date,
+            volume: r.group.volume,
+            fileBase,
+          },
+          contacts: r.contacts,
+          counts: r.counts,
+        });
+      } else {
+        const r = await fetchAssignmentContacts(props.assignmentId!, status);
+        const title = r.assignment.list_name
+          || (r.assignment.bucket_name
+            ? `W${r.assignment.webinar_number} — ${r.assignment.bucket_name}`
+            : `Assignment`);
+        const fileBase = (r.assignment.list_name || r.assignment.bucket_name || "contacts")
+          .replace(/[^a-zA-Z0-9_-]/g, "_");
+        setData({
+          header: {
+            title,
+            webinarNumber: r.assignment.webinar_number,
+            webinarDate: r.assignment.webinar_date,
+            volume: r.assignment.volume,
+            fileBase,
+          },
+          contacts: r.contacts,
+          counts: r.counts,
+        });
+      }
     } catch (err) {
       console.error("Failed to load contacts:", err);
     } finally {
       setLoading(false);
     }
-  }, [assignmentId]);
+  }, [isGroup, groupKey, props.assignmentId]);
 
   useEffect(() => {
     setLoading(true);
@@ -100,7 +161,11 @@ export function ContactsPage({
     if (selectedIds.size === 0) return;
     setMarking(true);
     try {
-      await markContactsUsed(assignmentId, Array.from(selectedIds));
+      if (isGroup) {
+        await markGroupContactsUsed(Array.from(selectedIds));
+      } else {
+        await markContactsUsed(props.assignmentId!, Array.from(selectedIds));
+      }
       // Reload to get fresh counts and filter out used ones
       setSelectedIds(new Set());
       setSelectCount(0);
@@ -110,7 +175,7 @@ export function ContactsPage({
     } finally {
       setMarking(false);
     }
-  }, [assignmentId, selectedIds, filter, load]);
+  }, [isGroup, props.assignmentId, selectedIds, filter, load]);
 
   /* ── Export selected contacts as CSV ─────────────────────────────────── */
 
@@ -126,8 +191,7 @@ export function ContactsPage({
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    const safeName = (data.assignment.list_name || data.assignment.bucket_name || "contacts").replace(/[^a-zA-Z0-9_-]/g, "_");
-    a.download = `${safeName}_${filter}.csv`;
+    a.download = `${data.header.fileBase}_${filter}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -161,16 +225,12 @@ export function ContactsPage({
   if (!data) {
     return (
       <main className="flex-1 bg-zinc-50 dark:bg-zinc-950 min-h-0 flex items-center justify-center">
-        <p className="text-zinc-500">Assignment not found</p>
+        <p className="text-zinc-500">{isGroup ? "Group not found" : "Assignment not found"}</p>
       </main>
     );
   }
 
-  const { assignment, contacts, counts } = data;
-  const listName = assignment.list_name
-    || (assignment.bucket_name
-      ? `W${assignment.webinar_number} — ${assignment.bucket_name}`
-      : `Assignment`);
+  const { header, contacts, counts } = data;
 
   const hasAssignedSelected = contacts.some(
     (c) => selectedIds.has(c.id) && c.outreach_status === "assigned"
@@ -183,14 +243,14 @@ export function ContactsPage({
         {/* ── Header ────────────────────────────────────────────────── */}
         <div className="mb-5">
           <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100 tracking-tight">
-            {listName}
+            {header.title}
           </h1>
           <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500">
-            {assignment.webinar_date && (
-              <span>{new Date(assignment.webinar_date + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</span>
+            {header.webinarDate && (
+              <span>{new Date(header.webinarDate + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</span>
             )}
-            <span className="text-zinc-300 dark:text-zinc-600">·</span>
-            <span>{assignment.volume.toLocaleString()} total contacts</span>
+            {header.webinarDate && <span className="text-zinc-300 dark:text-zinc-600">·</span>}
+            <span>{header.volume.toLocaleString()} total contacts</span>
           </div>
         </div>
 
