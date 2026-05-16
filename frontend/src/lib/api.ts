@@ -2116,3 +2116,29 @@ export async function setCalendarAccountSendersBulk(
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to save account senders"));
   return res.json();
 }
+
+export interface ApiDayOfWeekCell {
+  webinar_id: string;
+  calendar_account: string;
+  /** Postgres EXTRACT(DOW): 0=Sunday … 6=Saturday */
+  dow: number;
+  sent: number;
+  yes: number;
+  maybe: number;
+}
+
+export interface CalendarDayOfWeekResponse {
+  webinars: ApiAccountHealthWebinar[];
+  cells: ApiDayOfWeekCell[];
+  senders: ApiAccountHealthSender[];
+  sender_map: Record<string, Record<string, string>>;
+  sender_names: Record<string, string>;
+}
+
+export async function fetchCalendarDayOfWeek(): Promise<CalendarDayOfWeekResponse> {
+  const res = await fetch(`${API_URL}/calendar-uploads/day-of-week`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch day-of-week stats"));
+  return res.json();
+}

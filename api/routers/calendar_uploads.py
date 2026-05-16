@@ -373,6 +373,123 @@ async def calendar_account_health(
     }
 
 
+@router.get("/day-of-week")
+async def calendar_day_of_week(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Per-(webinar, calendar_account, day-of-week) invite stats for the
+    Send Day tab on Statistics.
+
+    Counts come from webinar_calendar_invites, grouped by
+    EXTRACT(DOW FROM calendar_invited_date) (0=Sun..6=Sat). Rows with a NULL
+    invited date are skipped — without a date we can't bucket them.
+
+    Only past webinars (Webinar.date <= today) are included; future webinars
+    have no responses to report on yet.
+    """
+    today = datetime.now(tz=timezone.utc).date()
+    wresult = await db.execute(
+        select(Webinar)
+        .where(Webinar.user_id == LLOYD_USER_ID, Webinar.date <= today)
+        .order_by(Webinar.number.desc(), Webinar.id.asc())
+    )
+    webinars = wresult.scalars().all()
+    webinar_ids = [w.id for w in webinars]
+
+    with_upload: set[str] = set()
+    if webinar_ids:
+        ur = await db.execute(
+            select(WebinarCalendarUpload.webinar_id)
+            .where(
+                WebinarCalendarUpload.user_id == LLOYD_USER_ID,
+                WebinarCalendarUpload.webinar_id.in_(webinar_ids),
+            )
+            .distinct()
+        )
+        with_upload = {row[0] for row in ur.all()}
+
+    invite = WebinarCalendarInvite.__table__
+    cells: list[dict] = []
+    if webinar_ids:
+        dow_expr = sa_func.extract("dow", invite.c.calendar_invited_date)
+        agg = await db.execute(
+            select(
+                invite.c.webinar_id,
+                invite.c.calendar_account,
+                dow_expr.label("dow"),
+                sa_func.count().label("total_sent"),
+                sa_func.count()
+                .filter(invite.c.calendar_invite_response == "Yes")
+                .label("yes"),
+                sa_func.count()
+                .filter(invite.c.calendar_invite_response == "Maybe")
+                .label("maybe"),
+            )
+            .where(
+                invite.c.webinar_id.in_(webinar_ids),
+                invite.c.calendar_invited_date.isnot(None),
+            )
+            .group_by(invite.c.webinar_id, invite.c.calendar_account, dow_expr)
+        )
+        for r in agg.all():
+            cells.append(
+                {
+                    "webinar_id": r.webinar_id,
+                    "calendar_account": (r.calendar_account or "").strip() or "(unknown)",
+                    "dow": int(r.dow or 0),
+                    "sent": int(r.total_sent or 0),
+                    "yes": int(r.yes or 0),
+                    "maybe": int(r.maybe or 0),
+                }
+            )
+
+    sender_map: dict[str, dict[str, str]] = {}
+    sender_names: dict[str, str] = {}
+    if webinar_ids:
+        cas = await db.execute(
+            select(
+                CalendarAccountSender.webinar_id,
+                CalendarAccountSender.calendar_account,
+                CalendarAccountSender.sender_id,
+            ).where(
+                CalendarAccountSender.user_id == LLOYD_USER_ID,
+                CalendarAccountSender.webinar_id.in_(webinar_ids),
+            )
+        )
+        for wid, acc, sid in cas.all():
+            sender_map.setdefault(wid, {})[acc] = sid
+
+    sresult = await db.execute(
+        select(OutreachSender)
+        .where(OutreachSender.user_id == LLOYD_USER_ID)
+        .order_by(OutreachSender.display_order.asc(), OutreachSender.name.asc())
+    )
+    senders = sresult.scalars().all()
+    for s in senders:
+        sender_names[s.id] = s.name
+
+    return {
+        "webinars": [
+            {
+                "id": w.id,
+                "number": w.number,
+                "variant_label": w.variant_label,
+                "label": _webinar_label(w),
+                "has_upload": w.id in with_upload,
+            }
+            for w in webinars
+        ],
+        "cells": cells,
+        "senders": [
+            {"id": s.id, "name": s.name, "color": s.color}
+            for s in senders
+        ],
+        "sender_map": sender_map,
+        "sender_names": sender_names,
+    }
+
+
 @router.post("/account-senders/bulk", status_code=200)
 async def set_account_senders_bulk(
     body: dict,

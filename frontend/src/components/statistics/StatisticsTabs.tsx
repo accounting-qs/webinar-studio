@@ -4,8 +4,9 @@ import { useState } from "react";
 import { StatisticsPage } from "./StatisticsPage";
 import { CalendarUploadsTab } from "./CalendarUploadsTab";
 import { AccountHealthTab } from "./AccountHealthTab";
+import { DayOfWeekTab } from "./DayOfWeekTab";
 
-type Tab = "statistics" | "calendar-uploads" | "account-health";
+type Tab = "statistics" | "calendar-uploads" | "account-health" | "send-day";
 
 export function StatisticsTabs() {
   const [tab, setTab] = useState<Tab>("statistics");
@@ -23,6 +24,9 @@ export function StatisticsTabs() {
           <TabButton active={tab === "account-health"} onClick={() => setTab("account-health")}>
             Account Health
           </TabButton>
+          <TabButton active={tab === "send-day"} onClick={() => setTab("send-day")}>
+            Send Day
+          </TabButton>
         </div>
       </div>
       <div className="flex-1 min-h-0 overflow-auto">
@@ -30,8 +34,10 @@ export function StatisticsTabs() {
           <StatisticsPage />
         ) : tab === "calendar-uploads" ? (
           <CalendarUploadsTab />
-        ) : (
+        ) : tab === "account-health" ? (
           <AccountHealthTab />
+        ) : (
+          <DayOfWeekTab />
         )}
       </div>
     </div>
