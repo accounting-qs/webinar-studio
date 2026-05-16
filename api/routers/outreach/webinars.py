@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, func as sa_func, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -742,21 +742,33 @@ async def mark_contacts_used(
 _GROUP_CONTACTS_MAX_IDS = 50
 
 
+# Page bound. Groups can have tens of thousands of contacts; paginate the UI
+# fetch to keep the page interactive. CSV export below has no page limit.
+_GROUP_CONTACTS_DEFAULT_LIMIT = 1000
+_GROUP_CONTACTS_MAX_LIMIT = 5000
+
+
+def _parse_group_ids(ids: str) -> list[str]:
+    parsed = [s for s in (x.strip() for x in ids.split(",")) if s]
+    if not parsed:
+        raise HTTPException(400, "ids is required")
+    seen: set[str] = set()
+    parsed = [a for a in parsed if not (a in seen or seen.add(a))]
+    if len(parsed) > _GROUP_CONTACTS_MAX_IDS:
+        raise HTTPException(400, f"Too many ids (max {_GROUP_CONTACTS_MAX_IDS})")
+    return parsed
+
+
 @router.get("/assignment-groups/contacts")
 async def get_group_contacts(
     ids: str = Query(..., description="Comma-separated assignment IDs"),
     status: str = Query("assigned", regex="^(assigned|used|all)$"),
+    limit: int = Query(_GROUP_CONTACTS_DEFAULT_LIMIT, ge=1, le=_GROUP_CONTACTS_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
-    assignment_ids = [s for s in (x.strip() for x in ids.split(",")) if s]
-    if not assignment_ids:
-        raise HTTPException(400, "ids is required")
-    # Dedup while preserving order.
-    seen: set[str] = set()
-    assignment_ids = [a for a in assignment_ids if not (a in seen or seen.add(a))]
-    if len(assignment_ids) > _GROUP_CONTACTS_MAX_IDS:
-        raise HTTPException(400, f"Too many ids (max {_GROUP_CONTACTS_MAX_IDS})")
+    assignment_ids = _parse_group_ids(ids)
 
     asgn_result = await db.execute(
         select(WebinarListAssignment)
@@ -772,14 +784,17 @@ async def get_group_contacts(
 
     not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
 
-    q = select(Contact).where(
-        Contact.assignment_id.in_(assignment_ids),
-        Contact.user_id == LLOYD_USER_ID,
-        not_blocklisted,
+    q = (
+        select(Contact)
+        .where(
+            Contact.assignment_id.in_(assignment_ids),
+            Contact.user_id == LLOYD_USER_ID,
+            not_blocklisted,
+        )
     )
     if status != "all":
         q = q.where(Contact.outreach_status == status)
-    q = q.order_by(Contact.first_name, Contact.email)
+    q = q.order_by(Contact.first_name, Contact.email).limit(limit).offset(offset)
 
     result = await db.execute(q)
     contacts = result.scalars().all()
@@ -803,6 +818,9 @@ async def get_group_contacts(
     webinar_dates = {a.webinar.date.isoformat() for a in assignments if a.webinar and a.webinar.date}
 
     attached_total = counts.get("assigned", 0) + counts.get("used", 0)
+    filtered_total = (
+        sum(counts.values()) if status == "all" else counts.get(status, 0)
+    )
 
     return {
         "group": {
@@ -830,7 +848,98 @@ async def get_group_contacts(
             "used": counts.get("used", 0),
             "total": sum(counts.values()),
         },
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "returned": len(contacts),
+            "filtered_total": filtered_total,
+        },
     }
+
+
+@router.get("/assignment-groups/contacts.csv")
+async def stream_group_contacts_csv(
+    ids: str = Query(..., description="Comma-separated assignment IDs"),
+    status: str = Query("assigned", regex="^(assigned|used|all)$"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    assignment_ids = _parse_group_ids(ids)
+
+    # Verify ownership and gather list names for the CSV's "list_name" column.
+    asgn_result = await db.execute(
+        select(WebinarListAssignment)
+        .where(
+            WebinarListAssignment.id.in_(assignment_ids),
+            WebinarListAssignment.user_id == LLOYD_USER_ID,
+        )
+        .options(selectinload(WebinarListAssignment.bucket), selectinload(WebinarListAssignment.webinar))
+    )
+    assignments = asgn_result.scalars().all()
+    if len(assignments) != len(assignment_ids):
+        raise HTTPException(404, "One or more assignments not found")
+
+    def _list_name(a: WebinarListAssignment) -> str:
+        if a.list_name:
+            return a.list_name
+        bucket = a.bucket.name if a.bucket else ""
+        w = f"W{a.webinar.number}" if a.webinar else ""
+        return " — ".join(p for p in (w, bucket) if p) or a.id
+
+    list_name_by_aid = {a.id: _list_name(a) for a in assignments}
+
+    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+
+    async def row_iter():
+        # CSV header.
+        header_buf = io.StringIO()
+        csv.writer(header_buf).writerow(["email", "first_name", "list_name", "outreach_status", "used_at"])
+        yield header_buf.getvalue()
+
+        q = (
+            select(
+                Contact.email,
+                Contact.first_name,
+                Contact.assignment_id,
+                Contact.outreach_status,
+                Contact.used_at,
+            )
+            .where(
+                Contact.assignment_id.in_(assignment_ids),
+                Contact.user_id == LLOYD_USER_ID,
+                not_blocklisted,
+            )
+        )
+        if status != "all":
+            q = q.where(Contact.outreach_status == status)
+        q = q.order_by(Contact.first_name, Contact.email).execution_options(yield_per=2000)
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        stream = await db.stream(q)
+        async for email, first_name, aid, oreach_status, used_at in stream:
+            writer.writerow([
+                email or "",
+                first_name or "",
+                list_name_by_aid.get(aid, ""),
+                oreach_status or "",
+                used_at.isoformat() if used_at else "",
+            ])
+            # Flush in ~64KB chunks so bytes leave the server steadily and
+            # the platform proxy doesn't think the connection is idle.
+            if buf.tell() > 64 * 1024:
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+        if buf.tell() > 0:
+            yield buf.getvalue()
+
+    filename = f"group_{len(assignment_ids)}_lists_{status}.csv"
+    return StreamingResponse(
+        row_iter(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 class GroupMarkUsedRequest(BaseModel):

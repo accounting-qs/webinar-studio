@@ -2,12 +2,15 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
+  downloadAssignmentGroupContactsCsv,
   fetchAssignmentContacts,
   fetchAssignmentGroupContacts,
   markContactsUsed,
   markGroupContactsUsed,
   type ApiContact,
 } from "@/lib/api";
+
+const GROUP_PAGE_SIZE = 1000;
 
 /* ─── Types ───────────────────────────────────────────────────────────────── */
 
@@ -25,6 +28,11 @@ type NormalizedData = {
   header: NormalizedHeader;
   contacts: ApiContact[];
   counts: { assigned: number; used: number; total: number };
+  // For group mode: how many rows match the current filter on the server, and
+  // whether we've loaded all of them locally yet. Single mode leaves filteredTotal
+  // equal to contacts.length and hasMore false.
+  filteredTotal: number;
+  hasMore: boolean;
 };
 
 type ContactsPageProps =
@@ -45,6 +53,8 @@ export function ContactsPage(props: ContactsPageProps) {
 
   const [data, setData] = useState<NormalizedData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [downloadingCsv, setDownloadingCsv] = useState(false);
   const [filter, setFilter] = useState<StatusFilter>(initialTab);
   const [selectCount, setSelectCount] = useState<number>(0);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -58,7 +68,7 @@ export function ContactsPage(props: ContactsPageProps) {
     try {
       if (isGroup) {
         const ids = groupKey ? groupKey.split(",") : [];
-        const r = await fetchAssignmentGroupContacts(ids, status);
+        const r = await fetchAssignmentGroupContacts(ids, status, { limit: GROUP_PAGE_SIZE, offset: 0 });
         const title = r.group.bucket_name
           ? (r.group.webinar_number != null
             ? `W${r.group.webinar_number} — ${r.group.bucket_name}`
@@ -76,6 +86,8 @@ export function ContactsPage(props: ContactsPageProps) {
           },
           contacts: r.contacts,
           counts: r.counts,
+          filteredTotal: r.pagination.filtered_total,
+          hasMore: r.contacts.length < r.pagination.filtered_total,
         });
       } else {
         const r = await fetchAssignmentContacts(props.assignmentId!, status);
@@ -95,6 +107,8 @@ export function ContactsPage(props: ContactsPageProps) {
           },
           contacts: r.contacts,
           counts: r.counts,
+          filteredTotal: r.contacts.length,
+          hasMore: false,
         });
       }
     } catch (err) {
@@ -103,6 +117,50 @@ export function ContactsPage(props: ContactsPageProps) {
       setLoading(false);
     }
   }, [isGroup, groupKey, props.assignmentId]);
+
+  const loadMore = useCallback(async () => {
+    if (!isGroup || !data || !data.hasMore || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const ids = groupKey ? groupKey.split(",") : [];
+      const r = await fetchAssignmentGroupContacts(ids, filter, {
+        limit: GROUP_PAGE_SIZE,
+        offset: data.contacts.length,
+      });
+      setData((prev) => prev ? ({
+        ...prev,
+        contacts: [...prev.contacts, ...r.contacts],
+        counts: r.counts,
+        filteredTotal: r.pagination.filtered_total,
+        hasMore: prev.contacts.length + r.contacts.length < r.pagination.filtered_total,
+      }) : prev);
+    } catch (err) {
+      console.error("Failed to load more contacts:", err);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [isGroup, groupKey, filter, data, loadingMore]);
+
+  const downloadAllCsv = useCallback(async () => {
+    if (!isGroup || !groupKey || downloadingCsv) return;
+    setDownloadingCsv(true);
+    try {
+      const ids = groupKey.split(",");
+      const { blob, filename } = await downloadAssignmentGroupContactsCsv(ids, filter);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to download CSV:", err);
+    } finally {
+      setDownloadingCsv(false);
+    }
+  }, [isGroup, groupKey, filter, downloadingCsv]);
 
   useEffect(() => {
     setLoading(true);
@@ -345,6 +403,20 @@ export function ContactsPage(props: ContactsPageProps) {
             Export CSV
           </button>
 
+          {isGroup && (
+            <button
+              onClick={downloadAllCsv}
+              disabled={downloadingCsv || data.filteredTotal === 0}
+              className="px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-wait text-white"
+              title={`Download all ${data.filteredTotal.toLocaleString()} contacts as CSV`}
+            >
+              {downloadingCsv && (
+                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+              )}
+              Download All ({data.filteredTotal.toLocaleString()})
+            </button>
+          )}
+
           {hasAssignedSelected && (
             <button
               onClick={handleMarkUsed}
@@ -446,9 +518,23 @@ export function ContactsPage(props: ContactsPageProps) {
           </table>
         </div>
 
-        {/* ── Footer count ──────────────────────────────────────────── */}
-        <div className="mt-3 text-xs text-zinc-400 text-right">
-          Showing {contacts.length} contact{contacts.length !== 1 ? "s" : ""}
+        {/* ── Footer count + Load more ─────────────────────────────── */}
+        <div className="mt-3 flex items-center justify-between gap-3">
+          {data.hasMore ? (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700 disabled:opacity-50 disabled:cursor-wait"
+            >
+              {loadingMore && (
+                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+              )}
+              Load next {Math.min(GROUP_PAGE_SIZE, data.filteredTotal - contacts.length).toLocaleString()}
+            </button>
+          ) : <div />}
+          <div className="text-xs text-zinc-400">
+            Showing {contacts.length.toLocaleString()} of {data.filteredTotal.toLocaleString()} contact{data.filteredTotal !== 1 ? "s" : ""}
+          </div>
         </div>
 
       </div>

@@ -1186,18 +1186,40 @@ export interface AssignmentGroupContactsResponse {
   };
   contacts: ApiContact[];
   counts: { assigned: number; used: number; total: number };
+  pagination: { limit: number; offset: number; returned: number; filtered_total: number };
 }
 
 export async function fetchAssignmentGroupContacts(
   assignmentIds: string[],
-  status: "assigned" | "used" | "all" = "assigned"
+  status: "assigned" | "used" | "all" = "assigned",
+  opts: { limit?: number; offset?: number } = {},
 ): Promise<AssignmentGroupContactsResponse> {
   const ids = assignmentIds.join(",");
-  const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts?ids=${encodeURIComponent(ids)}&status=${status}`, {
+  const params = new URLSearchParams({ ids, status });
+  if (opts.limit != null) params.set("limit", String(opts.limit));
+  if (opts.offset != null) params.set("offset", String(opts.offset));
+  const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts?${params.toString()}`, {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to fetch group contacts");
   return res.json();
+}
+
+export async function downloadAssignmentGroupContactsCsv(
+  assignmentIds: string[],
+  status: "assigned" | "used" | "all" = "all",
+): Promise<{ blob: Blob; filename: string }> {
+  const ids = assignmentIds.join(",");
+  const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts.csv?ids=${encodeURIComponent(ids)}&status=${status}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to export CSV");
+  const blob = await res.blob();
+  // Server sets Content-Disposition; pull a filename from it when present.
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match ? match[1] : `group_contacts_${status}.csv`;
+  return { blob, filename };
 }
 
 export async function markGroupContactsUsed(
