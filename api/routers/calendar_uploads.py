@@ -444,6 +444,32 @@ async def calendar_day_of_week(
                 }
             )
 
+    # Invites with NULL calendar_invited_date — can't bucket by weekday, but
+    # we surface the count per (webinar, account) so users can see what's
+    # missing from the day-of-week analysis.
+    skipped: list[dict] = []
+    if webinar_ids:
+        skip_agg = await db.execute(
+            select(
+                invite.c.webinar_id,
+                invite.c.calendar_account,
+                sa_func.count().label("count"),
+            )
+            .where(
+                invite.c.webinar_id.in_(webinar_ids),
+                invite.c.calendar_invited_date.is_(None),
+            )
+            .group_by(invite.c.webinar_id, invite.c.calendar_account)
+        )
+        for r in skip_agg.all():
+            skipped.append(
+                {
+                    "webinar_id": r.webinar_id,
+                    "calendar_account": (r.calendar_account or "").strip() or "(unknown)",
+                    "count": int(r.count or 0),
+                }
+            )
+
     sender_map: dict[str, dict[str, str]] = {}
     sender_names: dict[str, str] = {}
     if webinar_ids:
@@ -481,6 +507,7 @@ async def calendar_day_of_week(
             for w in webinars
         ],
         "cells": cells,
+        "skipped": skipped,
         "senders": [
             {"id": s.id, "name": s.name, "color": s.color}
             for s in senders

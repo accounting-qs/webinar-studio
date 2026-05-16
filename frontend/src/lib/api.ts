@@ -2127,9 +2127,17 @@ export interface ApiDayOfWeekCell {
   maybe: number;
 }
 
+export interface ApiDayOfWeekSkipped {
+  webinar_id: string;
+  calendar_account: string;
+  /** Rows with NULL calendar_invited_date — cannot be bucketed by weekday. */
+  count: number;
+}
+
 export interface CalendarDayOfWeekResponse {
   webinars: ApiAccountHealthWebinar[];
   cells: ApiDayOfWeekCell[];
+  skipped: ApiDayOfWeekSkipped[];
   senders: ApiAccountHealthSender[];
   sender_map: Record<string, Record<string, string>>;
   sender_names: Record<string, string>;

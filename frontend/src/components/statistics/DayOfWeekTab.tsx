@@ -5,6 +5,7 @@ import {
   fetchCalendarDayOfWeek,
   type ApiAccountHealthWebinar,
   type ApiDayOfWeekCell,
+  type ApiDayOfWeekSkipped,
   type CalendarDayOfWeekResponse,
 } from "@/lib/api";
 
@@ -110,6 +111,39 @@ export function DayOfWeekTab() {
     });
   }, [data, webinarFilter, senderFilter]);
 
+  const filteredSkipped = useMemo<ApiDayOfWeekSkipped[]>(() => {
+    if (!data) return [];
+    return data.skipped.filter((s) => {
+      if (webinarFilter !== "all" && s.webinar_id !== webinarFilter) return false;
+      if (senderFilter !== "all") {
+        const sid = data.sender_map[s.webinar_id]?.[s.calendar_account];
+        if (sid !== senderFilter) return false;
+      }
+      return true;
+    });
+  }, [data, webinarFilter, senderFilter]);
+
+  const skippedTotal = useMemo(
+    () => filteredSkipped.reduce((sum, s) => sum + s.count, 0),
+    [filteredSkipped],
+  );
+
+  const skippedByWebinar = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const s of filteredSkipped) {
+      m[s.webinar_id] = (m[s.webinar_id] ?? 0) + s.count;
+    }
+    return m;
+  }, [filteredSkipped]);
+
+  const skippedByAccount = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const s of filteredSkipped) {
+      m[s.calendar_account] = (m[s.calendar_account] ?? 0) + s.count;
+    }
+    return m;
+  }, [filteredSkipped]);
+
   const overall = useMemo<Bucket[]>(() => {
     const week = emptyWeek();
     for (const c of filteredCells) {
@@ -129,10 +163,15 @@ export function DayOfWeekTab() {
       if (!map[c.webinar_id]) map[c.webinar_id] = emptyWeek();
       addInto(map[c.webinar_id][col], c);
     }
+    // Include webinars that have ONLY skipped (NULL-date) rows so users can
+    // still see those skipped counts.
+    for (const wid of Object.keys(skippedByWebinar)) {
+      if (!map[wid]) map[wid] = emptyWeek();
+    }
     return data.webinars
       .filter((w) => map[w.id])
       .map((w) => ({ webinar: w, days: map[w.id] }));
-  }, [data, filteredCells]);
+  }, [data, filteredCells, skippedByWebinar]);
 
   const byAccount = useMemo(() => {
     if (!data) return [];
@@ -143,10 +182,21 @@ export function DayOfWeekTab() {
       if (!map[c.calendar_account]) map[c.calendar_account] = emptyWeek();
       addInto(map[c.calendar_account][col], c);
     }
+    for (const acc of Object.keys(skippedByAccount)) {
+      if (!map[acc]) map[acc] = emptyWeek();
+    }
     return Object.keys(map)
-      .map((acc) => ({ account: acc, days: map[acc], total: sumWeek(map[acc]) }))
-      .sort((a, b) => b.total.sent - a.total.sent);
-  }, [data, filteredCells]);
+      .map((acc) => ({
+        account: acc,
+        days: map[acc],
+        total: sumWeek(map[acc]),
+        skipped: skippedByAccount[acc] ?? 0,
+      }))
+      .sort(
+        (a, b) =>
+          b.total.sent + b.skipped - (a.total.sent + a.skipped),
+      );
+  }, [data, filteredCells, skippedByAccount]);
 
   if (loading) {
     return <div className="px-6 py-5 text-xs text-zinc-500">Loading…</div>;
@@ -223,8 +273,8 @@ export function DayOfWeekTab() {
         </div>
       ) : (
         <div className="flex-1 min-h-0 overflow-auto px-6 pb-6 space-y-6">
-          <OverviewCard buckets={overall} />
-          <ByWebinarTable rows={byWebinar} />
+          <OverviewCard buckets={overall} skipped={skippedTotal} />
+          <ByWebinarTable rows={byWebinar} skippedByWebinar={skippedByWebinar} />
           <ByAccountTable
             rows={byAccount}
             senderForAccount={(acc) => senderNameFor(data, acc, webinarFilter)}
@@ -235,7 +285,13 @@ export function DayOfWeekTab() {
   );
 }
 
-function OverviewCard({ buckets }: { buckets: Bucket[] }) {
+function OverviewCard({
+  buckets,
+  skipped,
+}: {
+  buckets: Bucket[];
+  skipped: number;
+}) {
   const total = sumWeek(buckets);
   const maxYm = buckets.reduce((m, b) => Math.max(m, ymCount(b)), 0);
   let bestIdx = -1;
@@ -255,6 +311,11 @@ function OverviewCard({ buckets }: { buckets: Bucket[] }) {
         </h3>
         <div className="text-[11px] text-zinc-500">
           {fmtInt(total.sent)} invites · {fmtInt(ymCount(total))} yes+maybe · {fmtPct(total)} overall
+          {skipped > 0 && (
+            <span className="ml-2 text-amber-500" title="Invites with no calendar_invited_date — excluded from day-of-week totals.">
+              · {fmtInt(skipped)} skipped (no date)
+            </span>
+          )}
         </div>
       </div>
       <div className="grid grid-cols-7 gap-2">
@@ -317,6 +378,22 @@ function DayCell({ b }: { b: Bucket }) {
   );
 }
 
+function SkippedCell({ count }: { count: number }) {
+  if (count === 0) {
+    return (
+      <td className="px-3 py-2 text-right text-zinc-500 font-mono">—</td>
+    );
+  }
+  return (
+    <td
+      className="px-3 py-2 text-right font-mono text-amber-500"
+      title="Rows with no calendar_invited_date — excluded from the weekday totals."
+    >
+      {fmtInt(count)}
+    </td>
+  );
+}
+
 function TotalCell({ b }: { b: Bucket }) {
   if (b.sent === 0) {
     return (
@@ -337,8 +414,10 @@ function TotalCell({ b }: { b: Bucket }) {
 
 function ByWebinarTable({
   rows,
+  skippedByWebinar,
 }: {
   rows: { webinar: ApiAccountHealthWebinar; days: Bucket[] }[];
+  skippedByWebinar: Record<string, number>;
 }) {
   if (rows.length === 0) {
     return (
@@ -373,11 +452,18 @@ function ByWebinarTable({
               <th className="text-right px-3 py-2 font-semibold border-l border-zinc-200 dark:border-zinc-800 min-w-[100px]">
                 Total
               </th>
+              <th
+                className="text-right px-3 py-2 font-semibold min-w-[90px]"
+                title="Invites with no calendar_invited_date — excluded from day-of-week totals."
+              >
+                Skipped
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
             {rows.map((r) => {
               const total = sumWeek(r.days);
+              const skipped = skippedByWebinar[r.webinar.id] ?? 0;
               return (
                 <tr
                   key={r.webinar.id}
@@ -390,6 +476,7 @@ function ByWebinarTable({
                     <DayCell key={i} b={b} />
                   ))}
                   <TotalCell b={total} />
+                  <SkippedCell count={skipped} />
                 </tr>
               );
             })}
@@ -404,7 +491,7 @@ function ByAccountTable({
   rows,
   senderForAccount,
 }: {
-  rows: { account: string; days: Bucket[]; total: Bucket }[];
+  rows: { account: string; days: Bucket[]; total: Bucket; skipped: number }[];
   senderForAccount: (acc: string) => string | null;
 }) {
   if (rows.length === 0) {
@@ -445,6 +532,12 @@ function ByAccountTable({
               <th className="text-right px-3 py-2 font-semibold border-l border-zinc-200 dark:border-zinc-800 min-w-[100px]">
                 Total
               </th>
+              <th
+                className="text-right px-3 py-2 font-semibold min-w-[90px]"
+                title="Invites with no calendar_invited_date — excluded from day-of-week totals."
+              >
+                Skipped
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
@@ -468,6 +561,7 @@ function ByAccountTable({
                     <DayCell key={i} b={b} />
                   ))}
                   <TotalCell b={r.total} />
+                  <SkippedCell count={r.skipped} />
                 </tr>
               );
             })}
