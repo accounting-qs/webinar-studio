@@ -1808,26 +1808,27 @@ export async function refreshWgWebinars(): Promise<{ count: number }> {
 
 export async function syncWgSubscribers(broadcastId: string): Promise<{
   broadcast_id: string;
-  total: number;
+  run_id: string;
+  status: string;
 }> {
   const res = await fetch(
     `${API_URL}/connectors/webinargeek/webinars/${encodeURIComponent(broadcastId)}/sync`,
     { method: "POST", headers: authHeaders() }
   );
-  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to sync subscribers"));
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start subscriber sync"));
   return res.json();
 }
 
 export async function syncAllWgSubscribers(): Promise<{
-  broadcasts_synced: number;
-  total_subscribers: number;
-  errors: string[];
+  run_id: string;
+  status: string;
+  broadcasts_queued: number;
 }> {
   const res = await fetch(`${API_URL}/connectors/webinargeek/webinars/sync-all`, {
     method: "POST",
     headers: authHeaders(),
   });
-  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to sync all"));
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start sync-all"));
   return res.json();
 }
 

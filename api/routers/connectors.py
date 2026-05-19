@@ -19,6 +19,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -33,14 +34,14 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
-from api.routers.outreach._helpers import LLOYD_USER_ID
 from db.models import (
-    BlocklistEntry, ConnectorCredential, Webinar, WebinarGeekWebinar, WebinarGeekSubscriber,
+    ConnectorCredential, GHLSyncRun, WebinarGeekWebinar, WebinarGeekSubscriber,
 )
-from db.session import get_db
+from db.session import AsyncSessionLocal, get_db
 from integrations import webinargeek_client as wg
 from integrations import openai_client as oai
 from integrations import ghl_client as ghl
+from services import wg_sync
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +104,24 @@ class RefreshResponse(BaseModel):
 
 
 class SyncResponse(BaseModel):
+    """Returned when a single-broadcast sync is queued in the background.
+
+    Frontend should redirect users to the Sync page (or just toast a
+    "started" message) — final counts are tracked on the sync_run row.
+    """
     broadcast_id: str
-    total: int
+    run_id: str
+    status: str
 
 
 class SyncAllResponse(BaseModel):
-    broadcasts_synced: int
-    total_subscribers: int
-    errors: list[str] = []
+    """Returned when sync-all is queued. Each broadcast gets its own
+    sync_run row in addition to this umbrella row; the UI sees all of them
+    on the Sync page.
+    """
+    run_id: str
+    status: str
+    broadcasts_queued: int
 
 
 class SubscriberOut(BaseModel):
@@ -163,97 +174,6 @@ async def _get_api_key(db: AsyncSession, name: str = "default") -> str:
         # Webinar. Better to sync against default than fail.
         return await _get_api_key(db, "default")
     return row.api_key
-
-
-async def _resolve_api_key_for_broadcast(db: AsyncSession, broadcast_id: str) -> str:
-    """Pick the right WG API key for a broadcast: if any Webinar references
-    this broadcast_id with a webinargeek_credential_id set, use that
-    credential's api_key. Otherwise fall back to the 'default' row.
-    """
-    cred_row = (await db.execute(
-        select(ConnectorCredential)
-        .join(Webinar, Webinar.webinargeek_credential_id == ConnectorCredential.id)
-        .where(
-            Webinar.broadcast_id == broadcast_id,
-            ConnectorCredential.provider == PROVIDER,
-        )
-        .limit(1)
-    )).scalar_one_or_none()
-    if cred_row:
-        return cred_row.api_key
-    return await _get_api_key(db, "default")
-
-
-def _subscriber_values(broadcast_id: str, s: dict) -> dict:
-    """Map WebinarGeek subscription record → our column layout."""
-    wd = s.get("watch_duration")
-    minutes = int(wd // 60) if isinstance(wd, (int, float)) else None
-    return {
-        "broadcast_id": broadcast_id,
-        "subscriber_id": str(s.get("id")) if s.get("id") is not None else None,
-        "email": (s.get("email") or "").strip(),
-        "first_name": s.get("firstname"),
-        "last_name": s.get("surname"),
-        "company": s.get("company"),
-        "job_title": s.get("job_title"),
-        "phone": s.get("phone"),
-        "city": s.get("city"),
-        "country": s.get("country"),
-        "timezone": s.get("time_zone"),
-        "registration_source": s.get("registration_source"),
-        "subscribed_at": wg.unix_to_dt(s.get("created_at")),
-        "unsubscribed_at": wg.unix_to_dt(s.get("unsubscribed_at")),
-        "unsubscribe_source": s.get("unsubscription_source"),
-        "watched_live": s.get("watched_live"),
-        "watched_replay": s.get("watched_replay"),
-        "start_time": wg.unix_to_dt(s.get("watch_start")),
-        "end_time": wg.unix_to_dt(s.get("watch_end")),
-        "minutes_viewing": minutes,
-        "viewing_country": s.get("viewing_country"),
-        "viewing_device": s.get("viewing_device"),
-        "watch_link": s.get("watch_link"),
-        "raw": s,
-        "synced_at": datetime.now(timezone.utc),
-    }
-
-
-async def _sync_one_broadcast(db: AsyncSession, api_key: str, broadcast_id: str) -> int:
-    subs = await wg.list_subscriptions(api_key, broadcast_id)
-    blocklist_rows: list[dict] = []
-    for s in subs:
-        values = _subscriber_values(broadcast_id, s)
-        if not values["email"]:
-            continue
-        stmt = pg_insert(WebinarGeekSubscriber).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["broadcast_id", "email"],
-            set_={k: v for k, v in values.items() if k not in ("broadcast_id", "email")},
-        )
-        await db.execute(stmt)
-        if values.get("unsubscribed_at"):
-            blocklist_rows.append({
-                "user_id": LLOYD_USER_ID,
-                "email": values["email"].lower(),
-                "source": "wg_unsub",
-                "reason": values.get("unsubscribe_source") or "WebinarGeek unsubscribed",
-                "source_ref": values.get("subscriber_id"),
-            })
-    if blocklist_rows:
-        seen: set[str] = set()
-        deduped = []
-        for r in blocklist_rows:
-            if r["email"] in seen:
-                continue
-            seen.add(r["email"])
-            deduped.append(r)
-        bl_stmt = pg_insert(BlocklistEntry).values(deduped).on_conflict_do_nothing(
-            index_elements=["user_id", "email"]
-        )
-        try:
-            await db.execute(bl_stmt)
-        except Exception as exc:
-            logger.warning("Failed to upsert blocklist from WG broadcast %s: %s", broadcast_id, exc)
-    return len(subs)
 
 
 # ---------------------------------------------------------------------------
@@ -772,53 +692,76 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
     return RefreshResponse(count=total)
 
 
-@router.post("/webinargeek/webinars/{broadcast_id}/sync", response_model=SyncResponse)
+@router.post("/webinargeek/webinars/{broadcast_id}/sync", response_model=SyncResponse, status_code=202)
 async def sync_broadcast_subscribers(broadcast_id: str, db: AsyncSession = Depends(get_db)):
-    # Pick the credential by following Webinar → credential. Falls back to
-    # 'default' if no webinar links this broadcast yet.
-    api_key = await _resolve_api_key_for_broadcast(db, broadcast_id)
+    """Queue a background subscriber sync for one broadcast.
+
+    Returns immediately with the sync_run id so the UI can route the user
+    to the Sync page. The actual fetch + upsert keeps running even if
+    the user navigates away.
+    """
     wb = (await db.execute(
         select(WebinarGeekWebinar).where(WebinarGeekWebinar.broadcast_id == broadcast_id)
     )).scalar_one_or_none()
     if not wb:
         raise HTTPException(status_code=404, detail="Broadcast not cached — refresh first")
 
+    task = asyncio.create_task(wg_sync.run_broadcast_sync(broadcast_id, trigger="manual"))
+
+    # Brief wait so the sync_run row exists by the time we read it back.
     try:
-        await _sync_one_broadcast(db, api_key, broadcast_id)
-    except wg.WebinarGeekError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        raise
 
-    wb.last_synced_at = datetime.now(timezone.utc)
-    total = (await db.execute(
-        select(func.count()).where(WebinarGeekSubscriber.broadcast_id == broadcast_id)
-    )).scalar_one()
-    return SyncResponse(broadcast_id=broadcast_id, total=total)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(GHLSyncRun)
+            .where(GHLSyncRun.sync_type == f"wg:{broadcast_id}")
+            .order_by(GHLSyncRun.started_at.desc())
+            .limit(1)
+        )
+        run = result.scalar_one_or_none()
+
+    if run is None:
+        if task.done() and task.exception():
+            raise HTTPException(status_code=409, detail=str(task.exception()))
+        raise HTTPException(status_code=500, detail="Failed to start broadcast sync")
+
+    return SyncResponse(broadcast_id=broadcast_id, run_id=run.id, status=run.status)
 
 
-@router.post("/webinargeek/webinars/sync-all", response_model=SyncAllResponse)
+@router.post("/webinargeek/webinars/sync-all", response_model=SyncAllResponse, status_code=202)
 async def sync_all_broadcasts(db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(WebinarGeekWebinar))).scalars().all()
+    """Queue a background sync-all. One umbrella sync_run row tracks
+    overall progress; each per-broadcast sync also gets its own row.
+    """
+    count = (await db.execute(
+        select(func.count()).select_from(WebinarGeekWebinar)
+    )).scalar_one()
 
-    errors: list[str] = []
-    synced = 0
-    total_subs = 0
-    now = datetime.now(timezone.utc)
-    for r in rows:
-        try:
-            api_key = await _resolve_api_key_for_broadcast(db, r.broadcast_id)
-            count = await _sync_one_broadcast(db, api_key, r.broadcast_id)
-            r.last_synced_at = now
-            synced += 1
-            total_subs += count
-        except wg.WebinarGeekError as e:
-            errors.append(f"{r.broadcast_id}: {e}")
-            logger.warning("sync-all: broadcast %s failed: %s", r.broadcast_id, e)
+    task = asyncio.create_task(wg_sync.run_sync_all(trigger="manual"))
 
-    return SyncAllResponse(
-        broadcasts_synced=synced,
-        total_subscribers=total_subs,
-        errors=errors[:20],
-    )
+    try:
+        await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        raise
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(GHLSyncRun)
+            .where(GHLSyncRun.sync_type == "wg:all")
+            .order_by(GHLSyncRun.started_at.desc())
+            .limit(1)
+        )
+        run = result.scalar_one_or_none()
+
+    if run is None:
+        if task.done() and task.exception():
+            raise HTTPException(status_code=409, detail=str(task.exception()))
+        raise HTTPException(status_code=500, detail="Failed to start sync-all")
+
+    return SyncAllResponse(run_id=run.id, status=run.status, broadcasts_queued=count)
 
 
 # ---------------------------------------------------------------------------

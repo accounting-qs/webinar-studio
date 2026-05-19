@@ -479,15 +479,13 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
   }
 
   async function handleSyncAll() {
-    if (!confirm(`Sync subscribers for all ${rows.length} broadcasts? This may take a while.`)) return;
+    if (!confirm(`Queue subscriber sync for all ${rows.length} broadcasts? Runs in the background — track progress on the Sync page.`)) return;
     setSyncAllRunning(true);
     try {
       const res = await syncAllWgSubscribers();
-      props.onMessage(`Synced ${res.total_subscribers} subscribers across ${res.broadcasts_synced} broadcasts.`);
-      if (res.errors?.length) props.onError(`Errors: ${res.errors.join("; ")}`);
-      await load();
+      props.onMessage(`Queued sync for ${res.broadcasts_queued} broadcasts. Track progress on the Sync page.`);
     } catch (e) {
-      props.onError(e instanceof Error ? e.message : "Sync all failed");
+      props.onError(e instanceof Error ? e.message : "Sync all failed to start");
     } finally {
       setSyncAllRunning(false);
     }
@@ -496,11 +494,10 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
   async function handleSync(id: string) {
     setSyncingId(id);
     try {
-      const res = await syncWgSubscribers(id);
-      props.onMessage(`Synced ${res.total} subscribers for ${id}.`);
-      await load();
+      await syncWgSubscribers(id);
+      props.onMessage(`Sync started for broadcast ${id}. Track progress on the Sync page.`);
     } catch (e) {
-      props.onError(e instanceof Error ? e.message : "Sync failed");
+      props.onError(e instanceof Error ? e.message : "Sync failed to start");
     } finally {
       setSyncingId(null);
     }

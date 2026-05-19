@@ -822,8 +822,8 @@ export function StatisticsPage() {
     try {
       const parts: string[] = [];
       if (summary.broadcastId) {
-        const res = await syncWgSubscribers(summary.broadcastId);
-        parts.push(`WG: ${res.total} subs`);
+        await syncWgSubscribers(summary.broadcastId);
+        parts.push("WG sync started");
       } else {
         parts.push("WG: no broadcast linked");
       }

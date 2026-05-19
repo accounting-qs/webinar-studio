@@ -65,6 +65,8 @@ function formatRelative(iso: string | null): string {
  *   "webinar:136:narrow" -> "Webinar 136 · Narrow"
  *   "webinar:136:deep"   -> "Webinar 136 · Deep"
  *   "webinar:136"        -> "Webinar 136" (legacy)
+ *   "wg:all"             -> "WG · All Broadcasts"
+ *   "wg:<broadcast_id>"  -> "WG · Broadcast <id>"
  */
 function formatSyncType(raw: string): string {
   if (raw.startsWith("webinar:")) {
@@ -74,6 +76,11 @@ function formatSyncType(raw: string): string {
       return `Webinar ${n} · ${phase.charAt(0).toUpperCase() + phase.slice(1)}`;
     }
     return `Webinar ${n}`;
+  }
+  if (raw.startsWith("wg:")) {
+    const id = raw.slice(3);
+    if (id === "all") return "WG · All Broadcasts";
+    return `WG · Broadcast ${id}`;
   }
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
@@ -405,7 +412,9 @@ export function SyncPage() {
                     </td>
                     <td className="px-4 py-2.5">
                       <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border whitespace-nowrap ${
-                        r.sync_type.startsWith("webinar:")
+                        r.sync_type.startsWith("wg:")
+                          ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                          : r.sync_type.startsWith("webinar:")
                           ? "bg-violet-500/15 text-violet-400 border-violet-500/30"
                           : r.sync_type === "full"
                           ? "bg-sky-500/15 text-sky-400 border-sky-500/30"
