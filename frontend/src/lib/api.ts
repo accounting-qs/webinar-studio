@@ -1643,6 +1643,8 @@ export interface WgWebinar {
   cancelled: boolean;
   last_synced_at: string | null;
   synced_subscriber_count: number;
+  credential_id: string | null;
+  credential_name: string | null;
 }
 
 export interface WgSubscriber {
@@ -1784,11 +1786,12 @@ export async function deleteGhlConnector(): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete GHL credentials");
 }
 
-export async function fetchWgWebinars(opts?: { limit?: number; offset?: number; q?: string }): Promise<{ broadcasts: WgWebinar[]; total: number }> {
+export async function fetchWgWebinars(opts?: { limit?: number; offset?: number; q?: string; credential_id?: string }): Promise<{ broadcasts: WgWebinar[]; total: number }> {
   const params = new URLSearchParams();
   if (opts?.limit != null) params.set("limit", String(opts.limit));
   if (opts?.offset != null) params.set("offset", String(opts.offset));
   if (opts?.q) params.set("q", opts.q);
+  if (opts?.credential_id) params.set("credential_id", opts.credential_id);
   const res = await fetch(
     `${API_URL}/connectors/webinargeek/webinars${params.toString() ? `?${params}` : ""}`,
     { headers: authHeaders() }

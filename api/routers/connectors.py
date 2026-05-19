@@ -92,6 +92,8 @@ class BroadcastOut(BaseModel):
     cancelled: bool = False
     last_synced_at: Optional[datetime] = None
     synced_subscriber_count: int = 0
+    credential_id: Optional[str] = None
+    credential_name: Optional[str] = None
 
 
 class BroadcastListResponse(BaseModel):
@@ -568,6 +570,7 @@ async def list_broadcasts(
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     q: Optional[str] = None,
+    credential_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
     base = select(WebinarGeekWebinar)
@@ -584,6 +587,9 @@ async def list_broadcasts(
             WebinarGeekWebinar.internal_title.ilike(like),
             WebinarGeekWebinar.broadcast_id.ilike(like),
         ))
+    if credential_id:
+        base = base.where(WebinarGeekWebinar.credential_id == credential_id)
+        count_base = count_base.where(WebinarGeekWebinar.credential_id == credential_id)
 
     total = (await db.execute(count_base)).scalar_one()
 
@@ -595,6 +601,11 @@ async def list_broadcasts(
     synced_counts = dict((await db.execute(
         select(WebinarGeekSubscriber.broadcast_id, func.count())
         .group_by(WebinarGeekSubscriber.broadcast_id)
+    )).all())
+
+    cred_names = dict((await db.execute(
+        select(ConnectorCredential.id, ConnectorCredential.name)
+        .where(ConnectorCredential.provider == PROVIDER)
     )).all())
 
     return BroadcastListResponse(
@@ -612,6 +623,8 @@ async def list_broadcasts(
                 cancelled=r.cancelled,
                 last_synced_at=r.last_synced_at,
                 synced_subscriber_count=synced_counts.get(r.broadcast_id, 0),
+                credential_id=r.credential_id,
+                credential_name=cred_names.get(r.credential_id) if r.credential_id else None,
             )
             for r in rows
         ],
@@ -639,20 +652,21 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
     if not creds:
         raise HTTPException(status_code=400, detail="No WebinarGeek credentials configured")
 
+    # Tuple per broadcast so we know which credential surfaced it.
+    cred_broadcasts: list[tuple[str, dict]] = []
     all_webinars: list = []
-    all_broadcasts: list = []
     cred_errors: list[str] = []
     for cred in creds:
         try:
             webinars = await wg.list_webinars(cred.api_key)
             broadcasts = await wg.list_broadcasts(cred.api_key)
             all_webinars.extend(webinars)
-            all_broadcasts.extend(broadcasts)
+            cred_broadcasts.extend((cred.id, b) for b in broadcasts)
         except wg.WebinarGeekError as e:
             cred_errors.append(f"{cred.name}: {e}")
             logger.warning("refresh: WG credential %s failed: %s", cred.name, e)
 
-    if not all_broadcasts and cred_errors:
+    if not cred_broadcasts and cred_errors:
         # All credentials failed — surface the error so the UI doesn't show
         # an empty success.
         raise HTTPException(status_code=502, detail="; ".join(cred_errors))
@@ -661,13 +675,14 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
     unknown_meta = {"webinar_id": None, "webinar_title": "", "internal_title": ""}
 
     total = 0
-    for b in all_broadcasts:
+    for cred_id, b in cred_broadcasts:
         broadcast_id = str(b.get("id") or "")
         if not broadcast_id:
             continue
         m = meta.get(broadcast_id, unknown_meta)
         values = {
             "broadcast_id": broadcast_id,
+            "credential_id": cred_id,
             "webinar_id": str(m["webinar_id"]) if m["webinar_id"] is not None else None,
             "name": m["webinar_title"] or f"Broadcast {broadcast_id}",
             "internal_title": m["internal_title"] or None,

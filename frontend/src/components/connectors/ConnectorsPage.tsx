@@ -437,9 +437,11 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
+  const [accountFilter, setAccountFilter] = useState<string>("");
   const [refreshing, setRefreshing] = useState(false);
   const [syncAllRunning, setSyncAllRunning] = useState(false);
   const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [accounts, setAccounts] = useState<ApiWgCredential[]>([]);
 
   async function load(q?: string) {
     setLoading(true);
@@ -454,16 +456,24 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
     }
   }
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    fetchWgCredentials()
+      .then((r) => setAccounts(r.credentials))
+      .catch(() => {});
+  }, []);
 
   const filtered = useMemo(() => {
-    if (!filter.trim()) return rows;
-    const q = filter.toLowerCase();
-    return rows.filter((r) =>
-      r.broadcast_id.includes(q) ||
-      r.name.toLowerCase().includes(q) ||
-      (r.internal_title ?? "").toLowerCase().includes(q)
-    );
-  }, [rows, filter]);
+    const q = filter.trim().toLowerCase();
+    return rows.filter((r) => {
+      if (accountFilter && r.credential_id !== accountFilter) return false;
+      if (!q) return true;
+      return (
+        r.broadcast_id.includes(q) ||
+        r.name.toLowerCase().includes(q) ||
+        (r.internal_title ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [rows, filter, accountFilter]);
 
   async function handleRefresh() {
     setRefreshing(true); props.onError(""); props.onMessage("");
@@ -531,12 +541,24 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
       </header>
 
       <div className="p-4">
-        <input
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter broadcasts..."
-          className="w-64 mb-3 bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-        />
+        <div className="flex items-center gap-2 mb-3">
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter broadcasts..."
+            className="w-64 bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+          />
+          <select
+            value={accountFilter}
+            onChange={(e) => setAccountFilter(e.target.value)}
+            className="bg-zinc-50 dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+          >
+            <option value="">All accounts</option>
+            {accounts.map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </div>
 
         {loading ? (
           <div className="py-8 text-center text-xs text-zinc-500">Loading...</div>
@@ -550,6 +572,7 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
               <thead>
                 <tr className="border-b border-zinc-200 dark:border-zinc-800/60 text-zinc-500 text-[10px] uppercase tracking-wider">
                   <th className="text-left py-2 px-2 font-semibold">ID</th>
+                  <th className="text-left py-2 px-2 font-semibold">Account</th>
                   <th className="text-left py-2 px-2 font-semibold">Internal #</th>
                   <th className="text-left py-2 px-2 font-semibold">Date &amp; Time</th>
                   <th className="text-left py-2 px-2 font-semibold">Duration</th>
@@ -565,6 +588,7 @@ function BroadcastsTab(props: { onMessage: (m: string) => void; onError: (e: str
                 {filtered.map((w) => (
                   <tr key={w.broadcast_id} className="border-b border-zinc-100 dark:border-zinc-800/30 hover:bg-zinc-50 dark:hover:bg-zinc-900/40">
                     <td className="py-2 px-2 font-mono text-zinc-700 dark:text-zinc-300">{w.broadcast_id}</td>
+                    <td className="py-2 px-2 text-zinc-600 dark:text-zinc-400">{w.credential_name || "—"}</td>
                     <td className="py-2 px-2 text-zinc-600 dark:text-zinc-400">{w.internal_title || "—"}</td>
                     <td className="py-2 px-2 text-zinc-600 dark:text-zinc-400">{formatDateTime(w.starts_at)}</td>
                     <td className="py-2 px-2 text-zinc-600 dark:text-zinc-400">{formatDuration(w.duration_seconds)}</td>

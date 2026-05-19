@@ -36,6 +36,13 @@ class WebinarGeekWebinar(Base):
 
     broadcast_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     webinar_id: Mapped[Optional[str]] = mapped_column(String(64))
+    # Which WebinarGeek credential most recently surfaced this broadcast.
+    # Stamped during refresh; rows synced before migration 042 stay NULL
+    # until the next refresh.
+    credential_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("connector_credentials.id", ondelete="SET NULL"),
+    )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     internal_title: Mapped[Optional[str]] = mapped_column(Text)
     starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
