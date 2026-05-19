@@ -406,6 +406,25 @@ export async function releaseWebinarContacts(
   return res.json();
 }
 
+export async function releaseContactsById(
+  contactIds: string[],
+  releaseBatchId?: string,
+): Promise<ReleaseContactsResponse> {
+  const res = await fetch(`${API_URL}/outreach/contacts/releases`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({
+      contact_ids: contactIds,
+      ...(releaseBatchId ? { release_batch_id: releaseBatchId } : {}),
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to release contacts");
+  }
+  return res.json();
+}
+
 /* ── Bucket merge ──────────────────────────────────────────────────────── */
 
 export interface MergeBlockingBucket {

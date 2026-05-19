@@ -7,6 +7,7 @@ import {
   fetchAssignmentGroupContacts,
   markContactsUsed,
   markGroupContactsUsed,
+  releaseContactsById,
   type ApiContact,
 } from "@/lib/api";
 
@@ -61,6 +62,7 @@ export function ContactsPage(props: ContactsPageProps) {
   const [copying, setCopying] = useState(false);
   const [copiedBtn, setCopiedBtn] = useState<"emails" | "names" | null>(null);
   const [marking, setMarking] = useState(false);
+  const [releasing, setReleasing] = useState(false);
 
   /* ── Fetch contacts ─────────────────────────────────────────────────── */
 
@@ -234,6 +236,34 @@ export function ContactsPage(props: ContactsPageProps) {
       setMarking(false);
     }
   }, [isGroup, props.assignmentId, selectedIds, filter, load]);
+
+  /* ── Release selected contacts back to the bucket ────────────────────── */
+
+  const handleRelease = useCallback(async () => {
+    if (selectedIds.size === 0 || releasing) return;
+    const n = selectedIds.size;
+    if (!confirm(`Release ${n.toLocaleString()} contact${n === 1 ? "" : "s"}? They'll be returned to the bucket as available and can be re-assigned to future webinars.`)) {
+      return;
+    }
+    setReleasing(true);
+    try {
+      const result = await releaseContactsById(Array.from(selectedIds));
+      setSelectedIds(new Set());
+      setSelectCount(0);
+      await load(filter);
+      if (result.not_found.length > 0 || result.already_available.length > 0) {
+        console.warn("Release skipped some:", {
+          not_found: result.not_found.length,
+          already_available: result.already_available.length,
+        });
+      }
+    } catch (err) {
+      console.error("Failed to release contacts:", err);
+      alert(err instanceof Error ? err.message : "Failed to release contacts");
+    } finally {
+      setReleasing(false);
+    }
+  }, [selectedIds, releasing, filter, load]);
 
   /* ── Export selected contacts as CSV ─────────────────────────────────── */
 
@@ -427,6 +457,20 @@ export function ContactsPage(props: ContactsPageProps) {
                 <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
               )}
               Mark as Used
+            </button>
+          )}
+
+          {selectedIds.size > 0 && (
+            <button
+              onClick={handleRelease}
+              disabled={releasing}
+              className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-wait text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+              title="Release selected contacts back to the bucket as available"
+            >
+              {releasing && (
+                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+              )}
+              Release
             </button>
           )}
         </div>

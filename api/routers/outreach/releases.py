@@ -40,6 +40,11 @@ class ReleaseRequest(BaseModel):
     release_batch_id: str | None = None
 
 
+class ReleaseByIdRequest(BaseModel):
+    contact_ids: list[str]
+    release_batch_id: str | None = None
+
+
 def _normalize_email(raw: str) -> str | None:
     if not raw:
         return None
@@ -306,3 +311,168 @@ async def list_releases(
         for row in r.all()
     ]
     return {"batches": batches}
+
+
+@router.post("/contacts/releases", status_code=201)
+async def release_contacts_by_id(
+    body: ReleaseByIdRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Release a set of contacts (by id) back to `available`.
+
+    Used by the per-assignment / per-group contacts pages where the operator
+    selects rows directly. Same revert + audit-log + bucket-reconcile pipeline
+    as the email-based endpoint above. Contacts can span multiple webinars and
+    assignments — each contact is logged against its current webinar.
+    """
+    # Dedup, preserve order
+    seen: set[str] = set()
+    contact_ids = [c for c in body.contact_ids if c and not (c in seen or seen.add(c))]
+    if not contact_ids:
+        raise HTTPException(400, "No contact_ids provided")
+
+    # Load contacts + their current assignment+webinar in chunked queries.
+    rows_by_id: dict[str, dict] = {}
+    for chunk in _chunked(contact_ids, _DB_CHUNK_SIZE):
+        c_result = await db.execute(
+            select(
+                Contact.id,
+                Contact.email,
+                Contact.outreach_status,
+                Contact.assignment_id,
+                Contact.bucket_id,
+                Contact.used_at,
+                WebinarListAssignment.webinar_id,
+            )
+            .outerjoin(
+                WebinarListAssignment,
+                Contact.assignment_id == WebinarListAssignment.id,
+            )
+            .where(
+                Contact.user_id == LLOYD_USER_ID,
+                Contact.id.in_(chunk),
+            )
+        )
+        for row in c_result.all():
+            rows_by_id[row.id] = {
+                "id": row.id,
+                "email": row.email,
+                "status": row.outreach_status,
+                "assignment_id": row.assignment_id,
+                "bucket_id": row.bucket_id,
+                "used_at": row.used_at,
+                "webinar_id": row.webinar_id,
+            }
+
+    # Touched assignments — load once so we can decrement remaining counters.
+    touched_assignment_ids = [
+        r["assignment_id"] for r in rows_by_id.values()
+        if r["assignment_id"] and r["status"] == "assigned"
+    ]
+    assignments_by_id: dict[str, WebinarListAssignment] = {}
+    if touched_assignment_ids:
+        a_result = await db.execute(
+            select(WebinarListAssignment).where(
+                WebinarListAssignment.id.in_(set(touched_assignment_ids)),
+                WebinarListAssignment.user_id == LLOYD_USER_ID,
+            )
+        )
+        assignments_by_id = {a.id: a for a in a_result.scalars().all()}
+
+    release_batch_id = body.release_batch_id or str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    not_found: list[str] = []
+    already_available: list[str] = []
+    by_status_count = {"assigned": 0, "used": 0}
+    touched_bucket_ids: set[str] = set()
+    log_rows: list[dict] = []
+    contact_ids_to_release: list[str] = []
+
+    for cid in contact_ids:
+        row = rows_by_id.get(cid)
+        if row is None:
+            not_found.append(cid)
+            continue
+        if row["status"] == "available":
+            already_available.append(cid)
+            continue
+        if row["status"] not in ("assigned", "used"):
+            not_found.append(cid)
+            continue
+        # A contact without a current webinar/assignment shouldn't reach status
+        # assigned/used in practice; skip defensively so we never insert a
+        # ContactReleaseLog row with NULL webinar_id.
+        if not row["webinar_id"]:
+            not_found.append(cid)
+            continue
+
+        log_rows.append({
+            "user_id": LLOYD_USER_ID,
+            "webinar_id": row["webinar_id"],
+            "release_batch_id": release_batch_id,
+            "released_at": now,
+            "released_by": None,
+            "contact_id": row["id"],
+            "email": row["email"],
+            "prior_status": row["status"],
+            "prior_assignment_id": row["assignment_id"],
+            "prior_bucket_id": row["bucket_id"],
+            "prior_used_at": row["used_at"],
+        })
+        contact_ids_to_release.append(row["id"])
+        by_status_count[row["status"]] += 1
+        if row["bucket_id"]:
+            touched_bucket_ids.add(row["bucket_id"])
+
+        if row["status"] == "assigned" and row["assignment_id"]:
+            asn = assignments_by_id.get(row["assignment_id"])
+            if asn:
+                asn.remaining = max(0, (asn.remaining or 0) - 1)
+
+    for chunk in _chunked(contact_ids_to_release, _DB_CHUNK_SIZE):
+        await db.execute(
+            update(Contact)
+            .where(Contact.id.in_(chunk))
+            .values(
+                outreach_status="available",
+                assignment_id=None,
+                assigned_date=None,
+                used_at=None,
+            )
+        )
+
+    LOG_CHUNK = 2000
+    for chunk in _chunked(log_rows, LOG_CHUNK):
+        await db.execute(insert(ContactReleaseLog), chunk)
+
+    bucket_updates: dict[str, int] = {}
+    if touched_bucket_ids:
+        await db.flush()
+        from sqlalchemy import func as sa_func
+        for bucket_id in touched_bucket_ids:
+            cnt_result = await db.execute(
+                select(sa_func.count()).where(
+                    Contact.bucket_id == bucket_id,
+                    Contact.outreach_status == "available",
+                )
+            )
+            available_count = int(cnt_result.scalar() or 0)
+            await db.execute(
+                update(OutreachBucket)
+                .where(OutreachBucket.id == bucket_id)
+                .values(remaining_contacts=available_count)
+            )
+            bucket_updates[bucket_id] = available_count
+
+    await db.flush()
+
+    return {
+        "release_batch_id": release_batch_id,
+        "released": len(contact_ids_to_release),
+        "not_found": not_found,
+        "already_available": already_available,
+        "by_status": by_status_count,
+        "bucket_updates": bucket_updates,
+    }
