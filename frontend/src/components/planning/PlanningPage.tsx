@@ -559,6 +559,8 @@ export function PlanningPage() {
 
   // Assignment form state — scoped to one webinar at a time
   const [assigningWebinarId, setAssigningWebinarId] = useState<string | null>(null);
+  // Webinar id whose Assign request is in flight (button shows spinner + disabled)
+  const [assignInFlight, setAssignInFlight] = useState<string | null>(null);
   const [assignTab, setAssignTab] = useState<"buckets" | "custom_lists">("buckets");
   const [assignBucket, setAssignBucket] = useState("");
   const [assignCustomList, setAssignCustomList] = useState("");
@@ -894,6 +896,7 @@ export function PlanningPage() {
   const handleAssign = useCallback(async (webinarIdOverride?: string) => {
     const targetId = webinarIdOverride || assigningWebinarId;
     if (!assignSender || assignVolume <= 0 || !targetId) return;
+    if (assignInFlight) return;
 
     const isCustomListAssign = assignTab === "custom_lists";
 
@@ -938,6 +941,7 @@ export function PlanningPage() {
       };
     }
 
+    setAssignInFlight(targetId);
     try {
       const assignment = await assignBucketToWebinar(targetId, requestData);
 
@@ -972,8 +976,10 @@ export function PlanningPage() {
     } catch (err) {
       console.error("Failed to assign:", err);
       alert(err instanceof Error ? err.message : "Failed to assign");
+    } finally {
+      setAssignInFlight(null);
     }
-  }, [assignBucket, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignInFlight, assignCountries, assignEmpRange, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
@@ -1961,9 +1967,12 @@ export function PlanningPage() {
                               <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Contacts</label>
                               <input type="number" value={assignVolume || ""} onChange={(e) => { setAssignVolume(parseInt(e.target.value) || 0); setAssignAccounts(0); }} className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500" />
                             </div>
-                            <button onClick={() => handleAssign(w.id)} disabled={(assignTab === "custom_lists" ? !assignCustomList : !assignBucket) || !assignSender || assignVolume <= 0}
-                              className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-200 dark:bg-zinc-700 disabled:text-zinc-500 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap">
-                              Assign →
+                            <button onClick={() => handleAssign(w.id)} disabled={(assignTab === "custom_lists" ? !assignCustomList : !assignBucket) || !assignSender || assignVolume <= 0 || assignInFlight === w.id}
+                              className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-200 dark:disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-wait text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap inline-flex items-center gap-1.5">
+                              {assignInFlight === w.id && (
+                                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                              )}
+                              {assignInFlight === w.id ? "Assigning…" : "Assign →"}
                             </button>
                           </div>
 
