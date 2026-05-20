@@ -247,15 +247,28 @@ export function ContactsPage(props: ContactsPageProps) {
     }
     setReleasing(true);
     try {
-      const result = await releaseContactsById(Array.from(selectedIds));
+      // Scope guard: the server will refuse any contact_id whose current
+      // assignment_id isn't in this list. Single-assignment page → one id;
+      // group page → the group's full id list.
+      const scopeAssignmentIds = isGroup
+        ? (groupKey ? groupKey.split(",") : [])
+        : [props.assignmentId!];
+      const result = await releaseContactsById(Array.from(selectedIds), scopeAssignmentIds);
       setSelectedIds(new Set());
       setSelectCount(0);
       await load(filter);
-      if (result.not_found.length > 0 || result.already_available.length > 0) {
+      const skippedNotFound = result.not_found.length;
+      const skippedAvailable = result.already_available.length;
+      const skippedOutOfScope = result.out_of_scope?.length ?? 0;
+      if (skippedNotFound > 0 || skippedAvailable > 0 || skippedOutOfScope > 0) {
         console.warn("Release skipped some:", {
-          not_found: result.not_found.length,
-          already_available: result.already_available.length,
+          not_found: skippedNotFound,
+          already_available: skippedAvailable,
+          out_of_scope: skippedOutOfScope,
         });
+        if (skippedOutOfScope > 0) {
+          alert(`Released ${result.released.toLocaleString()} contact${result.released === 1 ? "" : "s"}. ${skippedOutOfScope.toLocaleString()} were skipped because they weren't in the visible scope (likely a UI bug — please report).`);
+        }
       }
     } catch (err) {
       console.error("Failed to release contacts:", err);
@@ -263,7 +276,7 @@ export function ContactsPage(props: ContactsPageProps) {
     } finally {
       setReleasing(false);
     }
-  }, [selectedIds, releasing, filter, load]);
+  }, [selectedIds, releasing, filter, load, isGroup, groupKey, props.assignmentId]);
 
   /* ── Export selected contacts as CSV ─────────────────────────────────── */
 

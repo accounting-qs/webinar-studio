@@ -43,6 +43,11 @@ class ReleaseRequest(BaseModel):
 class ReleaseByIdRequest(BaseModel):
     contact_ids: list[str]
     release_batch_id: str | None = None
+    # Scope guard: the assignment(s) the operator is currently looking at.
+    # The server will refuse to release any contact_id whose current
+    # assignment_id is not in this set — protects against a future UI bug
+    # accidentally submitting ids outside the visible page.
+    assignment_ids: list[str] | None = None
 
 
 def _normalize_email(raw: str) -> str | None:
@@ -383,8 +388,13 @@ async def release_contacts_by_id(
     release_batch_id = body.release_batch_id or str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
+    scope_assignment_ids: set[str] | None = (
+        set(body.assignment_ids) if body.assignment_ids else None
+    )
+
     not_found: list[str] = []
     already_available: list[str] = []
+    out_of_scope: list[str] = []
     by_status_count = {"assigned": 0, "used": 0}
     touched_bucket_ids: set[str] = set()
     log_rows: list[dict] = []
@@ -406,6 +416,11 @@ async def release_contacts_by_id(
         # ContactReleaseLog row with NULL webinar_id.
         if not row["webinar_id"]:
             not_found.append(cid)
+            continue
+        # Visible-scope guard: ignore anything not in the assignment(s) the
+        # operator is currently viewing.
+        if scope_assignment_ids is not None and row["assignment_id"] not in scope_assignment_ids:
+            out_of_scope.append(cid)
             continue
 
         log_rows.append({
@@ -473,6 +488,7 @@ async def release_contacts_by_id(
         "released": len(contact_ids_to_release),
         "not_found": not_found,
         "already_available": already_available,
+        "out_of_scope": out_of_scope,
         "by_status": by_status_count,
         "bucket_updates": bucket_updates,
     }

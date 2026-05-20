@@ -379,6 +379,7 @@ export interface ReleaseContactsResponse {
   released: number;
   not_found: string[];
   already_available: string[];
+  out_of_scope?: string[];
   by_status: { assigned: number; used: number };
   bucket_updates: Record<string, number>;
 }
@@ -408,6 +409,7 @@ export async function releaseWebinarContacts(
 
 export async function releaseContactsById(
   contactIds: string[],
+  assignmentIds: string[],
   releaseBatchId?: string,
 ): Promise<ReleaseContactsResponse> {
   const res = await fetch(`${API_URL}/outreach/contacts/releases`, {
@@ -415,6 +417,7 @@ export async function releaseContactsById(
     headers: jsonHeaders(),
     body: JSON.stringify({
       contact_ids: contactIds,
+      assignment_ids: assignmentIds,
       ...(releaseBatchId ? { release_batch_id: releaseBatchId } : {}),
     }),
   });
