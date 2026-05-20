@@ -139,6 +139,7 @@ interface Webinar {
   id: string;
   number: number;
   date: string;
+  isoDate: string;
   status: string;
   broadcastId: string;
   mainTitle: string;
@@ -430,6 +431,7 @@ export function PlanningPage() {
             id: w.id,
             number: w.number,
             date: dateStr,
+            isoDate: w.date,
             status: w.status.charAt(0).toUpperCase() + w.status.slice(1),
             broadcastId: w.broadcast_id || "—",
             mainTitle: w.main_title || "",
@@ -689,8 +691,9 @@ export function PlanningPage() {
       if (field === "number") return { ...w, number: value as number };
       if (field === "variant_label") return { ...w, variantLabel: (value as string | null) || null };
       if (field === "date") {
-        const d = new Date((value as string) + "T00:00:00");
-        return { ...w, date: d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }) };
+        const iso = value as string;
+        const d = new Date(iso + "T00:00:00");
+        return { ...w, isoDate: iso, date: d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }) };
       }
       return w;
     }));
@@ -1448,6 +1451,7 @@ export function PlanningPage() {
         id: created.id,
         number: created.number,
         date: dateStr,
+        isoDate: newWebinarDate,
         status: "Planning",
         broadcastId: "—",
         mainTitle: "",
@@ -1735,11 +1739,10 @@ export function PlanningPage() {
                         {w.expanded && (
                           <div className="flex items-center gap-0.5 ml-1" onClick={(e) => e.stopPropagation()}>
                             <button onClick={() => {
-                              const d = new Date(w.date);
                               setEditWebinar({
                                 id: w.id,
                                 number: w.number,
-                                date: !isNaN(d.getTime()) ? d.toISOString().split("T")[0] : "",
+                                date: w.isoDate,
                                 broadcastId: w.broadcastId === "—" ? "" : w.broadcastId,
                                 status: w.status.toLowerCase(),
                                 registrationLink: w.registrationLink,
@@ -3052,7 +3055,7 @@ export function PlanningPage() {
                   if (!w) return;
                   // Apply all changes
                   if (ew.number !== w.number) await handleUpdateWebinar(ew.id, "number", ew.number);
-                  if (ew.date && ew.date !== (() => { const d = new Date(w.date); return !isNaN(d.getTime()) ? d.toISOString().split("T")[0] : ""; })()) {
+                  if (ew.date && ew.date !== w.isoDate) {
                     await handleUpdateWebinar(ew.id, "date", ew.date);
                   }
                   const currentBroadcast = w.broadcastId === "—" ? "" : w.broadcastId;
