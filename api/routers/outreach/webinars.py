@@ -418,9 +418,18 @@ async def assign_bucket(
             .limit(body.volume)
         )
 
+    # Re-check `outreach_status == 'available'` on the outer UPDATE so PostgreSQL's
+    # EvalPlanQual re-evaluates against the row's current state under READ COMMITTED.
+    # Without this predicate, a concurrent assign request (double-click race) would
+    # silently overwrite the first request's assignment_id on the same rows once it
+    # acquired the row locks — leaving the first assignment with volume>0 but zero
+    # contacts attached. See https://www.postgresql.org/docs/current/transaction-iso.html
     claim_result = await db.execute(
         update(Contact)
-        .where(Contact.id.in_(claim_subq))
+        .where(
+            Contact.id.in_(claim_subq),
+            Contact.outreach_status == "available",
+        )
         .values(
             assignment_id=assignment.id,
             outreach_status="assigned",

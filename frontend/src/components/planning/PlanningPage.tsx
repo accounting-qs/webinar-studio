@@ -561,6 +561,11 @@ export function PlanningPage() {
   const [assigningWebinarId, setAssigningWebinarId] = useState<string | null>(null);
   // Webinar id whose Assign request is in flight (button shows spinner + disabled)
   const [assignInFlight, setAssignInFlight] = useState<string | null>(null);
+  // Synchronous mirror of assignInFlight. React state updates are async, so two
+  // clicks fired within the same tick both see the stale `null` and pass the
+  // state guard — letting two identical POSTs through. The ref updates in the
+  // same call frame and blocks the second handler entry.
+  const assignInFlightRef = useRef<string | null>(null);
   const [assignTab, setAssignTab] = useState<"buckets" | "custom_lists">("buckets");
   const [assignBucket, setAssignBucket] = useState("");
   const [assignCustomList, setAssignCustomList] = useState("");
@@ -896,7 +901,7 @@ export function PlanningPage() {
   const handleAssign = useCallback(async (webinarIdOverride?: string) => {
     const targetId = webinarIdOverride || assigningWebinarId;
     if (!assignSender || assignVolume <= 0 || !targetId) return;
-    if (assignInFlight) return;
+    if (assignInFlightRef.current) return;
 
     const isCustomListAssign = assignTab === "custom_lists";
 
@@ -941,6 +946,7 @@ export function PlanningPage() {
       };
     }
 
+    assignInFlightRef.current = targetId;
     setAssignInFlight(targetId);
     try {
       const assignment = await assignBucketToWebinar(targetId, requestData);
@@ -977,9 +983,10 @@ export function PlanningPage() {
       console.error("Failed to assign:", err);
       alert(err instanceof Error ? err.message : "Failed to assign");
     } finally {
+      assignInFlightRef.current = null;
       setAssignInFlight(null);
     }
-  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignInFlight, assignCountries, assignEmpRange, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
