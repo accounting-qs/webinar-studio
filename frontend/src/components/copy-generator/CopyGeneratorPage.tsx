@@ -1102,6 +1102,14 @@ export function CopyGeneratorPage() {
             <span className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
               {selectedIds.size} bucket{selectedIds.size !== 1 ? "s" : ""} selected
             </span>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              disabled={activeAction !== null}
+              className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              title="Clear selection"
+            >
+              Clear
+            </button>
             <div className="w-px h-5 bg-zinc-200 dark:bg-zinc-700" />
             <div className="flex items-center gap-2">
               <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium">Variations</label>
