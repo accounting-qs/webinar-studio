@@ -707,11 +707,27 @@ class GoHighLevelStatisticsSource:
                       AND LOWER(calendar_invite_response) = 'maybe'
                 ),
             """
+            # Add CSV-only rows to `relevant` so emails that responded yes/maybe
+            # in the CSV but aren't in ghl_contact still land in NLD when they
+            # don't match a planned list. ghl_contact_id is NULL for those rows;
+            # the aggregate uses COALESCE(ghl_contact_id, lem) so they get
+            # counted by email instead of being dropped by COUNT(DISTINCT NULL).
+            relevant_csv_union = """
+                UNION
+                SELECT NULL::text AS ghl_contact_id, lem,
+                       NULL::text AS irh, NULL::int AS bcws, NULL::date AS wrd
+                FROM csv_yes
+                UNION
+                SELECT NULL::text AS ghl_contact_id, lem,
+                       NULL::text AS irh, NULL::int AS bcws, NULL::date AS wrd
+                FROM csv_maybe
+            """
             nld_params["wid"] = wid
         else:
             nld_yes_pred = "irh ~* :yes_re"
             nld_maybe_pred = "irh ~* :maybe_re"
             nld_csv_prefix = ""
+            relevant_csv_union = ""
 
         nld_counts_sql = f"""
             WITH
@@ -728,6 +744,7 @@ class GoHighLevelStatisticsSource:
                    OR g.booked_call_webinar_series = :N
                    OR g.webinar_registration_number = :N
                    {relevant_window_pred}
+                {relevant_csv_union}
             ),
             planned AS (
                 SELECT DISTINCT LOWER(c.email) AS email
@@ -743,11 +760,11 @@ class GoHighLevelStatisticsSource:
                 WHERE p.email IS NULL
             )
             SELECT
-                COUNT(DISTINCT ghl_contact_id)                          AS total_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {nld_yes_pred})   AS yes_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {nld_maybe_pred}) AS maybe_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE bcws = :N)        AS booked_unplanned,
-                COUNT(DISTINCT ghl_contact_id) FILTER (WHERE {self_reg_filter}) AS lp_regs_unplanned
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem))                          AS total_unplanned,
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {nld_yes_pred})   AS yes_unplanned,
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {nld_maybe_pred}) AS maybe_unplanned,
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE bcws = :N)        AS booked_unplanned,
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {self_reg_filter}) AS lp_regs_unplanned
             FROM unplanned
         """
         r = await db.execute(sa_text(nld_counts_sql).bindparams(**nld_params))
@@ -912,6 +929,11 @@ class GoHighLevelStatisticsSource:
             unsub_filter = "g.cold_calendar_unsubscribe_date > :sr_start AND g.cold_calendar_unsubscribe_date <= :sr_end"
         else:
             unsub_filter = "FALSE"
+        # LEFT JOIN ghl_contact so CSV-yes/maybe contacts who haven't been
+        # synced into ghl_contact still count toward yes_marked/maybe_marked.
+        # The GHL-rooted FILTER predicates below (gcal/bookings/self_reg/
+        # unsubscribes) naturally evaluate to false when g is NULL, so those
+        # metrics still correctly attribute only to contacts present in GHL.
         ghl_sql = f"""
             {csv_cte_prefix}
             SELECT
@@ -926,7 +948,7 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {unsub_filter}) AS unsubscribes
             FROM contacts c
             JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             WHERE wla.webinar_id = CAST(:wid AS uuid)
             GROUP BY c.assignment_id
         """
@@ -982,7 +1004,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM contacts c
                 JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-                JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
                 JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)
                 WHERE wla.webinar_id = CAST(:wid AS uuid)
                   AND wgs.broadcast_id = :bid
@@ -1177,11 +1199,23 @@ class GoHighLevelStatisticsSource:
         else:
             window_filter = "FALSE"
             unsub_filter = "FALSE"
+        # In CSV mode the source of truth for yes/maybe is the CSV itself,
+        # not ghl_contact. Use scalar subqueries against csv_yes/csv_maybe so
+        # CSV responders who haven't been synced to GHL still count toward
+        # the webinar-level Marked totals. Bookings/self-reg/unsubs still
+        # need GHL data (they're stored on ghl_contact), so they keep
+        # scanning ghl_contact.
+        if csv_mode:
+            ym_sql = "(SELECT COUNT(*) FROM csv_yes)"
+            mm_sql = "(SELECT COUNT(*) FROM csv_maybe)"
+        else:
+            ym_sql = f"COUNT(g.ghl_contact_id) FILTER (WHERE {yes_pred})"
+            mm_sql = f"COUNT(g.ghl_contact_id) FILTER (WHERE {maybe_pred})"
         ghl_sql = f"""
             {csv_cte_prefix}
             SELECT
-                COUNT(g.ghl_contact_id) FILTER (WHERE {yes_pred}) AS yes_marked,
-                COUNT(g.ghl_contact_id) FILTER (WHERE {maybe_pred}) AS maybe_marked,
+                {ym_sql} AS yes_marked,
+                {mm_sql} AS maybe_marked,
                 COUNT(g.ghl_contact_id) FILTER (WHERE {yes_pred} AND g.booked_call_webinar_series = :N) AS yes_bookings,
                 COUNT(g.ghl_contact_id) FILTER (WHERE {maybe_pred} AND g.booked_call_webinar_series = :N) AS maybe_bookings,
                 COUNT(g.ghl_contact_id) FILTER (WHERE {window_filter}) AS self_reg_marked,
