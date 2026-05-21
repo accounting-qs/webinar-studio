@@ -789,6 +789,67 @@ class GoHighLevelStatisticsSource:
             "totalBookings": booked_u,
         }
 
+        # WG attendance for the unplanned pool: anyone who attended the
+        # broadcast whose email isn't on any planned list for this webinar
+        # (or its sibling variants). Per-list rows already attribute planned
+        # attendees; this row catches the rest so the WG attendance total
+        # ties out to the broadcast.
+        if broadcast_id:
+            ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
+            wg_nld_params: dict[str, Any] = {
+                "planned_wids": planned_webinar_ids,
+                "bid": broadcast_id,
+            }
+            if csv_mode_nld:
+                wg_yes_pred = "LOWER(wgs.email) IN (SELECT lem FROM csv_yes)"
+                wg_maybe_pred = "LOWER(wgs.email) IN (SELECT lem FROM csv_maybe)"
+                wg_csv_prefix = nld_csv_prefix
+                wg_nld_params["wid"] = wid
+            else:
+                wg_yes_pred = "g.calendar_invite_response_history ~* :yes_re"
+                wg_maybe_pred = "g.calendar_invite_response_history ~* :maybe_re"
+                wg_csv_prefix = ""
+                wg_nld_params["yes_re"] = yes_re
+                wg_nld_params["maybe_re"] = maybe_re
+
+            wg_nld_sql = f"""
+                WITH
+                {wg_csv_prefix}
+                planned AS (
+                    SELECT DISTINCT LOWER(c.email) AS email
+                    FROM contacts c
+                    JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                    WHERE wla.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
+                      AND c.email IS NOT NULL
+                )
+                SELECT
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT})                                                  AS total_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10)                    AS ten_min,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)                    AS thirty_min,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred})                                AS yes_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred}   AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred})                              AS maybe_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m
+                FROM webinargeek_subscribers wgs
+                LEFT JOIN planned p ON p.email = LOWER(wgs.email)
+                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
+                WHERE wgs.broadcast_id = :bid
+                  AND p.email IS NULL
+            """
+            r = await db.execute(sa_text(wg_nld_sql).bindparams(**wg_nld_params))
+            wrow = r.mappings().one_or_none()
+            if wrow:
+                nld_metrics["totalAttended"] = int(wrow["total_attended"] or 0)
+                nld_metrics["total10MinPlus"] = int(wrow["ten_min"] or 0)
+                nld_metrics["total30MinPlus"] = int(wrow["thirty_min"] or 0)
+                nld_metrics["yesAttended"] = int(wrow["yes_attended"] or 0)
+                nld_metrics["yes10MinPlus"] = int(wrow["yes_10m"] or 0)
+                nld_metrics["maybeAttended"] = int(wrow["maybe_attended"] or 0)
+                nld_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
+                # Bump total_u so the NO LIST DATA row renders even when the
+                # only signal is a WG attendance match (GHL/CSV signals 0).
+                total_u = max(total_u, int(wrow["total_attended"] or 0))
+
         # Order rows: display_order later than any real list (negative means first; 999999 keeps them at the end)
         rows_out: list[dict[str, Any]] = []
         if nj_count > 0:
