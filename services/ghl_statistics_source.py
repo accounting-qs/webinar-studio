@@ -118,6 +118,29 @@ def _invite_response_regex(webinar_number: int, response: str) -> str:
     return rf"\ye{webinar_number}-{response}\y"
 
 
+async def _fetch_wg_broadcast_totals(db: AsyncSession, broadcast_id: str) -> dict | None:
+    """Return WG broadcast cache totals (subscriptions_count, live_viewers_count,
+    replay_viewers_count) for the given broadcast, or None when no row exists.
+    Used to source authoritative regs/attended for the webinar parent row —
+    the synced `webinargeek_subscribers` table omits no-email registrants.
+    """
+    from sqlalchemy import text as sa_text
+    r = await db.execute(sa_text(
+        """
+        SELECT subscriptions_count, live_viewers_count, replay_viewers_count
+        FROM webinargeek_webinars WHERE broadcast_id = :bid
+        """
+    ).bindparams(bid=broadcast_id))
+    row = r.mappings().one_or_none()
+    if row is None:
+        return None
+    return {
+        "subscriptions_count": int(row["subscriptions_count"] or 0),
+        "live_viewers_count": int(row["live_viewers_count"] or 0),
+        "replay_viewers_count": int(row["replay_viewers_count"] or 0),
+    }
+
+
 async def _csv_mode_for_webinar(db: AsyncSession, webinar_id: str) -> bool:
     """Return True when a completed Added-to-Calendar CSV with response data
     exists for this webinar. When True, Yes/Maybe metrics source from
@@ -535,6 +558,18 @@ class GoHighLevelStatisticsSource:
                     db, w, assignments, prev_date, current_date,
                 )
 
+            # Override registration/attendance totals with the WG broadcast
+            # cache when available. Both the per-list count and the
+            # webinar-wide query only see contacts we've synced (rows in
+            # webinargeek_subscribers); WG's broadcast row carries the
+            # authoritative `subscriptions_count` / `live_viewers_count`
+            # which also covers no-email registrants who never get synced.
+            if w.broadcast_id:
+                wg_totals = await _fetch_wg_broadcast_totals(db, w.broadcast_id)
+                if wg_totals is not None:
+                    summary["totalRegs"] = wg_totals["subscriptions_count"]
+                    summary["totalAttended"] = wg_totals["live_viewers_count"]
+
             synthetic = await self._synthetic_special_rows(
                 db, w, assignments, prev_date, current_date,
                 sibling_webinar_ids=siblings,
@@ -839,16 +874,50 @@ class GoHighLevelStatisticsSource:
             r = await db.execute(sa_text(wg_nld_sql).bindparams(**wg_nld_params))
             wrow = r.mappings().one_or_none()
             if wrow:
-                nld_metrics["totalAttended"] = int(wrow["total_attended"] or 0)
-                nld_metrics["total10MinPlus"] = int(wrow["ten_min"] or 0)
-                nld_metrics["total30MinPlus"] = int(wrow["thirty_min"] or 0)
+                # yes/maybe attendance + 10m breakdown only comes from synced
+                # subscribers (we need the email match to know who responded).
                 nld_metrics["yesAttended"] = int(wrow["yes_attended"] or 0)
                 nld_metrics["yes10MinPlus"] = int(wrow["yes_10m"] or 0)
                 nld_metrics["maybeAttended"] = int(wrow["maybe_attended"] or 0)
                 nld_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
-                # Bump total_u so the NO LIST DATA row renders even when the
-                # only signal is a WG attendance match (GHL/CSV signals 0).
-                total_u = max(total_u, int(wrow["total_attended"] or 0))
+                nld_metrics["total10MinPlus"] = int(wrow["ten_min"] or 0)
+                nld_metrics["total30MinPlus"] = int(wrow["thirty_min"] or 0)
+
+                # totalRegs / totalAttended on NLD reflect the WG-vs-planned
+                # gap: anything WG reports (including no-email registrants
+                # that never sync into webinargeek_subscribers) that we
+                # couldn't attribute to a planned list. Falls back to the
+                # synced-only unplanned count when WG cache is missing.
+                wg_totals_nld = await _fetch_wg_broadcast_totals(db, broadcast_id)
+                if wg_totals_nld is not None:
+                    matched = await db.execute(sa_text(
+                        """
+                        WITH planned AS (
+                            SELECT DISTINCT LOWER(c.email) AS email
+                            FROM contacts c
+                            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                            WHERE wla.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
+                              AND c.email IS NOT NULL
+                        )
+                        SELECT
+                          COUNT(DISTINCT LOWER(wgs.email)) AS planned_regs,
+                          COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE wgs.watched_live = TRUE OR wgs.minutes_viewing > 0) AS planned_attended
+                        FROM webinargeek_subscribers wgs
+                        JOIN planned p ON p.email = LOWER(wgs.email)
+                        WHERE wgs.broadcast_id = :bid
+                        """
+                    ).bindparams(planned_wids=planned_webinar_ids, bid=broadcast_id))
+                    mrow = matched.mappings().one()
+                    planned_regs = int(mrow["planned_regs"] or 0)
+                    planned_attended = int(mrow["planned_attended"] or 0)
+                    nld_total_regs = max(0, wg_totals_nld["subscriptions_count"] - planned_regs)
+                    nld_total_attended = max(0, wg_totals_nld["live_viewers_count"] - planned_attended)
+                    nld_metrics["totalRegs"] = nld_total_regs
+                    nld_metrics["totalAttended"] = nld_total_attended
+                    total_u = max(total_u, nld_total_regs)
+                else:
+                    nld_metrics["totalAttended"] = int(wrow["total_attended"] or 0)
+                    total_u = max(total_u, int(wrow["total_attended"] or 0))
 
         # Order rows: display_order later than any real list (negative means first; 999999 keeps them at the end)
         rows_out: list[dict[str, Any]] = []
