@@ -26,7 +26,7 @@ const SYSTEM_FIELDS = [
   { value: "status", label: "Status", group: "enrichment" },
   { value: "enrichment_classification", label: "Enrichment Classification", group: "enrichment" },
   { value: "primary_identity", label: "Primary Identity", group: "enrichment" },
-  { value: "characteristic", label: "Characteristic", group: "enrichment" },
+  { value: "sub_identity", label: "Sub-Identity", group: "enrichment" },
   { value: "sector", label: "Sector", group: "enrichment" },
   { value: "lead_list_name", label: "Lead List Name", group: "source" },
   { value: "segment_name", label: "Segment Name", group: "source" },
@@ -61,7 +61,9 @@ const AUTO_MAP: Record<string, string> = {
   scraper: "scraper",
   enrichment_classification: "enrichment_classification",
   primary_identity: "primary_identity",
-  characteristic: "characteristic",
+  // Legacy header name kept so older CSVs still auto-map to the renamed column.
+  characteristic: "sub_identity",
+  sub_identity: "sub_identity",
   sector: "sector",
 };
 

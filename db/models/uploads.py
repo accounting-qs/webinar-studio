@@ -96,7 +96,7 @@ class Contact(Base):
     scraper: Mapped[Optional[str]] = mapped_column(Text)
     enrichment_classification: Mapped[Optional[str]] = mapped_column(Text)
     primary_identity: Mapped[Optional[str]] = mapped_column(Text)
-    characteristic: Mapped[Optional[str]] = mapped_column(Text)
+    sub_identity: Mapped[Optional[str]] = mapped_column(Text)
     sector: Mapped[Optional[str]] = mapped_column(Text)
 
     # Custom fields stored as JSONB
