@@ -461,11 +461,26 @@ class GHLClient:
                 await asyncio.sleep(self._page_delay_s)
 
 
+_CUSTOM_FIELD_VALUE_KEYS = (
+    # /contacts/search and /opportunities/{id}
+    "fieldValue", "value",
+    # /opportunities/search uses typed-by-shape keys; first non-null wins.
+    # fieldValueDate is Unix milliseconds — _parse_dt accepts ints.
+    "fieldValueString", "fieldValueDate", "fieldValueArray", "fieldValueNumber",
+)
+
+
 def parse_custom_fields(raw: list[dict] | None) -> dict[str, object]:
     """Convert GHL `customFields` array to {fieldId: value} dict.
 
-    GHL returns entries shaped like {"id": "...", "value": X} or
-    {"id": "...", "fieldValue": X} depending on endpoint.
+    GHL uses different value-key shapes per endpoint:
+      - /contacts/search:        {"id": ..., "value": X}
+      - /opportunities/{id}:     {"id": ..., "fieldValue": X}
+      - /opportunities/search:   {"id": ..., "fieldValueString": ..., "type": ...}
+                                 or fieldValueDate (epoch-ms int) / fieldValueArray
+                                 / fieldValueNumber depending on the field's type.
+    We accept all of them; first non-null wins so the dropped-shape variants
+    don't blow away a populated value.
     """
     out: dict[str, object] = {}
     if not raw:
@@ -474,7 +489,12 @@ def parse_custom_fields(raw: list[dict] | None) -> dict[str, object]:
         fid = item.get("id")
         if not fid:
             continue
-        val = item.get("fieldValue") if "fieldValue" in item else item.get("value")
+        val: object = None
+        for k in _CUSTOM_FIELD_VALUE_KEYS:
+            v = item.get(k)
+            if v is not None:
+                val = v
+                break
         out[fid] = val
     return out
 

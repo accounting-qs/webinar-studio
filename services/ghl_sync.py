@@ -96,8 +96,23 @@ def _parse_dt(value: object) -> datetime | None:
         return None
     if isinstance(value, datetime):
         return value
+    # /opportunities/search returns fieldValueDate as Unix milliseconds (int
+    # or numeric string). Anything that looks like a 13-digit epoch counts.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
     try:
-        s = str(value)
+        s = str(value).strip()
+        if not s:
+            return None
+        # Numeric string that's plausibly an epoch-ms timestamp
+        if s.lstrip("-").isdigit() and len(s.lstrip("-")) >= 12:
+            try:
+                return datetime.fromtimestamp(int(s) / 1000.0, tz=timezone.utc)
+            except (ValueError, OSError, OverflowError):
+                return None
         # GHL returns ISO 8601; also handles trailing Z
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
