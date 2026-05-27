@@ -130,7 +130,21 @@ def _parse_invited_date(value: str) -> datetime | None:
     v = value.strip()
     if not v:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%-m/%-d/%Y",
+        "%m/%d/%y %I:%M %p",
+        "%m/%d/%y %H:%M",
+        "%m/%d/%y",
+        "%-m/%-d/%y",
+    ):
         try:
             dt = datetime.strptime(v, fmt)
             return dt.replace(tzinfo=timezone.utc)
