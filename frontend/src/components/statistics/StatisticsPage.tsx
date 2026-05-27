@@ -479,7 +479,11 @@ function placeholderWebinar(
 
 /* ─── Bucket-grouped child-row renderer ─────────────────────────────── */
 
-const BASE_SUM_KEYS = ["accountsNeeded", "invited", "actuallyUsed"] as const;
+/** Metric formats whose values are raw counts (or sum-by-design currency),
+ * so summing across a bucket's lists is meaningful. Percentages, per-1k,
+ * and ratio columns intentionally stay blank on bucket headers — averaging
+ * those across child rows would be misleading. */
+const SUMMABLE_FORMATS = new Set<string>(["number"]);
 
 function sumMetric(rows: ApiStatisticsRow[], key: string): number {
   let total = 0;
@@ -647,7 +651,11 @@ function renderGroupedRows(
       }
     }
     const summed: Record<string, number> = {};
-    for (const k of BASE_SUM_KEYS) summed[k] = sumMetric(lists, k);
+    for (const col of METRIC_COLUMNS) {
+      if (SUMMABLE_FORMATS.has(col.format)) {
+        summed[col.key] = sumMetric(lists, col.key);
+      }
+    }
 
     return (
       <tr
@@ -697,9 +705,9 @@ function renderGroupedRows(
           </div>
         </td>
         {METRIC_COLUMNS.map((col, idx) => {
-          const isBase = (BASE_SUM_KEYS as readonly string[]).includes(col.key);
-          const val = isBase ? summed[col.key] : 0;
-          const show = isBase && val > 0;
+          const isSummable = SUMMABLE_FORMATS.has(col.format);
+          const val = isSummable ? summed[col.key] : 0;
+          const show = isSummable && val > 0;
           return (
             <td
               key={col.key}
@@ -1282,14 +1290,6 @@ export function StatisticsPage() {
                   <td className={`px-2 py-2.5 ${W_NUM} ${sNumP}`}>
                     <div className="flex items-center gap-2">
                       <span className="text-zinc-900 dark:text-zinc-100 font-bold text-sm">{w.number}</span>
-                      {w.variantLabel && (
-                        <span
-                          title={`A/B variant: ${w.variantLabel}`}
-                          className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30"
-                        >
-                          {w.variantLabel}
-                        </span>
-                      )}
                       <span className="text-zinc-500">{w.date ?? "\u2014"}</span>
                       {isLoading && (
                         <span
@@ -1298,6 +1298,16 @@ export function StatisticsPage() {
                         />
                       )}
                     </div>
+                    {w.variantLabel && (
+                      <div className="mt-1">
+                        <span
+                          title={`A/B variant: ${w.variantLabel}`}
+                          className="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30 max-w-[184px] truncate align-middle"
+                        >
+                          {w.variantLabel}
+                        </span>
+                      </div>
+                    )}
                     {w.title && w.title !== "TOTAL" && (
                       <div className="text-[10px] text-zinc-500 mt-0.5 truncate max-w-[200px]">{w.title}</div>
                     )}
