@@ -2,6 +2,7 @@
 import asyncio
 import csv
 import io
+import json
 import os
 import traceback
 import uuid
@@ -75,6 +76,66 @@ def _parse_csv_line(line: str) -> list[str]:
     for row in reader:
         return [cell.strip() for cell in row]
     return []
+
+
+# Column order used by the COPY → staging path in _process_csv_import.
+# Server defaults handle id (via gen_uuid when not provided — but we provide one),
+# outreach_status, custom_data, created_at, updated_at; assigned_date, used_at,
+# assignment_id stay NULL.
+_COPY_COLUMNS: tuple[str, ...] = (
+    "id", "user_id", "upload_id", "bucket_id", "outreach_status",
+    "contact_id", "first_name", "last_name", "email", "company_website",
+    "bucket_name", "classification", "confidence", "reasoning", "cost", "status",
+    "lead_list_name", "segment_name", "created_date", "industry", "employee_range",
+    "country", "database_provider", "scraper", "enrichment_classification",
+    "primary_identity", "sub_identity", "sector",
+    "custom_data",
+)
+
+
+def _contact_to_copy_tuple(c: dict) -> tuple:
+    """Return contact dict values in _COPY_COLUMNS order for asyncpg COPY."""
+    return (
+        c["id"],
+        c["user_id"],
+        c.get("upload_id"),
+        c.get("bucket_id"),
+        c.get("outreach_status", "available"),
+        c.get("contact_id"),
+        c.get("first_name"),
+        c.get("last_name"),
+        c.get("email"),
+        c.get("company_website"),
+        c.get("bucket_name"),
+        c.get("classification"),
+        c.get("confidence"),
+        c.get("reasoning"),
+        c.get("cost"),
+        c.get("status"),
+        c.get("lead_list_name"),
+        c.get("segment_name"),
+        c.get("created_date"),
+        c.get("industry"),
+        c.get("employee_range"),
+        c.get("country"),
+        c.get("database_provider"),
+        c.get("scraper"),
+        c.get("enrichment_classification"),
+        c.get("primary_identity"),
+        c.get("sub_identity"),
+        c.get("sector"),
+        c.get("custom_data") or {},
+    )
+
+
+# asyncpg JSONB binary codec: 0x01 version byte + UTF-8 JSON. Required because
+# asyncpg has no default codec for jsonb (it ships bytes through otherwise).
+def _jsonb_dumps(v) -> bytes:
+    return b"\x01" + json.dumps(v).encode("utf-8")
+
+
+def _jsonb_loads(v: bytes):
+    return json.loads(v[1:].decode("utf-8"))
 
 
 @router.get("/uploads")
@@ -1001,10 +1062,33 @@ async def _process_csv_import(
                 contact["email"] = contact["email"].lower().strip()
             return contact
 
+        # Pre-compute the INSERT…SELECT statement that resolves conflicts.
+        _cols_csv = ", ".join(_COPY_COLUMNS)
+        if duplicate_mode == "overwrite":
+            _conflict_set = ", ".join(
+                f"{c} = EXCLUDED.{c}"
+                for c in _COPY_COLUMNS
+                if c not in ("id", "user_id", "email", "created_at")
+            )
+            _conflict_sql = (
+                f"INSERT INTO contacts ({_cols_csv}) "
+                f"SELECT {_cols_csv} FROM _staging_contacts "
+                f"ON CONFLICT ON CONSTRAINT uq_contacts_user_email "
+                f"DO UPDATE SET {_conflict_set}"
+            )
+        else:
+            _conflict_sql = (
+                f"INSERT INTO contacts ({_cols_csv}) "
+                f"SELECT {_cols_csv} FROM _staging_contacts "
+                f"ON CONFLICT ON CONSTRAINT uq_contacts_user_email DO NOTHING"
+            )
+
         async def _flush_batch(conn, rows_to_insert: list[dict]) -> tuple[int, int, int]:
-            """Deduplicate within batch and insert via the provided conn. Caller owns the
-            transaction so the insert + progress UPDATE share a single commit. Returns
-            (inserted, skipped, overwritten)."""
+            """Deduplicate within batch then COPY to a TEMP table and resolve conflicts
+            via INSERT…SELECT…ON CONFLICT. Caller owns the transaction so the staging
+            CREATE/COPY/INSERT and the upload-history progress UPDATE share one commit
+            (and the temp table is dropped at COMMIT). Returns (inserted, skipped,
+            overwritten)."""
             seen: dict[str, int] = {}
             dupes = 0
             for i, r in enumerate(rows_to_insert):
@@ -1020,26 +1104,42 @@ async def _process_csv_import(
             if not rows_to_insert:
                 return 0, dupes, 0
 
-            stmt = pg_insert(Contact.__table__).values(rows_to_insert)
-            if duplicate_mode == "overwrite":
-                set_cols = {
-                    c.name: getattr(stmt.excluded, c.name)
-                    for c in Contact.__table__.columns
-                    if c.name not in ("id", "user_id", "email", "created_at")
-                }
-                stmt = stmt.on_conflict_do_update(constraint="uq_contacts_user_email", set_=set_cols)
-                result = await conn.execute(stmt)
-                return 0, dupes, result.rowcount
-            else:
-                stmt = stmt.on_conflict_do_nothing(constraint="uq_contacts_user_email")
-                result = await conn.execute(stmt)
-                b_ins = result.rowcount
-                return b_ins, dupes + (len(rows_to_insert) - b_ins), 0
+            # Reach the raw asyncpg connection for COPY + JSONB codec.
+            raw = await conn.get_raw_connection()
+            asyncpg_conn = raw.driver_connection
+            await asyncpg_conn.set_type_codec(
+                "jsonb",
+                encoder=_jsonb_dumps,
+                decoder=_jsonb_loads,
+                schema="pg_catalog",
+                format="binary",
+            )
 
-        # Single-pass: iterate rows, create buckets on the fly, batch insert
-        # asyncpg limit: 32767 params per query. Each contact has ~29 columns.
-        # 32767 / 29 ≈ 1130, so 1000 rows per batch is safe.
-        BATCH_SIZE = 1000
+            # Fresh temp table per batch; ON COMMIT DROP cleans up at txn end.
+            await conn.exec_driver_sql(
+                "CREATE TEMP TABLE _staging_contacts "
+                "(LIKE contacts INCLUDING DEFAULTS) ON COMMIT DROP"
+            )
+
+            records = [_contact_to_copy_tuple(r) for r in rows_to_insert]
+            await asyncpg_conn.copy_records_to_table(
+                "_staging_contacts",
+                records=records,
+                columns=list(_COPY_COLUMNS),
+            )
+
+            result = await conn.exec_driver_sql(_conflict_sql)
+            affected = result.rowcount or 0
+            if duplicate_mode == "overwrite":
+                # rowcount = inserts + updates combined; today's code reports this as overwritten.
+                return 0, dupes, affected
+            return affected, dupes + (len(rows_to_insert) - affected), 0
+
+        # Single-pass: iterate rows, create buckets on the fly, batch insert via COPY.
+        # asyncpg's 32767-param limit applied to pg_insert.values(); the COPY path
+        # (binary protocol, no params) lets us go much wider. 5000 trades batch
+        # blast radius for fewer round-trips and amortises temp-table overhead.
+        BATCH_SIZE = 5000
         inserted = 0
         skipped = 0
         overwritten = 0
