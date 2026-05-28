@@ -1493,7 +1493,7 @@ export function PlanningPage() {
   /* ── Filtered webinars ─────────────────────────────────────────────── */
 
   const filteredWebinars = useMemo(() => {
-    let result = webinars;
+    let result = [...webinars].sort((a, b) => b.isoDate.localeCompare(a.isoDate));
     // Sender filter: keep the webinar, but show only lists belonging to the selected sender
     if (senderFilterId) {
       result = result
