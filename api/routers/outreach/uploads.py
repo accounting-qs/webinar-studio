@@ -1001,8 +1001,10 @@ async def _process_csv_import(
                 contact["email"] = contact["email"].lower().strip()
             return contact
 
-        async def _flush_batch(rows_to_insert: list[dict]) -> tuple[int, int, int]:
-            """Deduplicate within batch, insert, return (inserted, skipped, overwritten)."""
+        async def _flush_batch(conn, rows_to_insert: list[dict]) -> tuple[int, int, int]:
+            """Deduplicate within batch and insert via the provided conn. Caller owns the
+            transaction so the insert + progress UPDATE share a single commit. Returns
+            (inserted, skipped, overwritten)."""
             seen: dict[str, int] = {}
             dupes = 0
             for i, r in enumerate(rows_to_insert):
@@ -1015,34 +1017,24 @@ async def _process_csv_import(
                 keep = set(seen.values()) | {i for i, r in enumerate(rows_to_insert) if not r.get("email")}
                 rows_to_insert = [rows_to_insert[i] for i in sorted(keep)]
 
-            b_ins, b_skip, b_over = 0, dupes, 0
-            # Retry up to 3 times on connection errors (Supabase pooler drops idle connections)
-            for attempt in range(3):
-                try:
-                    async with engine.begin() as conn:
-                        stmt = pg_insert(Contact.__table__).values(rows_to_insert)
-                        if duplicate_mode == "overwrite":
-                            set_cols = {
-                                c.name: getattr(stmt.excluded, c.name)
-                                for c in Contact.__table__.columns
-                                if c.name not in ("id", "user_id", "email", "created_at")
-                            }
-                            stmt = stmt.on_conflict_do_update(constraint="uq_contacts_user_email", set_=set_cols)
-                            result = await conn.execute(stmt)
-                            b_over = result.rowcount
-                        else:
-                            stmt = stmt.on_conflict_do_nothing(constraint="uq_contacts_user_email")
-                            result = await conn.execute(stmt)
-                            b_ins = result.rowcount
-                            b_skip += len(rows_to_insert) - result.rowcount
-                    break  # success
-                except Exception as e:
-                    if attempt < 2 and ("connection" in str(e).lower() or "timeout" in str(e).lower()):
-                        print(f"[IMPORT] DB retry {attempt+1}: {e}")
-                        await asyncio.sleep(1)
-                    else:
-                        raise
-            return b_ins, b_skip, b_over
+            if not rows_to_insert:
+                return 0, dupes, 0
+
+            stmt = pg_insert(Contact.__table__).values(rows_to_insert)
+            if duplicate_mode == "overwrite":
+                set_cols = {
+                    c.name: getattr(stmt.excluded, c.name)
+                    for c in Contact.__table__.columns
+                    if c.name not in ("id", "user_id", "email", "created_at")
+                }
+                stmt = stmt.on_conflict_do_update(constraint="uq_contacts_user_email", set_=set_cols)
+                result = await conn.execute(stmt)
+                return 0, dupes, result.rowcount
+            else:
+                stmt = stmt.on_conflict_do_nothing(constraint="uq_contacts_user_email")
+                result = await conn.execute(stmt)
+                b_ins = result.rowcount
+                return b_ins, dupes + (len(rows_to_insert) - b_ins), 0
 
         # Single-pass: iterate rows, create buckets on the fly, batch insert
         # asyncpg limit: 32767 params per query. Each contact has ~29 columns.
@@ -1099,35 +1091,54 @@ async def _process_csv_import(
                             )
                         return
 
-                # Build contacts and flush
+                # Build contacts; insert + progress UPDATE share one transaction
                 contacts = [_build_contact(r) for r in batch_rows]
-                try:
-                    b_ins, b_skip, b_over = await _flush_batch(contacts)
-                    inserted += b_ins
-                    skipped += b_skip
-                    overwritten += b_over
-                except Exception as e:
-                    print(f"[IMPORT] Batch error at row {processed}: {e}")
+                batch_len = len(batch_rows)
+                new_processed = processed + batch_len
+                total_rows = max(total_rows_estimate, new_processed)
+                progress_pct = min(99, int((new_processed / total_rows) * 100))
+
+                committed = False
+                last_error: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        async with engine.begin() as conn:
+                            b_ins, b_skip, b_over = await _flush_batch(conn, contacts)
+                            new_inserted = inserted + b_ins
+                            new_skipped = skipped + b_skip
+                            new_overwritten = overwritten + b_over
+                            await conn.execute(
+                                update(UploadHistory.__table__)
+                                .where(UploadHistory.__table__.c.id == upload_id)
+                                .values(progress=progress_pct, processed_rows=new_processed,
+                                        inserted_count=new_inserted, skipped_count=new_skipped,
+                                        overwritten_count=new_overwritten)
+                            )
+                        inserted = new_inserted
+                        skipped = new_skipped
+                        overwritten = new_overwritten
+                        processed = new_processed
+                        committed = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        msg = str(e).lower()
+                        if attempt < 2 and ("connection" in msg or "timeout" in msg):
+                            print(f"[IMPORT] Batch retry {attempt+1}: {e}")
+                            await asyncio.sleep(1)
+                        else:
+                            break
+
+                if not committed:
+                    print(f"[IMPORT] Batch error at row {processed}: {last_error}")
                     traceback.print_exc()
-                    skipped += len(batch_rows)
+                    skipped += batch_len
+                    processed += batch_len
 
-                processed += len(batch_rows)
                 batch_rows = []
-
-                # Update progress
-                total_rows = max(total_rows_estimate, processed)
-                progress_pct = min(99, int((processed / total_rows) * 100))
                 elapsed = _time.monotonic() - start_time
                 rate = processed / elapsed if elapsed > 0 else 0
                 print(f"[IMPORT] {processed}/{total_rows} ({progress_pct}%) — {rate:.0f} rows/s — {inserted} ins, {skipped} skip")
-                async with engine.begin() as conn:
-                    await conn.execute(
-                        update(UploadHistory.__table__)
-                        .where(UploadHistory.__table__.c.id == upload_id)
-                        .values(progress=progress_pct, processed_rows=processed,
-                                inserted_count=inserted, skipped_count=skipped,
-                                overwritten_count=overwritten)
-                    )
                 await asyncio.sleep(0)
 
         # Flush remaining rows
@@ -1136,16 +1147,35 @@ async def _process_csv_import(
                 await _ensure_buckets(engine, new_bucket_names, bucket_cache)
 
             contacts = [_build_contact(r) for r in batch_rows]
-            try:
-                b_ins, b_skip, b_over = await _flush_batch(contacts)
+            batch_len = len(batch_rows)
+            committed = False
+            last_error: Exception | None = None
+            b_ins = b_skip = b_over = 0
+            for attempt in range(3):
+                try:
+                    async with engine.begin() as conn:
+                        b_ins, b_skip, b_over = await _flush_batch(conn, contacts)
+                    # txn committed cleanly — promote counts after the with block
+                    committed = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    if attempt < 2 and ("connection" in msg or "timeout" in msg):
+                        print(f"[IMPORT] Final batch retry {attempt+1}: {e}")
+                        await asyncio.sleep(1)
+                    else:
+                        break
+
+            if committed:
                 inserted += b_ins
                 skipped += b_skip
                 overwritten += b_over
-            except Exception as e:
-                print(f"[IMPORT] Final batch error: {e}")
+            else:
+                print(f"[IMPORT] Final batch error: {last_error}")
                 traceback.print_exc()
-                skipped += len(batch_rows)
-            processed += len(batch_rows)
+                skipped += batch_len
+            processed += batch_len
 
         total_rows = processed  # actual count after full iteration
         csv_file.close()
