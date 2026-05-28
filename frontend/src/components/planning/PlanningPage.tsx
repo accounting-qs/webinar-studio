@@ -106,6 +106,9 @@ function linkifyToHtml(
 // AvailableBucket now uses ApiBucket from API
 type AvailableBucket = ApiBucket;
 
+const isDisqualifiedBucket = (b: { name: string }) =>
+  b.name.trim().toLowerCase() === "disqualified";
+
 interface PlannedList {
   id: string;
   webinarId: string;
@@ -637,7 +640,9 @@ export function PlanningPage() {
       totalVolume: allLists.reduce((s, l) => s + l.listSize, 0),
       totalRemaining: allLists.reduce((s, l) => s + l.listRemain, 0),
       totalAccounts: Math.round(allLists.reduce((s, l) => s + l.accountsNeeded, 0)),
-      availableBuckets: buckets.reduce((s, b) => s + (b.remaining_contacts || 0), 0),
+      availableBuckets: buckets
+        .filter((b) => !isDisqualifiedBucket(b))
+        .reduce((s, b) => s + (b.remaining_contacts || 0), 0),
     };
   }, [webinars, buckets]);
 
@@ -2079,7 +2084,7 @@ export function PlanningPage() {
                                 <>
                                   <thead>
                                     {(() => {
-                                      const availBuckets = buckets.filter((b) => b.remaining_contacts > 0);
+                                      const availBuckets = buckets.filter((b) => b.remaining_contacts > 0 && !isDisqualifiedBucket(b));
                                       const totalSum = availBuckets.reduce((s, b) => s + b.total_contacts, 0);
                                       const remainSum = availBuckets.reduce((s, b) => s + b.remaining_contacts, 0);
                                       return (
@@ -2092,7 +2097,11 @@ export function PlanningPage() {
                                     })()}
                                   </thead>
                                   <tbody className="divide-y divide-zinc-800/20">
-                                    {buckets.filter((b) => b.remaining_contacts > 0).map((b) => (
+                                    {buckets
+                                      .filter((b) => b.remaining_contacts > 0)
+                                      .slice()
+                                      .sort((a, b) => Number(isDisqualifiedBucket(a)) - Number(isDisqualifiedBucket(b)))
+                                      .map((b) => (
                                       <tr key={b.id} onClick={() => {
                                         setAssignBucket(b.id);
                                         setAssignCountries((b.countries || []).join(", "));
