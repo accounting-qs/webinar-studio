@@ -880,14 +880,67 @@ async def _ensure_buckets(engine, new_names: set, bucket_cache: dict):
 
 # ── Background import task ────────────────────────────────────────────────
 
+def resume_orphan_import(upload: "UploadHistory") -> bool:
+    """Re-attach worker state and respawn _process_csv_import for an upload that
+    was left in status='processing' (or 'paused') by a backend restart.
+
+    Returns True if the task was spawned, False if we can't resume (missing
+    storage_path or field_mappings). Caller is responsible for marking the row
+    as failed in the False case. Single-instance safe; if multiple instances
+    ever run, this needs a row-level lock so only one picks up each orphan.
+    """
+    if upload.id in _active_import_tasks:
+        return True  # Already running in this process
+    if not upload.storage_path or not upload.field_mappings:
+        return False
+
+    pause_event = asyncio.Event()
+    pause_event.set()
+    _import_pause_events[upload.id] = pause_event
+    _import_cancel_flags[upload.id] = False
+
+    def _cleanup(_t):
+        _active_import_tasks.pop(upload.id, None)
+        _import_pause_events.pop(upload.id, None)
+        _import_cancel_flags.pop(upload.id, None)
+
+    task = asyncio.create_task(
+        _process_csv_import(
+            upload.id,
+            upload.storage_path,
+            upload.field_mappings,
+            upload.duplicate_mode or "ignore",
+            upload.upload_mode or "bucket",
+            start_from_row=upload.processed_rows or 0,
+            initial_inserted=upload.inserted_count or 0,
+            initial_skipped=upload.skipped_count or 0,
+            initial_overwritten=upload.overwritten_count or 0,
+        )
+    )
+    _active_import_tasks[upload.id] = task
+    task.add_done_callback(_cleanup)
+    return True
+
+
 async def _process_csv_import(
     upload_id: str,
     storage_path: str,
     field_mappings: dict,
     duplicate_mode: str,
     upload_mode: str = "bucket",
+    *,
+    start_from_row: int = 0,
+    initial_inserted: int = 0,
+    initial_skipped: int = 0,
+    initial_overwritten: int = 0,
 ):
-    """Background task: download CSV from Storage, parse, bulk insert."""
+    """Background task: download CSV from Storage, parse, bulk insert.
+
+    Pass ``start_from_row`` > 0 to resume an orphaned import: the worker reads
+    headers as usual then advances the reader past that many data rows before
+    starting the batch loop. Counters are seeded from the ``initial_*`` args so
+    progress math stays consistent with what was already persisted in the DB.
+    """
     engine = _bg_engine
     if not engine:
         print(f"[IMPORT] FAILED: no DATABASE_URL configured")
@@ -895,10 +948,10 @@ async def _process_csv_import(
 
     import tempfile
     tmp_path = None
-    processed = 0
-    inserted = 0
-    skipped = 0
-    overwritten = 0
+    processed = start_from_row
+    inserted = initial_inserted
+    skipped = initial_skipped
+    overwritten = initial_overwritten
 
     try:
         import httpx
@@ -957,6 +1010,19 @@ async def _process_csv_import(
         except StopIteration:
             csv_file.close()
             raise Exception("CSV file is empty")
+
+        # Resume support: skip past rows we already processed in a previous run.
+        if start_from_row > 0:
+            print(f"[IMPORT] Resuming {upload_id} — skipping first {start_from_row} rows")
+            skipped_ahead = 0
+            for _ in range(start_from_row):
+                try:
+                    next(reader)
+                    skipped_ahead += 1
+                except StopIteration:
+                    break
+            if skipped_ahead < start_from_row:
+                print(f"[IMPORT] Resume skip-ahead ran out of rows at {skipped_ahead} (expected {start_from_row}) — finalizing")
 
         # Build column mapping
         col_map: dict[int, str] = {}

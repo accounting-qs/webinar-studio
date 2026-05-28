@@ -16,32 +16,46 @@ async def lifespan(app: FastAPI):
     logger.info("Webinar Studio starting up")
     # Tables are managed by Alembic migrations — do not create_all here
 
-    # Recover stale imports stuck in "processing" from a previous crash/restart
+    # Resume in-flight imports orphaned by a backend restart. Each import worker
+    # writes processed_rows to its upload row every batch, so we can skip the
+    # CSV reader past that point and continue. If we can't resume (missing
+    # storage_path / field_mappings), fall back to marking failed so the user
+    # knows to retry manually. NOTE: single-instance only — if Render ever
+    # runs >1 instance, this needs a row-level lock so only one picks up each.
     try:
-        from sqlalchemy import select, update
+        from sqlalchemy import select
         from sqlalchemy.ext.asyncio import AsyncSession
         from db.models import UploadHistory, WebinarCalendarUpload
+        from api.routers.outreach.uploads import resume_orphan_import
+        from api.routers.calendar_uploads import resume_orphan_calendar_import
+
         async with AsyncSession(engine) as db:
             result = await db.execute(
                 select(UploadHistory).where(UploadHistory.status.in_(["processing", "paused"]))
             )
             stale = result.scalars().all()
-            if stale:
-                for u in stale:
+            for u in stale:
+                if resume_orphan_import(u):
+                    logger.info(f"Resumed orphan import {u.id} ({u.file_name}) from row {u.processed_rows}")
+                else:
                     u.status = "failed"
-                    u.error_message = "Server restarted during import. Please retry."
-                    logger.warning(f"Marked stale import {u.id} ({u.file_name}) as failed")
+                    u.error_message = "Server restarted during import; resume metadata missing. Please retry."
+                    logger.warning(f"Could not resume {u.id} ({u.file_name}) — marked failed")
+            if stale:
                 await db.commit()
 
             cal_result = await db.execute(
                 select(WebinarCalendarUpload).where(WebinarCalendarUpload.status.in_(["processing", "paused"]))
             )
             cal_stale = cal_result.scalars().all()
-            if cal_stale:
-                for u in cal_stale:
+            for u in cal_stale:
+                if resume_orphan_calendar_import(u):
+                    logger.info(f"Resumed orphan calendar import {u.id} ({u.file_name}) from row {u.processed_rows}")
+                else:
                     u.status = "failed"
-                    u.error_message = "Server restarted during import. Please retry."
-                    logger.warning(f"Marked stale calendar import {u.id} ({u.file_name}) as failed")
+                    u.error_message = "Server restarted during import; resume metadata missing. Please retry."
+                    logger.warning(f"Could not resume calendar {u.id} ({u.file_name}) — marked failed")
+            if cal_stale:
                 await db.commit()
     except Exception as e:
         logger.error(f"Startup recovery failed: {e}")

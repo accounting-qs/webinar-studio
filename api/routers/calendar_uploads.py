@@ -963,24 +963,72 @@ async def delete_calendar_upload(
 # Background import
 # ═══════════════════════════════════════════════════════════════════════════
 
+def resume_orphan_calendar_import(upload: "WebinarCalendarUpload") -> bool:
+    """Re-attach worker state and respawn _process_calendar_csv for an upload that
+    was left in status='processing' or 'paused' by a backend restart.
+
+    Returns True if the task was spawned, False if we can't resume (missing
+    storage_path). Caller is responsible for marking the row as failed in that
+    case. Single-instance safe; see note in outreach resume_orphan_import.
+    """
+    if upload.id in _active_import_tasks:
+        return True
+    if not upload.storage_path:
+        return False
+
+    pause_event = asyncio.Event()
+    pause_event.set()
+    _import_pause_events[upload.id] = pause_event
+    _import_cancel_flags[upload.id] = False
+
+    def _cleanup(_t):
+        _active_import_tasks.pop(upload.id, None)
+        _import_pause_events.pop(upload.id, None)
+        _import_cancel_flags.pop(upload.id, None)
+
+    task = asyncio.create_task(
+        _process_calendar_csv(
+            upload.id,
+            upload.webinar_id,
+            upload.storage_path,
+            upload.sender_id,
+            start_from_row=upload.processed_rows or 0,
+            initial_matched=upload.matched_count or 0,
+            initial_unmatched=upload.unmatched_count or 0,
+        )
+    )
+    _active_import_tasks[upload.id] = task
+    task.add_done_callback(_cleanup)
+    return True
+
+
 async def _process_calendar_csv(
     upload_id: str,
     webinar_id: str,
     storage_path: str,
     sender_id: str | None,
+    *,
+    start_from_row: int = 0,
+    initial_matched: int = 0,
+    initial_unmatched: int = 0,
 ):
     """Stream-parse the CSV from Supabase Storage, upsert in batches of BATCH_SIZE.
     If sender_id is set, every distinct calendar_account in the CSV gets upserted
-    into calendar_account_senders on successful completion (Pattern A)."""
+    into calendar_account_senders on successful completion (Pattern A).
+
+    Pass ``start_from_row`` > 0 to resume an orphaned import after a restart: the
+    reader is advanced that many rows past the header and counters seed from the
+    DB-persisted values.
+    """
     engine = _bg_engine
     if not engine:
         print(f"[CAL_IMPORT] FAILED: no DATABASE_URL configured")
         return
 
     tmp_path: str | None = None
-    processed = 0
-    matched = 0
-    unmatched = 0
+    processed = start_from_row
+    matched = initial_matched
+    unmatched = initial_unmatched
     upserted = 0
     accounts_seen: set[str] = set()
 
@@ -1037,6 +1085,19 @@ async def _process_calendar_csv(
         except StopIteration:
             csv_file.close()
             raise Exception("CSV is empty")
+
+        # Resume support: skip past rows we already processed in a previous run.
+        if start_from_row > 0:
+            print(f"[CAL_IMPORT] Resuming {upload_id} — skipping first {start_from_row} rows")
+            skipped_ahead = 0
+            for _ in range(start_from_row):
+                try:
+                    next(reader)
+                    skipped_ahead += 1
+                except StopIteration:
+                    break
+            if skipped_ahead < start_from_row:
+                print(f"[CAL_IMPORT] Resume skip-ahead ran out of rows at {skipped_ahead} (expected {start_from_row}) — finalizing")
 
         col_map = _build_col_map(headers)
         if "email" not in col_map.values():
