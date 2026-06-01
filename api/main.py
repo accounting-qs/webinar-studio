@@ -96,7 +96,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from api.routers import webhook, competitors, ads, generation, outreach, statistics, connectors, ghl_sync, blocklist, chat, calendar_uploads
+from api.routers import webhook, competitors, ads, generation, outreach, statistics, connectors, ghl_sync, blocklist, chat, calendar_uploads, public_stats
 from api.routers.costs import router as costs_router
 
 app.include_router(webhook.router, prefix="/webhook", tags=["webhook"])
@@ -111,6 +111,7 @@ app.include_router(ghl_sync.router, prefix="/ghl-sync", tags=["ghl-sync"])
 app.include_router(blocklist.router, prefix="/blocklist", tags=["blocklist"])
 app.include_router(chat.router, prefix="/chat", tags=["chat"])
 app.include_router(calendar_uploads.router, prefix="/calendar-uploads", tags=["calendar-uploads"])
+app.include_router(public_stats.router, prefix="/public", tags=["public"])
 
 # Phase 1b — uncomment as built:
 # from api.routers import outputs, brain, monitoring

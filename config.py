@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     # Auth
     API_BEARER_TOKEN: str
 
+    # Public contact-counts endpoint key (optional)
+    STATS_API_KEY: Optional[str] = None
+
     # Apify
     APIFY_API_TOKEN: str
     APIFY_ACTOR_ID: Optional[str] = None
