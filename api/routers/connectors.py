@@ -637,12 +637,15 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
     """
     Refresh strategy (multi-credential):
       For each WebinarGeek credential row,
-        1) GET /webinars      → build {broadcast_id → webinar meta} map
-        2) GET /broadcasts    → flat paginated list with all stats
-        3) Enrich each broadcast with webinar meta, upsert.
+        1) GET /broadcasts (nested_resources=episode,webinar) → flat list
+           with all stats AND the parent webinar embedded per broadcast.
+        2) GET /webinars → {broadcast_id → webinar meta} map, kept only as
+           a fallback for broadcasts missing the embedded webinar.
+        3) Enrich each broadcast with webinar meta (embedded first), upsert.
     Broadcasts are keyed by id; if two accounts somehow surface the same
     id (rare), the last-written value wins. Errors from one credential
-    don't block the others.
+    don't block the others. On conflict, a known internal_title / webinar_id
+    / name is never overwritten by a NULL or "Broadcast {id}" placeholder.
     """
     creds = (await db.execute(
         select(ConnectorCredential)
@@ -679,12 +682,15 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
         broadcast_id = str(b.get("id") or "")
         if not broadcast_id:
             continue
-        m = meta.get(broadcast_id, unknown_meta)
+        # Prefer the webinar embedded on the broadcast (nested_resources);
+        # fall back to the /webinars map for any broadcast missing it.
+        m = wg.webinar_meta_from_broadcast(b) or meta.get(broadcast_id, unknown_meta)
+        placeholder_name = f"Broadcast {broadcast_id}"
         values = {
             "broadcast_id": broadcast_id,
             "credential_id": cred_id,
             "webinar_id": str(m["webinar_id"]) if m["webinar_id"] is not None else None,
-            "name": m["webinar_title"] or f"Broadcast {broadcast_id}",
+            "name": m["webinar_title"] or placeholder_name,
             "internal_title": m["internal_title"] or None,
             "starts_at": wg.unix_to_dt(b.get("date")),
             "duration_seconds": b.get("duration"),
@@ -697,9 +703,22 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
             "updated_at": datetime.now(timezone.utc),
         }
         stmt = pg_insert(WebinarGeekWebinar).values(**values)
+        set_cols = {k: v for k, v in values.items() if k != "broadcast_id"}
+        # A later refresh that loses the webinar link must not wipe values we
+        # already captured: keep the prior internal_title / webinar_id, and the
+        # prior name unless we now have a real (non-placeholder) title.
+        set_cols["internal_title"] = func.coalesce(
+            stmt.excluded.internal_title, WebinarGeekWebinar.internal_title
+        )
+        set_cols["webinar_id"] = func.coalesce(
+            stmt.excluded.webinar_id, WebinarGeekWebinar.webinar_id
+        )
+        set_cols["name"] = func.coalesce(
+            func.nullif(stmt.excluded.name, placeholder_name), WebinarGeekWebinar.name
+        )
         stmt = stmt.on_conflict_do_update(
             index_elements=["broadcast_id"],
-            set_={k: v for k, v in values.items() if k != "broadcast_id"},
+            set_=set_cols,
         )
         await db.execute(stmt)
         total += 1

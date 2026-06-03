@@ -102,11 +102,22 @@ async def list_webinars(api_key: str) -> list[dict[str, Any]]:
 async def list_broadcasts(api_key: str) -> list[dict[str, Any]]:
     """
     Fetch all broadcasts directly from /broadcasts (flat, paginated).
-    Response items do NOT include webinar_id or webinar title — enrich
-    via build_broadcast_meta(list_webinars(...)).
+
+    Requests nested_resources=episode,webinar so each broadcast embeds its
+    parent `webinar` (id, title, internal_title) and `episode` — covering
+    every broadcast including ended ones (unlike the windowed /webinars
+    nesting). Read the webinar via webinar_meta_from_broadcast();
+    build_broadcast_meta(list_webinars(...)) stays a fallback for any
+    broadcast missing the embed.
     """
     async with httpx.AsyncClient() as client:
-        return await _paged(client, "/broadcasts", api_key, items_key="broadcasts")
+        return await _paged(
+            client,
+            "/broadcasts",
+            api_key,
+            params={"nested_resources": "episode,webinar"},
+            items_key="broadcasts",
+        )
 
 
 async def list_subscriptions(api_key: str, broadcast_id: str | int) -> list[dict[str, Any]]:
@@ -153,3 +164,20 @@ def build_broadcast_meta(webinars: list[dict[str, Any]]) -> dict[str, dict[str, 
                 if bid is not None:
                     out[str(bid)] = meta
     return out
+
+
+def webinar_meta_from_broadcast(b: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """
+    Extract {webinar_id, webinar_title, internal_title} from a broadcast's
+    embedded `webinar` resource (present when list_broadcasts requests
+    nested_resources=episode,webinar). Returns None when not embedded so
+    callers can fall back to build_broadcast_meta().
+    """
+    w = b.get("webinar")
+    if not isinstance(w, dict):
+        return None
+    return {
+        "webinar_id": w.get("id"),
+        "webinar_title": w.get("title") or "",
+        "internal_title": w.get("internal_title") or "",
+    }
