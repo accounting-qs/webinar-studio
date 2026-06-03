@@ -5,10 +5,8 @@ A single read-only endpoint that returns live contact counts from Webinar Studio
 ## Endpoint
 
 ```
-GET {BASE_URL}/public/contact-counts
+GET https://competeiq-api.onrender.com/public/contact-counts
 ```
-
-Replace `{BASE_URL}` with the Webinar Studio API base URL (e.g. `https://api.example.com`).
 
 ## Authentication
 
@@ -42,7 +40,7 @@ All values are non-negative integers.
 ## Example
 
 ```bash
-curl -s "{BASE_URL}/public/contact-counts" \
+curl -s "https://competeiq-api.onrender.com/public/contact-counts" \
   -H "X-API-Key: <your-api-key>"
 ```
 

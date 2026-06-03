@@ -13,6 +13,7 @@ const NAV_LINKS = [
   { href: "/blocklist", label: "Blocklist" },
   { href: "/connectors", label: "Connectors" },
   { href: "/sync", label: "Sync" },
+  { href: "/api-docs", label: "API Docs" },
 ];
 
 export function TopNav() {
