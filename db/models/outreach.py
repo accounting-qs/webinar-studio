@@ -110,6 +110,13 @@ class Webinar(Base):
     # WebinarGeek broadcast subscribers (fires 2h after the broadcast's start
     # time). NULL → not yet auto-synced. See services/wg_sync.py.
     broadcast_auto_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Optional link to the PREVIOUS webinar whose WebinarGeek broadcast supplies
+    # this webinar's Nonjoiners (that broadcast's registrants who did NOT watch
+    # live). NULL → fall back to the GHL-based nonjoiner computation.
+    nonjoiner_source_webinar_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("webinars.id", ondelete="SET NULL"),
+    )
     main_title: Mapped[Optional[str]] = mapped_column(Text)
     registration_link: Mapped[Optional[str]] = mapped_column(Text)
     unsubscribe_link: Mapped[Optional[str]] = mapped_column(Text)
@@ -131,6 +138,7 @@ class Webinar(Base):
         Index("ix_webinars_user_id", "user_id"),
         Index("ix_webinars_status", "status"),
         Index("ix_webinars_wg_credential", "webinargeek_credential_id"),
+        Index("ix_webinars_nonjoiner_source", "nonjoiner_source_webinar_id"),
     )
 
 

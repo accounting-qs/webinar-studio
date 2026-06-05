@@ -109,6 +109,9 @@ export interface ApiWebinar {
   /** ConnectorCredential.id of the WebinarGeek account this variant uses
    * for sync. null → use the credential row named 'default'. */
   webinargeek_credential_id: string | null;
+  /** Optional link to the previous webinar whose WG broadcast supplies this
+   * webinar's Nonjoiners (registrants who did not watch live). */
+  nonjoiner_source_webinar_id: string | null;
   date: string;
   status: string;
   broadcast_id: string | null;
@@ -598,6 +601,7 @@ export async function updateWebinar(
     unsubscribe_link: string;
     variant_label: string | null;
     webinargeek_credential_id: string | null;
+    nonjoiner_source_webinar_id: string | null;
   }>
 ): Promise<ApiWebinar> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}`, {

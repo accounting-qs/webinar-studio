@@ -98,6 +98,7 @@ class WebinarUpdate(BaseModel):
     unsubscribe_link: str | None = None
     variant_label: str | None = None
     webinargeek_credential_id: str | None = None
+    nonjoiner_source_webinar_id: str | None = None
 
 
 # ── Assignments ────────────────────────────────────────────────────────────

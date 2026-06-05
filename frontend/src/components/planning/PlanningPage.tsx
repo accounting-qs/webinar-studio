@@ -12,10 +12,11 @@ import {
   fetchCustomLists, fetchCustomListCopies, createCustomListCopy as apiCreateCustomListCopy,
   startWebinarListExport, fetchActiveWebinarListExports, fetchLatestWebinarListExport,
   downloadWebinarListExport,
-  fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
+  fetchWgCredentials,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
-  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
+  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential,
 } from "@/lib/api";
+import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
 
@@ -156,6 +157,8 @@ interface Webinar {
   /** ConnectorCredential.id for the WebinarGeek account this variant
    * uses for sync. null → use the credential row named 'default'. */
   webinargeekCredentialId: string | null;
+  /** Previous webinar whose broadcast supplies this one's Nonjoiners. */
+  nonjoinerSourceWebinarId: string | null;
 }
 
 interface Sender {
@@ -444,6 +447,7 @@ export function PlanningPage() {
             expanded: w.status === "planning",
             variantLabel: w.variant_label,
             webinargeekCredentialId: w.webinargeek_credential_id,
+            nonjoinerSourceWebinarId: w.nonjoiner_source_webinar_id,
           });
         }
 
@@ -557,11 +561,8 @@ export function PlanningPage() {
    * webinar / edit modals open. */
   const [wgCredentials, setWgCredentials] = useState<ApiWgCredential[]>([]);
 
-  // Edit Webinar modal state
-  const [editWebinar, setEditWebinar] = useState<{ id: string; number: number; date: string; broadcastId: string; webinargeekCredentialId: string; status: string; registrationLink: string; unsubscribeLink: string; variantLabel: string } | null>(null);
-  // Broadcast options for the Edit modal's selected WebinarGeek account.
-  const [editBroadcasts, setEditBroadcasts] = useState<WgWebinar[]>([]);
-  const [editBroadcastsLoading, setEditBroadcastsLoading] = useState(false);
+  // Edit Webinar modal state (shared WebinarEditModal manages its own internals)
+  const [editWebinar, setEditWebinar] = useState<EditableWebinar | null>(null);
 
   // Assignment form state — scoped to one webinar at a time
   const [assigningWebinarId, setAssigningWebinarId] = useState<string | null>(null);
@@ -720,23 +721,23 @@ export function PlanningPage() {
     }
   };
 
-  /** Load broadcast options for the Edit modal's selected WG account.
-   * `refresh` first pulls the latest from WebinarGeek (used on modal open). */
-  const loadEditBroadcasts = useCallback(async (credIdForFilter: string | undefined, refresh: boolean) => {
-    setEditBroadcastsLoading(true);
-    try {
-      if (refresh) {
-        try { await refreshWgWebinars(); } catch (e) { console.error("WG refresh failed:", e); }
-      }
-      const { broadcasts } = await fetchWgWebinars({ credential_id: credIdForFilter, limit: 500 });
-      setEditBroadcasts(broadcasts);
-    } catch (e) {
-      console.error("Failed to load broadcasts:", e);
-      setEditBroadcasts([]);
-    } finally {
-      setEditBroadcastsLoading(false);
-    }
-  }, []);
+  /** Merge a saved webinar (returned by the shared modal's PUT) back into
+   * local state so the row reflects the new values without a refetch. */
+  const handleEditSaved = (u: ApiWebinar) => {
+    setWebinars((prev) => prev.map((w) => w.id === u.id ? {
+      ...w,
+      number: u.number,
+      isoDate: u.date,
+      date: new Date(u.date + "T00:00:00").toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" }),
+      broadcastId: u.broadcast_id || "—",
+      webinargeekCredentialId: u.webinargeek_credential_id,
+      nonjoinerSourceWebinarId: u.nonjoiner_source_webinar_id,
+      status: u.status.charAt(0).toUpperCase() + u.status.slice(1),
+      registrationLink: u.registration_link ?? "",
+      unsubscribeLink: u.unsubscribe_link ?? "",
+      variantLabel: u.variant_label,
+    } : w));
+  };
 
   const handleDeleteWebinar = async (webinarId: string) => {
     const w = webinars.find((w) => w.id === webinarId);
@@ -1501,6 +1502,7 @@ export function PlanningPage() {
         expanded: true,
         variantLabel: created.variant_label,
         webinargeekCredentialId: created.webinargeek_credential_id,
+        nonjoinerSourceWebinarId: created.nonjoiner_source_webinar_id,
       };
       setWebinars((prev) => [newWebinar, ...prev]);
       // Auto-open assignment form for the new webinar
@@ -1778,26 +1780,19 @@ export function PlanningPage() {
                         )}
                         {w.expanded && (
                           <div className="flex items-center gap-0.5 ml-1" onClick={(e) => e.stopPropagation()}>
-                            <button onClick={async () => {
+                            <button onClick={() => {
                               setEditWebinar({
                                 id: w.id,
                                 number: w.number,
-                                date: w.isoDate,
+                                isoDate: w.isoDate,
                                 broadcastId: w.broadcastId === "—" ? "" : w.broadcastId,
                                 webinargeekCredentialId: w.webinargeekCredentialId ?? "",
+                                nonjoinerSourceWebinarId: w.nonjoinerSourceWebinarId ?? "",
                                 status: w.status.toLowerCase(),
                                 registrationLink: w.registrationLink,
                                 unsubscribeLink: w.unsubscribeLink,
                                 variantLabel: w.variantLabel ?? "",
                               });
-                              // Ensure WG accounts are loaded, then refresh + load this account's broadcasts.
-                              let creds = wgCredentials;
-                              if (creds.length === 0) {
-                                try { creds = (await fetchWgCredentials()).credentials; setWgCredentials(creds); }
-                                catch (err) { console.error("Failed to load WG credentials:", err); }
-                              }
-                              const credId = (w.webinargeekCredentialId ?? "") || creds.find((c) => c.name === "default")?.id;
-                              loadEditBroadcasts(credId, true);
                             }} className="p-0.5 rounded hover:bg-zinc-200 dark:hover:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors" title="Edit webinar">
                               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                             </button>
@@ -3028,159 +3023,14 @@ export function PlanningPage() {
         </div>
       )}
 
-      {/* ── Edit Webinar Modal ─────────────────────────────────────── */}
+      {/* ── Edit Webinar Modal (shared with the Statistics page) ───── */}
       {editWebinar && (
-        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) setEditWebinar(null); }}>
-          <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800/60 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
-            {/* Header */}
-            <div className="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800/40 flex items-center justify-between">
-              <h3 className="text-base font-bold text-zinc-900 dark:text-zinc-100">Edit Webinar</h3>
-              <button onClick={() => setEditWebinar(null)} className="p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors">
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-              </button>
-            </div>
-
-            {/* Body */}
-            <div className="px-6 py-5 space-y-4">
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Webinar Number</label>
-                <input type="number" value={editWebinar.number}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, number: parseInt(e.target.value) || 0 })}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors"
-                  autoFocus />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Webinar Date</label>
-                <input type="date" value={editWebinar.date}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, date: e.target.value })}
-                  onClick={(e) => (e.target as HTMLInputElement).showPicker?.()}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors [color-scheme:dark] cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-70 [&::-webkit-calendar-picker-indicator]:invert [&::-webkit-calendar-picker-indicator]:cursor-pointer" />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5 flex items-center gap-2">
-                  Variant Label
-                  <span className="text-zinc-500 normal-case font-normal">(optional for a single webinar; required for A/B variants)</span>
-                </label>
-                <input type="text" value={editWebinar.variantLabel}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, variantLabel: e.target.value })}
-                  placeholder='e.g. "Account A" / "WG-Skarpe"'
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">WebinarGeek Account</label>
-                <select
-                  value={editWebinar.webinargeekCredentialId}
-                  onChange={(e) => {
-                    const credId = e.target.value;
-                    setEditWebinar({ ...editWebinar, webinargeekCredentialId: credId, broadcastId: "" });
-                    const filterId = credId || wgCredentials.find((c) => c.name === "default")?.id;
-                    loadEditBroadcasts(filterId, false);
-                  }}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors"
-                >
-                  <option value="">Default credential</option>
-                  {wgCredentials.filter((c) => c.name !== "default").map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium mb-1.5 flex items-center gap-2">
-                  WebinarGeek Broadcast
-                  {editBroadcastsLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
-                </label>
-                <select
-                  value={editWebinar.broadcastId}
-                  disabled={editBroadcastsLoading}
-                  onChange={(e) => {
-                    const bid = e.target.value;
-                    const b = editBroadcasts.find((x) => x.broadcast_id === bid);
-                    setEditWebinar({
-                      ...editWebinar,
-                      broadcastId: bid,
-                      // Auto-fill the date from the broadcast start (still editable above).
-                      date: b?.starts_at ? new Date(b.starts_at).toISOString().slice(0, 10) : editWebinar.date,
-                    });
-                  }}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors disabled:opacity-60"
-                >
-                  <option value="">— None —</option>
-                  {editWebinar.broadcastId && !editBroadcasts.some((b) => b.broadcast_id === editWebinar.broadcastId) && (
-                    <option value={editWebinar.broadcastId}>Current · {editWebinar.broadcastId}</option>
-                  )}
-                  {editBroadcasts.map((b) => (
-                    <option key={b.broadcast_id} value={b.broadcast_id}>
-                      {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""}
-                    </option>
-                  ))}
-                </select>
-                <div className="mt-1.5 text-[10px] text-zinc-500">
-                  Subscribers auto-sync once, ~2h after the broadcast start time. Picking a broadcast fills the date above (still editable).
-                </div>
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Registration Link</label>
-                <input type="url" value={editWebinar.registrationLink}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, registrationLink: e.target.value })}
-                  placeholder="https://..."
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Unsubscribe Link</label>
-                <input type="url" value={editWebinar.unsubscribeLink}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, unsubscribeLink: e.target.value })}
-                  placeholder="https://..."
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
-              </div>
-              <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Status</label>
-                <select value={editWebinar.status}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, status: e.target.value })}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors">
-                  <option value="planning">Planning</option>
-                  <option value="sent">Sent</option>
-                  <option value="archived">Archived</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Footer */}
-            <div className="px-6 py-4 border-t border-zinc-200 dark:border-zinc-800/40 flex items-center justify-between">
-              <button onClick={() => setEditWebinar(null)} className="px-4 py-2 text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors">
-                Cancel
-              </button>
-              <button
-                onClick={async () => {
-                  const ew = editWebinar;
-                  const w = webinars.find((w) => w.id === ew.id);
-                  if (!w) return;
-                  // Apply all changes
-                  if (ew.number !== w.number) await handleUpdateWebinar(ew.id, "number", ew.number);
-                  if (ew.date && ew.date !== w.isoDate) {
-                    await handleUpdateWebinar(ew.id, "date", ew.date);
-                  }
-                  const currentBroadcast = w.broadcastId === "—" ? "" : w.broadcastId;
-                  if (ew.broadcastId !== currentBroadcast) await handleUpdateWebinar(ew.id, "broadcast_id", ew.broadcastId);
-                  if (ew.webinargeekCredentialId !== (w.webinargeekCredentialId ?? "")) {
-                    await handleUpdateWebinar(ew.id, "webinargeek_credential_id", ew.webinargeekCredentialId || null);
-                  }
-                  if (ew.registrationLink !== w.registrationLink) await handleUpdateWebinar(ew.id, "registration_link", ew.registrationLink);
-                  if (ew.unsubscribeLink !== w.unsubscribeLink) await handleUpdateWebinar(ew.id, "unsubscribe_link", ew.unsubscribeLink);
-                  if (ew.status !== w.status.toLowerCase()) await handleUpdateWebinar(ew.id, "status", ew.status);
-                  const trimmedLabel = ew.variantLabel.trim();
-                  if (trimmedLabel !== (w.variantLabel ?? "")) {
-                    await handleUpdateWebinar(ew.id, "variant_label", trimmedLabel || null);
-                  }
-                  setEditWebinar(null);
-                }}
-                disabled={!editWebinar.number || !editWebinar.date}
-                className="px-5 py-2 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-300 dark:disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-sm font-semibold rounded-lg transition-colors"
-              >
-                Save Changes
-              </button>
-            </div>
-          </div>
-        </div>
+        <WebinarEditModal
+          webinar={editWebinar}
+          allWebinars={webinars.map((w) => ({ id: w.id, number: w.number, variantLabel: w.variantLabel, date: w.isoDate }))}
+          onClose={() => setEditWebinar(null)}
+          onSaved={handleEditSaved}
+        />
       )}
     </main>
   );

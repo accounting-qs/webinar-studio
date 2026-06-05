@@ -169,6 +169,7 @@ def webinar_dict(w: Webinar) -> dict:
         "number": w.number,
         "variant_label": w.variant_label,
         "webinargeek_credential_id": w.webinargeek_credential_id,
+        "nonjoiner_source_webinar_id": w.nonjoiner_source_webinar_id,
         "date": w.date.isoformat() if w.date else None,
         "status": w.status,
         "broadcast_id": w.broadcast_id,

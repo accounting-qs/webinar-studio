@@ -129,9 +129,16 @@ async def update_webinar(
     webinar = result.scalar_one_or_none()
     if not webinar:
         raise HTTPException(404, "Webinar not found")
-    for field, val in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    for field, val in fields.items():
         setattr(webinar, field, val)
     await db.flush()
+    # Drop the per-webinar stats cache when an edit changes anything the
+    # Statistics page derives (nonjoiner source, broadcast, identity/date) so
+    # the dashboard reflects it immediately instead of after the 10-min TTL.
+    if {"nonjoiner_source_webinar_id", "broadcast_id", "number", "variant_label", "date"} & fields.keys():
+        from services.statistics import invalidate_stats_cache
+        invalidate_stats_cache()
     return webinar_dict(webinar)
 
 

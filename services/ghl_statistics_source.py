@@ -708,23 +708,37 @@ class GoHighLevelStatisticsSource:
         planned_webinar_ids: list[str] = [wid] + list(sibling_ids)
 
         # ── Nonjoiners ────────────────────────────────────────────────
-        # Prefer the cached value populated during run_webinar_sync (cheap
-        # PK lookup). Fall back to the live regex scan when the cache is
-        # missing — first page load before any sync runs, or a newly-added
-        # webinar whose sync hasn't been triggered yet.
-        cached_nj = (await db.execute(
-            select(GHLWebinarStats.nj_count).where(GHLWebinarStats.webinar_number == N)
-        )).scalar()
-        if cached_nj is not None:
-            nj_count = int(cached_nj)
-        else:
-            r = await db.execute(sa_text("""
-                SELECT COUNT(DISTINCT g.ghl_contact_id)
-                FROM ghl_contact g
-                WHERE g.calendar_webinar_series_non_joiners ~* :re
-                   OR g.calendar_invite_response_prefix_non_joiners ~* :re
-            """).bindparams(re=series_nj_re))
-            nj_count = int(r.scalar() or 0)
+        # If this webinar links to a previous one (nonjoiner_source_webinar_id),
+        # Nonjoiners = that webinar's WebinarGeek broadcast registrants who did
+        # NOT watch live (registered no-shows). Otherwise fall back to the
+        # GHL-based count: prefer the cached value from run_webinar_sync, else a
+        # live regex scan.
+        nj_count: int | None = None
+        if w.nonjoiner_source_webinar_id:
+            src_bid = (await db.execute(sa_text(
+                "SELECT broadcast_id FROM webinars WHERE id = CAST(:sid AS uuid)"
+            ).bindparams(sid=w.nonjoiner_source_webinar_id))).scalar()
+            if src_bid:
+                nj_count = int((await db.execute(sa_text("""
+                    SELECT COUNT(DISTINCT LOWER(email))
+                    FROM webinargeek_subscribers
+                    WHERE broadcast_id = :bid AND watched_live IS NOT TRUE
+                """).bindparams(bid=src_bid))).scalar() or 0)
+
+        if nj_count is None:
+            cached_nj = (await db.execute(
+                select(GHLWebinarStats.nj_count).where(GHLWebinarStats.webinar_number == N)
+            )).scalar()
+            if cached_nj is not None:
+                nj_count = int(cached_nj)
+            else:
+                r = await db.execute(sa_text("""
+                    SELECT COUNT(DISTINCT g.ghl_contact_id)
+                    FROM ghl_contact g
+                    WHERE g.calendar_webinar_series_non_joiners ~* :re
+                       OR g.calendar_invite_response_prefix_non_joiners ~* :re
+                """).bindparams(re=series_nj_re))
+                nj_count = int(r.scalar() or 0)
 
         # Nonjoiners row metrics
         nj_metrics: dict[str, float | None] = {

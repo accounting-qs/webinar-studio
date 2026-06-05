@@ -6,12 +6,15 @@ import {
   fetchStatisticsWebinarList,
   syncWgSubscribers,
   triggerGhlWebinarSync,
+  fetchWebinars,
   type ApiStatisticsRow,
   type ApiStatisticsWebinar,
   type ApiStatisticsWebinarSummary,
+  type ApiWebinar,
   type StatisticsMeta,
   type StatisticsMetrics,
 } from "@/lib/api";
+import { WebinarEditModal, type EditableWebinar } from "../planning/WebinarEditModal";
 import {
   GROUP_BOUNDARY_CLASSES,
   METRIC_COLUMNS,
@@ -907,6 +910,9 @@ export function StatisticsPage() {
   const [infoModalCol, setInfoModalCol] = useState<MetricColumn | null>(null);
   /** Metric-cell drill-down: opens the booking-source + contacts modal. */
   const [drill, setDrill] = useState<DrillTarget | null>(null);
+  /** Planning webinars (full editable rows) for the shared Edit modal. */
+  const [planningWebinars, setPlanningWebinars] = useState<ApiWebinar[]>([]);
+  const [editWebinar, setEditWebinar] = useState<EditableWebinar | null>(null);
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   /** Sender filter — empty string means "all senders". When set, only list
@@ -1101,6 +1107,44 @@ export function StatisticsPage() {
     load();
     return () => { cancelled = true; };
   }, []);
+
+  /* ── Planning webinars (for the Edit modal pre-fill + Previous dropdown) ─ */
+  useEffect(() => {
+    fetchWebinars()
+      .then(({ webinars }) => setPlanningWebinars(webinars))
+      .catch((e) => console.error("Failed to load webinars for edit modal", e));
+  }, []);
+
+  /** Open the shared Edit modal for a stats webinar (matched to its planning row). */
+  const openEditWebinar = (webinarId: string | null) => {
+    if (!webinarId) return;
+    const pw = planningWebinars.find((p) => p.id === webinarId);
+    if (!pw) return;
+    setEditWebinar({
+      id: pw.id,
+      number: pw.number,
+      isoDate: pw.date,
+      broadcastId: pw.broadcast_id ?? "",
+      webinargeekCredentialId: pw.webinargeek_credential_id ?? "",
+      nonjoinerSourceWebinarId: pw.nonjoiner_source_webinar_id ?? "",
+      status: pw.status,
+      registrationLink: pw.registration_link ?? "",
+      unsubscribeLink: pw.unsubscribe_link ?? "",
+      variantLabel: pw.variant_label ?? "",
+    });
+  };
+
+  /** After a save: update the planning cache and refetch this webinar's stats
+   * so the Nonjoiners / broadcast-derived numbers reflect the change. */
+  const handleStatsWebinarSaved = async (u: ApiWebinar) => {
+    setPlanningWebinars((prev) => prev.map((p) => (p.id === u.id ? u : p)));
+    try {
+      const fresh = await fetchStatisticsWebinar(u.id);
+      setWebinars((prev) => prev.map((sw) => (sw.webinarId === u.id ? fresh : sw)));
+    } catch (e) {
+      console.error("Failed to refresh webinar stats after save", e);
+    }
+  };
 
   /* ── Unique senders (for the filter dropdown) ──────────────────── */
   const allSenders = useMemo(() => {
@@ -1482,6 +1526,14 @@ export function StatisticsPage() {
                         <>Sync GHL</>
                       )}
                     </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); openEditWebinar(w.webinarId); }}
+                      title="Edit webinar — WebinarGeek account / broadcast / previous webinar"
+                      className="ml-1.5 px-2 py-1 text-[10px] font-semibold rounded bg-zinc-500/15 text-zinc-500 hover:bg-zinc-500/25 hover:text-zinc-700 dark:hover:text-zinc-300 border border-zinc-400/30 transition-colors inline-flex items-center gap-1"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                      Edit
+                    </button>
                   </td>
                   {METRIC_COLUMNS.map((col, idx) => (
                     <MetricCell
@@ -1544,6 +1596,16 @@ export function StatisticsPage() {
       {/* ── Booking-source + contacts drill-down modal ─────────────── */}
       {drill && (
         <BookingSourceModal target={drill} onClose={() => setDrill(null)} />
+      )}
+
+      {/* ── Edit Webinar modal (shared with Planning) ──────────────── */}
+      {editWebinar && (
+        <WebinarEditModal
+          webinar={editWebinar}
+          allWebinars={planningWebinars.map((p) => ({ id: p.id, number: p.number, variantLabel: p.variant_label, date: p.date }))}
+          onClose={() => setEditWebinar(null)}
+          onSaved={handleStatsWebinarSaved}
+        />
       )}
 
       {/* ── AI chat panel ──────────────────────────────────────────── */}
