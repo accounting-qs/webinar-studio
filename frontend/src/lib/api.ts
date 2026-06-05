@@ -1468,6 +1468,10 @@ export interface ContactDrilldownItem {
   company_website: string | null;
   assignment_id: string | null;
   ghl_url: string;
+  // Booking-source UTMs (GHL contact "Book - Campaign *" fields)
+  book_source?: string | null;
+  book_medium?: string | null;
+  book_name?: string | null;
   opportunity_id?: string | null;
   opportunity_url?: string | null;
   opportunity_stage_id?: string | null;

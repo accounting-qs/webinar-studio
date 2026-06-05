@@ -254,6 +254,9 @@ def build_contacts_query(
             o.webinar_source_number,
             g.ghl_contact_id,
             g.email,
+            g.book_campaign_source AS book_source,
+            g.book_campaign_medium AS book_medium,
+            g.book_campaign_name   AS book_name,
             c.first_name,
             c.last_name,
             c.company_website,
@@ -264,6 +267,9 @@ def build_contacts_query(
             DISTINCT
             g.ghl_contact_id,
             g.email,
+            g.book_campaign_source AS book_source,
+            g.book_campaign_medium AS book_medium,
+            g.book_campaign_name   AS book_name,
             c.first_name,
             c.last_name,
             c.company_website,
@@ -279,3 +285,74 @@ def build_contacts_query(
         LIMIT :limit
     """
     return sql, params
+
+
+def build_webinar_wide_opp_query(
+    spec: MetricSpec,
+    webinar_number: int,
+    limit: int = 500,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build (list_sql, count_sql, params) for an OPPORTUNITY-unit metric drilled
+    from the webinar parent summary (no assignment filter).
+
+    Unlike build_contacts_query, this is NOT restricted to the outreach-list path
+    (contacts -> webinar_list_assignments). It selects directly from the
+    webinar-wide opportunity set — the same base the displayed summary count uses
+    (services/ghl_statistics_source.py::_compute_webinar_metrics) — so the
+    returned list ties out to the clicked number, including inbound / self-booked
+    opportunities that were never in an outreach list.
+
+    Contact name/company are LEFT-JOINed from the outreach `contacts` table by
+    email, so they're only present when the booker is also an outreach contact;
+    email + the GHL deep-link are always available.
+
+    `count_sql` references only the spec's WHERE-clause params (it has no :limit),
+    so bind it with params minus "limit".
+    """
+    assert spec.unit == "opportunity", "webinar-wide path is opportunity-only"
+    where = " AND ".join(f"({w})" for w in spec.where_clauses)
+    params: dict[str, Any] = {**spec.params, "limit": limit}
+
+    list_sql = f"""
+        SELECT opportunity_id, pipeline_stage_id, monetary_value,
+               call1_appointment_status, call1_appointment_date, lead_quality,
+               webinar_source_number, ghl_contact_id, email,
+               book_source, book_medium, book_name,
+               first_name, last_name, company_website, assignment_id
+        FROM (
+            SELECT DISTINCT ON (o.ghl_opportunity_id)
+                o.ghl_opportunity_id        AS opportunity_id,
+                o.pipeline_stage_id         AS pipeline_stage_id,
+                o.monetary_value            AS monetary_value,
+                o.call1_appointment_status  AS call1_appointment_status,
+                o.call1_appointment_date    AS call1_appointment_date,
+                o.lead_quality              AS lead_quality,
+                o.webinar_source_number     AS webinar_source_number,
+                g.ghl_contact_id            AS ghl_contact_id,
+                g.email                     AS email,
+                g.book_campaign_source      AS book_source,
+                g.book_campaign_medium      AS book_medium,
+                g.book_campaign_name        AS book_name,
+                c.first_name                AS first_name,
+                c.last_name                 AS last_name,
+                c.company_website           AS company_website,
+                c.assignment_id             AS assignment_id
+            FROM ghl_opportunity o
+            LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
+            LEFT JOIN contacts c ON LOWER(c.email) = LOWER(g.email)
+            WHERE {where}
+            ORDER BY o.ghl_opportunity_id, c.first_name NULLS LAST
+        ) sub
+        ORDER BY call1_appointment_date DESC NULLS LAST
+        LIMIT :limit
+    """
+
+    count_sql = f"""
+        SELECT COUNT(*) FROM (
+            SELECT DISTINCT o.ghl_opportunity_id
+            FROM ghl_opportunity o
+            LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
+            WHERE {where}
+        ) sub
+    """
+    return list_sql, count_sql, params

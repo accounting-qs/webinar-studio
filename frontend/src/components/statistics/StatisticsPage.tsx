@@ -22,6 +22,7 @@ import {
   type MetricColumn,
 } from "./metricRegistry";
 import { ChatPanel } from "./ChatPanel";
+import { BookingSourceModal, type DrillTarget } from "./BookingSourceModal";
 
 /* ─── Identity columns (pinned left side of table) ────────────────────── */
 
@@ -266,7 +267,7 @@ const DRILLDOWN_KEYS = new Set([
 ]);
 
 function MetricCell({
-  value, col, bold, boundary, webinarNumber, webinarId, assignmentId, listLabel, rowMetrics,
+  value, col, bold, boundary, webinarNumber, webinarId, assignmentId, listLabel, rowMetrics, onDrill,
 }: {
   value: number | null | undefined;
   col: MetricColumn;
@@ -279,6 +280,9 @@ function MetricCell({
   assignmentId?: string | null;
   listLabel?: string | null;
   rowMetrics?: Record<string, number | null>;
+  /** When provided, a drillable cell opens the in-dashboard modal instead of
+   * a new browser tab. */
+  onDrill?: (t: DrillTarget) => void;
 }) {
   const formatted = formatMetricValue(value, col);
   const isNull = value === null || value === undefined;
@@ -296,23 +300,45 @@ function MetricCell({
   const hasWarning = missingSources.length > 0;
 
   const content = drillable ? (
-    <a
-      href={(() => {
-        const qs = new URLSearchParams({ metric: col.key });
-        if (webinarId) qs.set("webinar_id", webinarId);
-        else if (webinarNumber != null) qs.set("webinar", String(webinarNumber));
-        if (assignmentId) qs.set("assignment", assignmentId);
-        if (listLabel) qs.set("list", listLabel);
-        return `/statistics/contacts?${qs.toString()}`;
-      })()}
-      target="_blank"
-      rel="noopener noreferrer"
-      onClick={(e) => e.stopPropagation()}
-      className="hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-dotted decoration-zinc-400/40"
-      title={`Click to see the ${col.group} · ${col.label} contacts`}
-    >
-      {formatted}
-    </a>
+    onDrill ? (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDrill({
+            metric: col.key,
+            group: col.group,
+            label: col.label,
+            webinarId,
+            webinarNumber,
+            assignment: assignmentId,
+            listLabel,
+          });
+        }}
+        className="hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-dotted decoration-zinc-400/40 cursor-pointer"
+        title={`Click to see the ${col.group} · ${col.label} contacts & source`}
+      >
+        {formatted}
+      </button>
+    ) : (
+      <a
+        href={(() => {
+          const qs = new URLSearchParams({ metric: col.key });
+          if (webinarId) qs.set("webinar_id", webinarId);
+          else if (webinarNumber != null) qs.set("webinar", String(webinarNumber));
+          if (assignmentId) qs.set("assignment", assignmentId);
+          if (listLabel) qs.set("list", listLabel);
+          return `/statistics/contacts?${qs.toString()}`;
+        })()}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className="hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-dotted decoration-zinc-400/40"
+        title={`Click to see the ${col.group} · ${col.label} contacts`}
+      >
+        {formatted}
+      </a>
+    )
   ) : (
     formatted
   );
@@ -479,26 +505,98 @@ function placeholderWebinar(
 
 /* ─── Bucket-grouped child-row renderer ─────────────────────────────── */
 
-/** Metric formats whose values are raw counts (or sum-by-design currency),
- * so summing across a bucket's lists is meaningful. Percentages, per-1k,
- * and ratio columns intentionally stay blank on bucket headers — averaging
- * those across child rows would be misleading. */
-const SUMMABLE_FORMATS = new Set<string>(["number"]);
+/* ── Bucket / total aggregation + derived-metric formulas ─────────────────
+ * Mirrors services/statistics.py::compute_derived_metrics so bucket-sum rows
+ * and the "Assigned Lists Total" row carry the same ratio / percent / per-1k
+ * metrics the backend computes per row. Raw counts are SUMMED; ratios are
+ * recomputed from those sums (never averaged). */
 
-function sumMetric(rows: ApiStatisticsRow[], key: string): number {
-  let total = 0;
+function _sumOrNull(rows: ApiStatisticsRow[], key: string): number | null {
+  let any = false, total = 0;
   for (const r of rows) {
     const v = r.metrics[key];
-    if (typeof v === "number") total += v;
+    if (typeof v === "number") { any = true; total += v; }
   }
-  return total;
+  return any ? total : null;
+}
+function _avgOrNull(rows: ApiStatisticsRow[], key: string): number | null {
+  const nums: number[] = [];
+  for (const r of rows) { const v = r.metrics[key]; if (typeof v === "number") nums.push(v); }
+  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+}
+function _safeDiv(a: number | null, b: number | null): number | null {
+  if (a == null || b == null || b === 0) return null;
+  return a / b;
+}
+function _safePer1k(a: number | null, b: number | null): number | null {
+  if (a == null || b == null || b === 0) return null;
+  return a / (b / 1000);
+}
+
+/** Sum raw metrics across rows, then recompute every derived ratio/percent/
+ * per-1k field from the sums — identical to the backend's per-row derivation
+ * (rate denominator = actuallyUsed, falling back to invited). */
+function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | null> {
+  const m: Record<string, number | null> = {};
+  for (const col of METRIC_COLUMNS) {
+    if (col.format === "number" || col.format === "currency") m[col.key] = _sumOrNull(rows, col.key);
+  }
+  // avgProjectedDealSize is an average of child values, not a sum.
+  m["avgProjectedDealSize"] = _avgOrNull(rows, "avgProjectedDealSize");
+
+  const au = m["actuallyUsed"];
+  const inv = au == null || au === 0 ? (m["invited"] ?? null) : au;
+  const g = (k: string) => m[k] ?? null;
+  return {
+    ...m,
+    unsubPercent: _safeDiv(g("unsubscribes"), inv),
+    yesPer1kInv: _safePer1k(g("yesMarked"), inv),
+    yesPercent: _safeDiv(g("yesMarked"), inv),
+    yesAttendPercent: _safeDiv(g("yesAttended"), g("yesMarked")),
+    yesStay10MinPercent: _safeDiv(g("yes10MinPlus"), g("yesAttended")),
+    yesAttendBySmsClickPercent: _safeDiv(g("yesAttendBySmsClick"), g("yesAttended")),
+    yesBookingsPer1kInv: _safePer1k(g("yesBookings"), inv),
+    maybePer1kInv: _safePer1k(g("maybeMarked"), inv),
+    maybeAttendPercent: _safeDiv(g("maybeAttended"), g("maybeMarked")),
+    maybeStay10MinPercent: _safeDiv(g("maybe10MinPlus"), g("maybeAttended")),
+    maybeAttendBySmsClickPercent: _safeDiv(g("maybeAttendBySmsClick"), g("maybeAttended")),
+    maybeBookingsPer1kInv: _safePer1k(g("maybeBookings"), inv),
+    selfRegPer1kInv: _safePer1k(g("selfRegMarked"), inv),
+    selfRegAttendPercent: _safeDiv(g("selfRegAttended"), g("selfRegMarked")),
+    selfRegStay10MinPercent: _safeDiv(g("selfReg10MinPlus"), g("selfRegAttended")),
+    selfRegBookingsPer1kInv: _safePer1k(g("selfRegBookings"), inv),
+    invitedToRegPercent: _safeDiv(g("totalRegs"), inv),
+    regToAttendPercent: _safeDiv(g("totalAttended"), g("totalRegs")),
+    invitedToAttendPercent: _safeDiv(g("totalAttended"), inv),
+    totalAttendedPer1kInv: _safePer1k(g("totalAttended"), inv),
+    attendBySmsReminderPercent: _safeDiv(g("attendBySmsReminder"), g("totalAttended")),
+    total10MinPlusPer1kInv: _safePer1k(g("total10MinPlus"), inv),
+    attend10MinPercent: _safeDiv(g("total10MinPlus"), g("totalAttended")),
+    total30MinPlusPer1kInv: _safePer1k(g("total30MinPlus"), inv),
+    attend30MinPercent: _safeDiv(g("total30MinPlus"), g("totalAttended")),
+    bookingsPerAttended: _safeDiv(g("totalBookings"), g("totalAttended")),
+    bookingsPerPast10Min: _safeDiv(g("totalBookings"), g("total10MinPlus")),
+    totalBookingsPer1kInv: _safePer1k(g("totalBookings"), inv),
+    showPercent: _safeDiv(g("shows"), g("totalBookings")),
+    closeRatePercent: _safeDiv(g("won"), g("shows")),
+    qualPercent: _safeDiv(g("qualified"), g("shows")),
+  };
+}
+
+/** Display rule for aggregated (bucket / total) rows: show derived ratios when
+ * present; blank raw counts that are zero so the summary rows stay readable. */
+function showAggValue(col: MetricColumn, v: number | null | undefined): boolean {
+  if (v === null || v === undefined) return false;
+  const isCount = col.format === "number" || col.format === "currency";
+  return !isCount || v > 0;
 }
 
 /**
- * Render child rows for an expanded webinar, grouped by bucket like the
- * Planning page: multi-list buckets collapse under a header row, single-list
- * buckets go into a synthetic "Unique Buckets" group, and Nonjoiners /
- * NO LIST DATA rows render below as-is.
+ * Render child rows for an expanded webinar. Order: NO LIST DATA + Nonjoiners
+ * pinned to the top (right under the webinar total), then an "Assigned Lists
+ * Total" (sum of all assigned lists, excluding the specials), then the
+ * bucket-grouped lists (multi-list buckets collapse under a header; single-list
+ * buckets bundle into a synthetic "Unique Buckets" group).
  */
 function renderGroupedRows(
   w: ApiStatisticsWebinar,
@@ -507,6 +605,7 @@ function renderGroupedRows(
   setCopyModalRow: (row: ApiStatisticsRow) => void,
   sortKey: string | null,
   sortDir: "asc" | "desc",
+  onDrill: (t: DrillTarget) => void,
 ): ReactNode[] {
   // Sort comparator: numeric metric value, null last, respecting asc/desc.
   const cmp = (a: ApiStatisticsRow, b: ApiStatisticsRow): number => {
@@ -548,7 +647,7 @@ function renderGroupedRows(
 
   // Apply per-webinar sort when active. Sort within each multi-list bucket,
   // sort the "Unique Buckets" bundle, and sort unbucketed rows. Specials
-  // (Nonjoiners / NO LIST DATA) stay at the bottom; we also sort them for
+  // (NO LIST DATA / Nonjoiners) stay pinned to the top; we still sort them for
   // consistency (useful when the same column is clicked across webinars).
   if (sortKey) {
     for (const g of multi) g.lists = [...g.lists].sort(cmp);
@@ -589,8 +688,8 @@ function renderGroupedRows(
           {row.kind === "no_list_data" && row.sharedAcrossVariants && (
             <span
               title={
-                "GHL invite-response and booked-call signals are stored per webinar number, not per A/B variant. " +
-                "These leftover counts therefore appear on both variants' NO LIST DATA rows. " +
+                "GHL invite-response and booked-call signals are stored per webinar number, not per A/B variant — " +
+                "they can't be tied to one variant, so they're attributed to the primary (largest-audience) variant only. " +
                 "WebinarGeek-derived counts (registrations, attendance) are correctly scoped per broadcast."
               }
               className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-amber-500/15 text-amber-500 border border-amber-500/30 align-middle not-italic"
@@ -633,6 +732,7 @@ function renderGroupedRows(
           assignmentId={row.assignmentId}
           listLabel={row.description}
           rowMetrics={row.metrics}
+          onDrill={onDrill}
         />
       ))}
     </tr>
@@ -650,12 +750,7 @@ function renderGroupedRows(
         uniqSenders.push({ name: l.sendInfo, color: l.senderColor });
       }
     }
-    const summed: Record<string, number> = {};
-    for (const col of METRIC_COLUMNS) {
-      if (SUMMABLE_FORMATS.has(col.format)) {
-        summed[col.key] = sumMetric(lists, col.key);
-      }
-    }
+    const metrics = aggregateMetrics(lists);
 
     return (
       <tr
@@ -705,9 +800,8 @@ function renderGroupedRows(
           </div>
         </td>
         {METRIC_COLUMNS.map((col, idx) => {
-          const isSummable = SUMMABLE_FORMATS.has(col.format);
-          const val = isSummable ? summed[col.key] : 0;
-          const show = isSummable && val > 0;
+          const v = metrics[col.key];
+          const show = showAggValue(col, v);
           return (
             <td
               key={col.key}
@@ -715,7 +809,41 @@ function renderGroupedRows(
                 show ? "text-zinc-800 dark:text-zinc-100" : "text-zinc-500"
               } ${isGroupBoundary(idx) ? GROUP_BOUNDARY_CLASSES : ""}`}
             >
-              {show ? formatMetricValue(val, col) : ""}
+              {show ? formatMetricValue(v ?? null, col) : ""}
+            </td>
+          );
+        })}
+      </tr>
+    );
+  };
+
+  // Footer "Assigned Lists Total" — sums all assigned list rows (excludes the
+  // NO LIST DATA / Nonjoiners specials) and recomputes derived metrics.
+  const renderTotalRow = (label: string, lists: ApiStatisticsRow[]) => {
+    const metrics = aggregateMetrics(lists);
+    return (
+      <tr key="assigned-lists-total" className="bg-violet-50/60 dark:bg-violet-500/[0.06] border-y-2 border-violet-300/50 dark:border-violet-500/25">
+        <td className="px-2 py-2"></td>
+        <td className={`px-2 py-2 ${W_NUM} ${sNumG}`}></td>
+        <td className="px-2 py-2"></td>
+        <td className="px-2 py-2"></td>
+        <td className={`px-2 py-2 ${W_DESC} ${sDescG}`}>
+          <span className="text-zinc-800 dark:text-zinc-100 text-xs font-bold uppercase tracking-wide">{label}</span>
+        </td>
+        <td className={`px-2 py-2 ${W_COPY} ${sCopyG}`}></td>
+        <td className={`px-2 py-2 ${W_URL} ${sUrlG}`}></td>
+        <td className={`px-2 py-2 ${W_SEND} ${sSendG}`}></td>
+        {METRIC_COLUMNS.map((col, idx) => {
+          const v = metrics[col.key];
+          const show = showAggValue(col, v);
+          return (
+            <td
+              key={col.key}
+              className={`px-2 py-2 text-right font-mono font-bold whitespace-nowrap ${
+                show ? "text-zinc-800 dark:text-zinc-100" : "text-zinc-500"
+              } ${isGroupBoundary(idx) ? GROUP_BOUNDARY_CLASSES : ""}`}
+            >
+              {show ? formatMetricValue(v ?? null, col) : ""}
             </td>
           );
         })}
@@ -725,7 +853,20 @@ function renderGroupedRows(
 
   const nodes: ReactNode[] = [];
 
-  // 1) Multi-list bucket groups
+  // 1) Special rows pinned to the top, right under the webinar total:
+  //    NO LIST DATA first, then Nonjoiners.
+  const specialRank = (r: ApiStatisticsRow) =>
+    r.kind === "no_list_data" ? 0 : r.kind === "nonjoiners" ? 1 : 2;
+  const orderedSpecials = [...specials].sort((a, b) => specialRank(a) - specialRank(b));
+  for (const l of orderedSpecials) nodes.push(renderListRow(l));
+
+  // 2) Assigned Lists Total — sum of every assigned list (excludes the
+  //    NO LIST DATA / Nonjoiners specials), placed right under the specials so
+  //    it sits beside — but distinct from — the webinar-wide total above.
+  const allLists = [...multi.flatMap((g) => g.lists), ...single, ...unbucketed];
+  if (allLists.length > 0) nodes.push(renderTotalRow("Assigned Lists Total", allLists));
+
+  // 3) Multi-list bucket groups
   for (const g of multi) {
     const key = `${w.id}::${g.bucketId}`;
     const collapsed = collapsedBuckets.has(key);
@@ -733,7 +874,7 @@ function renderGroupedRows(
     if (!collapsed) g.lists.forEach((l) => nodes.push(renderListRow(l)));
   }
 
-  // 2) "Unique Buckets" — synthetic group for single-list buckets
+  // 4) "Unique Buckets" — synthetic group for single-list buckets
   if (single.length > 0) {
     const uniqueKey = "__unique__";
     const collapsed = collapsedBuckets.has(`${w.id}::${uniqueKey}`);
@@ -741,11 +882,8 @@ function renderGroupedRows(
     if (!collapsed) single.forEach((l) => nodes.push(renderListRow(l)));
   }
 
-  // 3) Unbucketed lists (shouldn't normally exist but render safely)
+  // 5) Unbucketed lists (shouldn't normally exist but render safely)
   for (const l of unbucketed) nodes.push(renderListRow(l));
-
-  // 4) Special rows (Nonjoiners / NO LIST DATA) — always visible, italic
-  for (const l of specials) nodes.push(renderListRow(l));
 
   return nodes;
 }
@@ -767,6 +905,8 @@ export function StatisticsPage() {
   const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
   const [copyModalRow, setCopyModalRow] = useState<ApiStatisticsRow | null>(null);
   const [infoModalCol, setInfoModalCol] = useState<MetricColumn | null>(null);
+  /** Metric-cell drill-down: opens the booking-source + contacts modal. */
+  const [drill, setDrill] = useState<DrillTarget | null>(null);
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   /** Sender filter — empty string means "all senders". When set, only list
@@ -1354,13 +1494,14 @@ export function StatisticsPage() {
                       webinarId={w.webinarId}
                       listLabel={`Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`}
                       rowMetrics={w.summary}
+                      onDrill={setDrill}
                     />
                   ))}
                 </tr>
 
                 {/* ── Child rows (bucket-grouped) ─────────────────── */}
                 {isExpanded && w.rows.length > 0 &&
-                  renderGroupedRows(w, collapsedBuckets, toggleBucketGroup, setCopyModalRow, sortKey, sortDir)}
+                  renderGroupedRows(w, collapsedBuckets, toggleBucketGroup, setCopyModalRow, sortKey, sortDir, setDrill)}
                 {isExpanded && w.rows.length === 0 && (
                   <tr className="bg-white dark:bg-zinc-950 border-b border-zinc-200 dark:border-zinc-800/20">
                     <td colSpan={IDENTITY_COL_COUNT + METRIC_COLUMNS.length} className="px-4 py-6 text-center text-xs text-zinc-500">
@@ -1398,6 +1539,11 @@ export function StatisticsPage() {
       {/* ── Metric info modal ──────────────────────────────────────── */}
       {infoModalCol && (
         <MetricInfoModal col={infoModalCol} onClose={() => setInfoModalCol(null)} />
+      )}
+
+      {/* ── Booking-source + contacts drill-down modal ─────────────── */}
+      {drill && (
+        <BookingSourceModal target={drill} onClose={() => setDrill(null)} />
       )}
 
       {/* ── AI chat panel ──────────────────────────────────────────── */}

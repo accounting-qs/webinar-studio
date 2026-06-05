@@ -286,9 +286,19 @@ def _process_raw_webinar(w: dict[str, Any], source_label: str) -> dict[str, Any]
         agg_raw = aggregate_parent_summary(raw_metrics_for_agg)
         summary, summary_fallback = compute_derived_metrics(agg_raw)
 
+    # Variant-aware synthetic id + identity fields — must match the lightweight
+    # list (get_raw_webinar_list) so the frontend's progressive-load merge
+    # (replace summary row by id) keeps webinarId/variantLabel and drill-downs
+    # can pass webinar_id (A/B variants share a number, so number alone is
+    # ambiguous and 500s the contacts endpoint).
+    variant_label = w.get("variantLabel")
+    syn_id = f"stat-w{w['number']}" + (f"-{variant_label}" if variant_label else "")
     return {
-        "id": f"stat-w{w['number']}",
+        "id": syn_id,
+        "webinarId": w.get("webinarId"),
         "number": w["number"],
+        "variantLabel": variant_label,
+        "hasSiblingVariants": w.get("hasSiblingVariants", False),
         "date": w.get("date"),
         "title": w.get("title"),
         "workbookRow": w.get("workbookRow", 0),
@@ -297,7 +307,7 @@ def _process_raw_webinar(w: dict[str, Any], source_label: str) -> dict[str, Any]
         "usedFallback": summary_fallback,
         "rows": [
             {
-                "id": f"stat-w{w['number']}-r{r.get('workbookRow', i)}",
+                "id": f"{syn_id}-r{r.get('workbookRow', i)}",
                 "webinarNumber": w["number"],
                 **r,
             }

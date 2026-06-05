@@ -394,6 +394,7 @@ class GoHighLevelStatisticsSource:
         webinars = await self._load_webinars()
         date_windows = self._date_windows(webinars)
         siblings_map = self._sibling_webinar_ids(webinars)
+        primary_ids = self._primary_variant_ids(webinars)
         raw_webinars: list[dict[str, Any]] = []
         for w in webinars:
             prev_date, current_date = date_windows[w.id]
@@ -401,6 +402,7 @@ class GoHighLevelStatisticsSource:
                 await self._build_raw_webinar(
                     w, prev_date, current_date,
                     sibling_webinar_ids=siblings_map.get(w.id, []),
+                    is_primary=w.id in primary_ids,
                 )
             )
         raw_webinars.reverse()  # descending by number for the UI
@@ -457,12 +459,14 @@ class GoHighLevelStatisticsSource:
         webinars = await self._load_webinars()
         date_windows = self._date_windows(webinars)
         siblings_map = self._sibling_webinar_ids(webinars)
+        primary_ids = self._primary_variant_ids(webinars)
         for w in webinars:
             if w.id == webinar_id:
                 prev_date, current_date = date_windows[w.id]
                 return await self._build_raw_webinar(
                     w, prev_date, current_date,
                     sibling_webinar_ids=siblings_map.get(w.id, []),
+                    is_primary=w.id in primary_ids,
                 )
         return None
 
@@ -478,6 +482,28 @@ class GoHighLevelStatisticsSource:
             ids = by_key.get((w.user_id, w.number), [])
             out[w.id] = [wid for wid in ids if wid != w.id]
         return out
+
+    @staticmethod
+    def _primary_variant_ids(webinars: list[Webinar]) -> set[str]:
+        """Id of the 'primary' webinar in each (user_id, number) group — the
+        variant with the largest planned audience (sum of assignment volumes),
+        ties broken by id.
+
+        NO LIST DATA / Nonjoiners are webinar-NUMBER-level signals (booked_call,
+        invite responses) that can't be tied to a specific A/B variant — those
+        bookers aren't on any list (e.g. they booked with a different email than
+        we invited). We attribute them to the primary variant only — the largest
+        funnel, where they almost certainly came from — instead of duplicating
+        them onto every variant. Non-variant webinars are always their own
+        primary."""
+        by_key: dict[tuple[str, int], list[Webinar]] = {}
+        for w in webinars:
+            by_key.setdefault((w.user_id, w.number), []).append(w)
+        primary: set[str] = set()
+        for ws in by_key.values():
+            best = max(ws, key=lambda w: (sum((a.volume or 0) for a in w.assignments), w.id))
+            primary.add(best.id)
+        return primary
 
     async def _load_webinars(self) -> list[Webinar]:
         return await _get_cached_webinars()
@@ -525,6 +551,7 @@ class GoHighLevelStatisticsSource:
         prev_date,
         current_date,
         sibling_webinar_ids: list[str] | None = None,
+        is_primary: bool = True,
     ) -> dict[str, Any]:
         """Build the full raw-stats dict for one webinar.
 
@@ -551,8 +578,26 @@ class GoHighLevelStatisticsSource:
                 extra = per_list.get(a.id, {})
                 r["metrics"].update(extra)
 
+            # NO LIST DATA / Nonjoiners are webinar-NUMBER-level (shared across
+            # A/B variants, not tied to one). Attribute them to the primary
+            # variant only (largest funnel) so they aren't duplicated across
+            # variants; non-variant webinars always show their own. The primary
+            # variant folds them into its summary so its total stays consistent:
+            # Total = Assigned lists + NO LIST DATA + Nonjoiners.
+            show_specials = (not is_variant) or is_primary
+            synthetic = (
+                await self._synthetic_special_rows(
+                    db, w, assignments, prev_date, current_date,
+                    sibling_webinar_ids=siblings,
+                )
+                if show_specials else []
+            )
+
             if is_variant:
-                summary = self._summary_from_per_list(assignments, per_list)
+                summary = self._summary_from_per_list(
+                    assignments, per_list,
+                    extra_metrics=[s["metrics"] for s in synthetic],
+                )
             else:
                 summary = await self._compute_webinar_summary(
                     db, w, assignments, prev_date, current_date,
@@ -570,10 +615,6 @@ class GoHighLevelStatisticsSource:
                     summary["totalRegs"] = wg_totals["subscriptions_count"]
                     summary["totalAttended"] = wg_totals["live_viewers_count"]
 
-            synthetic = await self._synthetic_special_rows(
-                db, w, assignments, prev_date, current_date,
-                sibling_webinar_ids=siblings,
-            )
             rows.extend(synthetic)
 
         return {
@@ -595,15 +636,23 @@ class GoHighLevelStatisticsSource:
     def _summary_from_per_list(
         assignments: list[WebinarListAssignment],
         per_list: dict[str, dict[str, float | None]],
+        extra_metrics: list[dict[str, float | None]] | None = None,
     ) -> dict[str, float | None]:
         """Build a parent summary by summing the per-list child rows.
 
         Used for variants — webinar-wide N counts would conflate sibling
         variants since GHL custom fields don't carry variant info. For
         non-variant webinars the existing webinar-wide aggregate stays.
+
+        `extra_metrics` (the NO LIST DATA / Nonjoiners rows' metric dicts) are
+        summed in alongside the lists so the variant total mirrors the
+        webinar-wide totals non-variant parents get. accountsNeeded / invited
+        stay list-derived (planned volume) — matching the non-variant parent,
+        which also excludes the nonjoiners pool from `invited`.
         """
+        all_metrics = list(per_list.values()) + list(extra_metrics or [])
         keys: set[str] = set()
-        for m in per_list.values():
+        for m in all_metrics:
             keys.update(m.keys())
         summary: dict[str, float | None] = {
             "accountsNeeded": sum((a.accounts_used or 0) for a in assignments),
@@ -614,7 +663,7 @@ class GoHighLevelStatisticsSource:
                 continue
             total: float = 0.0
             any_value = False
-            for m in per_list.values():
+            for m in all_metrics:
                 v = m.get(k)
                 if v is None:
                     continue

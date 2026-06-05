@@ -129,7 +129,14 @@ class ApiStatisticsRow(BaseModel):
 
 class ApiStatisticsWebinar(BaseModel):
     id: str
+    # Underlying Webinar.id (UUID). Required by the frontend for drill-down
+    # requests so A/B variants (which share a number) resolve unambiguously.
+    # Without it the model silently stripped the value and drill-downs fell
+    # back to the bare number, 500-ing the contacts endpoint on variants.
+    webinarId: str | None = None
     number: int
+    variantLabel: str | None = None
+    hasSiblingVariants: bool = False
     date: str | None = None
     title: str | None = None
     workbookRow: int
@@ -182,6 +189,10 @@ class ContactDrilldownItem(BaseModel):
     company_website: str | None = None
     assignment_id: str | None = None
     ghl_url: str
+    # Booking-source UTMs (GHL contact "Book - Campaign *" fields)
+    book_source: str | None = None
+    book_medium: str | None = None
+    book_name: str | None = None
     # When metric unit is "opportunity"
     opportunity_id: str | None = None
     opportunity_url: str | None = None
@@ -226,7 +237,9 @@ async def list_contacts_for_metric(
     from sqlalchemy import select, text
     from db.models import Webinar as WebinarModel
     from db.session import AsyncSessionLocal
-    from services.statistics_metric_filters import spec_for_metric, build_contacts_query
+    from services.statistics_metric_filters import (
+        spec_for_metric, build_contacts_query, build_webinar_wide_opp_query,
+    )
 
     if webinar_id is None and webinar is None:
         raise HTTPException(400, "Either webinar (number) or webinar_id (UUID) is required")
@@ -247,8 +260,10 @@ async def list_contacts_for_metric(
             w = r.scalar_one_or_none()
             if w is None:
                 # All rows for this number are labeled variants; require explicit webinar_id.
+                # Use .first() — scalar_one_or_none() itself raises when a number
+                # has 2+ variants (the exact case we're detecting here).
                 ambig = await db.execute(select(WebinarModel).where(WebinarModel.number == webinar))
-                if ambig.scalar_one_or_none() is not None:
+                if ambig.scalars().first() is not None:
                     return {
                         "metric": metric, "webinar_number": webinar, "webinar_id": None,
                         "assignment_id": assignment, "unit": "contact", "total": 0, "items": [],
@@ -297,9 +312,23 @@ async def list_contacts_for_metric(
                 "reason": "Required data missing (broadcast not linked or no prior webinar for date window)",
             }
 
-        sql, params = build_contacts_query(spec, w.id, assignment_id=assignment, limit=limit)
-        r = await db.execute(text(sql).bindparams(**params))
-        rows = r.mappings().all()
+        # Opportunity-unit metrics drilled from the parent summary (no
+        # assignment) use the webinar-wide query so the list ties out to the
+        # displayed number — including inbound / self-booked opportunities that
+        # were never in an outreach list. Per-list drilldowns (assignment set)
+        # and contact-unit metrics keep the outreach-list-scoped query, which
+        # already matches their per-list counts.
+        if spec.unit == "opportunity" and assignment is None:
+            list_sql, count_sql, params = build_webinar_wide_opp_query(spec, w.number, limit=limit)
+            count_params = {k: v for k, v in params.items() if k != "limit"}
+            total = int((await db.execute(text(count_sql).bindparams(**count_params))).scalar() or 0)
+            r = await db.execute(text(list_sql).bindparams(**params))
+            rows = r.mappings().all()
+        else:
+            sql, params = build_contacts_query(spec, w.id, assignment_id=assignment, limit=limit)
+            r = await db.execute(text(sql).bindparams(**params))
+            rows = r.mappings().all()
+            total = len(rows)
 
         from integrations.ghl_client import get_ghl_location_id
         loc = (await get_ghl_location_id()) or ""
@@ -315,11 +344,14 @@ async def list_contacts_for_metric(
                 "company_website": row.get("company_website"),
                 "assignment_id": str(row.get("assignment_id")) if row.get("assignment_id") else None,
                 "ghl_url": f"https://app.gohighlevel.com/v2/location/{loc}/contacts/detail/{contact_id}" if contact_id else "",
+                "book_source": row.get("book_source"),
+                "book_medium": row.get("book_medium"),
+                "book_name": row.get("book_name"),
             }
             if opportunity_id:
                 item.update({
                     "opportunity_id": opportunity_id,
-                    "opportunity_url": f"https://app.gohighlevel.com/v2/location/{loc}/opportunities/list?opp={opportunity_id}",
+                    "opportunity_url": f"https://app.gohighlevel.com/v2/location/{loc}/opportunities/{opportunity_id}?tab=Opportunity+Details",
                     "opportunity_stage_id": row.get("pipeline_stage_id"),
                     "opportunity_value": float(row["monetary_value"]) if row.get("monetary_value") is not None else None,
                     "call1_status": row.get("call1_appointment_status"),
@@ -334,7 +366,7 @@ async def list_contacts_for_metric(
             "webinar_id": w.id,
             "assignment_id": assignment,
             "unit": spec.unit,
-            "total": len(items),
+            "total": total,
             "items": items,
             "available": True,
             "reason": None,
