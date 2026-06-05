@@ -29,6 +29,12 @@ STALE_SWEEPER_JOB_ID = "ghl_stale_sweeper"
 # Cheap query (one indexed scan over status='running') so 2 minutes is fine.
 STALE_SWEEP_INTERVAL_MINUTES = 2
 
+# WebinarGeek broadcast auto-sync: scan for planned webinars whose linked
+# broadcast started >=2h ago and sync their subscribers once. Cheap partial-
+# index scan; 15 min keeps the fire reasonably close to the 2h mark.
+WG_AUTO_SYNC_JOB_ID = "wg_auto_sync"
+WG_AUTO_SYNC_INTERVAL_MINUTES = 15
+
 _scheduler: AsyncIOScheduler | None = None
 
 
@@ -51,6 +57,16 @@ async def _stale_sweeper_job() -> None:
         await sweep_stale_runs()
     except Exception as exc:
         logger.error("Stale sync sweeper failed: %s", exc)
+
+
+async def _wg_auto_sync_job() -> None:
+    try:
+        from services import wg_sync
+        n = await wg_sync.run_due_broadcast_autosyncs()
+        if n:
+            logger.info("WG broadcast auto-sync: synced %d due broadcast(s)", n)
+    except Exception as exc:
+        logger.error("WG broadcast auto-sync failed: %s", exc)
 
 
 async def start() -> AsyncIOScheduler:
@@ -98,7 +114,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, STALE_SWEEPER_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -110,6 +126,18 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         id=STALE_SWEEPER_JOB_ID,
         max_instances=1,
         misfire_grace_time=60,
+        replace_existing=True,
+    )
+
+    # WebinarGeek broadcast auto-sync is unconditional too — it self-gates on
+    # broadcast start time + the one-shot stamp, so it's a no-op when nothing
+    # is due.
+    scheduler.add_job(
+        _wg_auto_sync_job,
+        trigger=IntervalTrigger(minutes=WG_AUTO_SYNC_INTERVAL_MINUTES),
+        id=WG_AUTO_SYNC_JOB_ID,
+        max_instances=1,
+        misfire_grace_time=300,
         replace_existing=True,
     )
 

@@ -106,6 +106,10 @@ class Webinar(Base):
         UUID(as_uuid=False),
         ForeignKey("connector_credentials.id", ondelete="SET NULL"),
     )
+    # One-shot stamp: set once the scheduler has auto-synced this webinar's
+    # WebinarGeek broadcast subscribers (fires 2h after the broadcast's start
+    # time). NULL → not yet auto-synced. See services/wg_sync.py.
+    broadcast_auto_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     main_title: Mapped[Optional[str]] = mapped_column(Text)
     registration_link: Mapped[Optional[str]] = mapped_column(Text)
     unsubscribe_link: Mapped[Optional[str]] = mapped_column(Text)

@@ -12,9 +12,9 @@ import {
   fetchCustomLists, fetchCustomListCopies, createCustomListCopy as apiCreateCustomListCopy,
   startWebinarListExport, fetchActiveWebinarListExports, fetchLatestWebinarListExport,
   downloadWebinarListExport,
-  fetchWgCredentials,
+  fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
-  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential,
+  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
 } from "@/lib/api";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
@@ -558,7 +558,10 @@ export function PlanningPage() {
   const [wgCredentials, setWgCredentials] = useState<ApiWgCredential[]>([]);
 
   // Edit Webinar modal state
-  const [editWebinar, setEditWebinar] = useState<{ id: string; number: number; date: string; broadcastId: string; status: string; registrationLink: string; unsubscribeLink: string; variantLabel: string } | null>(null);
+  const [editWebinar, setEditWebinar] = useState<{ id: string; number: number; date: string; broadcastId: string; webinargeekCredentialId: string; status: string; registrationLink: string; unsubscribeLink: string; variantLabel: string } | null>(null);
+  // Broadcast options for the Edit modal's selected WebinarGeek account.
+  const [editBroadcasts, setEditBroadcasts] = useState<WgWebinar[]>([]);
+  const [editBroadcastsLoading, setEditBroadcastsLoading] = useState(false);
 
   // Assignment form state — scoped to one webinar at a time
   const [assigningWebinarId, setAssigningWebinarId] = useState<string | null>(null);
@@ -691,7 +694,7 @@ export function PlanningPage() {
     }
   };
 
-  const handleUpdateWebinar = async (webinarId: string, field: "main_title" | "broadcast_id" | "status" | "number" | "date" | "registration_link" | "unsubscribe_link" | "variant_label", value: string | number | null) => {
+  const handleUpdateWebinar = async (webinarId: string, field: "main_title" | "broadcast_id" | "status" | "number" | "date" | "registration_link" | "unsubscribe_link" | "variant_label" | "webinargeek_credential_id", value: string | number | null) => {
     // Optimistic update
     setWebinars((prev) => prev.map((w) => {
       if (w.id !== webinarId) return w;
@@ -702,6 +705,7 @@ export function PlanningPage() {
       if (field === "status") return { ...w, status: (value as string).charAt(0).toUpperCase() + (value as string).slice(1) };
       if (field === "number") return { ...w, number: value as number };
       if (field === "variant_label") return { ...w, variantLabel: (value as string | null) || null };
+      if (field === "webinargeek_credential_id") return { ...w, webinargeekCredentialId: (value as string | null) || null };
       if (field === "date") {
         const iso = value as string;
         const d = new Date(iso + "T00:00:00");
@@ -715,6 +719,24 @@ export function PlanningPage() {
       console.error("Failed to update webinar:", err);
     }
   };
+
+  /** Load broadcast options for the Edit modal's selected WG account.
+   * `refresh` first pulls the latest from WebinarGeek (used on modal open). */
+  const loadEditBroadcasts = useCallback(async (credIdForFilter: string | undefined, refresh: boolean) => {
+    setEditBroadcastsLoading(true);
+    try {
+      if (refresh) {
+        try { await refreshWgWebinars(); } catch (e) { console.error("WG refresh failed:", e); }
+      }
+      const { broadcasts } = await fetchWgWebinars({ credential_id: credIdForFilter, limit: 500 });
+      setEditBroadcasts(broadcasts);
+    } catch (e) {
+      console.error("Failed to load broadcasts:", e);
+      setEditBroadcasts([]);
+    } finally {
+      setEditBroadcastsLoading(false);
+    }
+  }, []);
 
   const handleDeleteWebinar = async (webinarId: string) => {
     const w = webinars.find((w) => w.id === webinarId);
@@ -1756,17 +1778,26 @@ export function PlanningPage() {
                         )}
                         {w.expanded && (
                           <div className="flex items-center gap-0.5 ml-1" onClick={(e) => e.stopPropagation()}>
-                            <button onClick={() => {
+                            <button onClick={async () => {
                               setEditWebinar({
                                 id: w.id,
                                 number: w.number,
                                 date: w.isoDate,
                                 broadcastId: w.broadcastId === "—" ? "" : w.broadcastId,
+                                webinargeekCredentialId: w.webinargeekCredentialId ?? "",
                                 status: w.status.toLowerCase(),
                                 registrationLink: w.registrationLink,
                                 unsubscribeLink: w.unsubscribeLink,
                                 variantLabel: w.variantLabel ?? "",
                               });
+                              // Ensure WG accounts are loaded, then refresh + load this account's broadcasts.
+                              let creds = wgCredentials;
+                              if (creds.length === 0) {
+                                try { creds = (await fetchWgCredentials()).credentials; setWgCredentials(creds); }
+                                catch (err) { console.error("Failed to load WG credentials:", err); }
+                              }
+                              const credId = (w.webinargeekCredentialId ?? "") || creds.find((c) => c.name === "default")?.id;
+                              loadEditBroadcasts(credId, true);
                             }} className="p-0.5 rounded hover:bg-zinc-200 dark:hover:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors" title="Edit webinar">
                               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                             </button>
@@ -3036,11 +3067,56 @@ export function PlanningPage() {
                   className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
               </div>
               <div>
-                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Broadcast ID</label>
-                <input type="text" value={editWebinar.broadcastId}
-                  onChange={(e) => setEditWebinar({ ...editWebinar, broadcastId: e.target.value })}
-                  placeholder="Optional"
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors" />
+                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">WebinarGeek Account</label>
+                <select
+                  value={editWebinar.webinargeekCredentialId}
+                  onChange={(e) => {
+                    const credId = e.target.value;
+                    setEditWebinar({ ...editWebinar, webinargeekCredentialId: credId, broadcastId: "" });
+                    const filterId = credId || wgCredentials.find((c) => c.name === "default")?.id;
+                    loadEditBroadcasts(filterId, false);
+                  }}
+                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors"
+                >
+                  <option value="">Default credential</option>
+                  {wgCredentials.filter((c) => c.name !== "default").map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium mb-1.5 flex items-center gap-2">
+                  WebinarGeek Broadcast
+                  {editBroadcastsLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
+                </label>
+                <select
+                  value={editWebinar.broadcastId}
+                  disabled={editBroadcastsLoading}
+                  onChange={(e) => {
+                    const bid = e.target.value;
+                    const b = editBroadcasts.find((x) => x.broadcast_id === bid);
+                    setEditWebinar({
+                      ...editWebinar,
+                      broadcastId: bid,
+                      // Auto-fill the date from the broadcast start (still editable above).
+                      date: b?.starts_at ? new Date(b.starts_at).toISOString().slice(0, 10) : editWebinar.date,
+                    });
+                  }}
+                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors disabled:opacity-60"
+                >
+                  <option value="">— None —</option>
+                  {editWebinar.broadcastId && !editBroadcasts.some((b) => b.broadcast_id === editWebinar.broadcastId) && (
+                    <option value={editWebinar.broadcastId}>Current · {editWebinar.broadcastId}</option>
+                  )}
+                  {editBroadcasts.map((b) => (
+                    <option key={b.broadcast_id} value={b.broadcast_id}>
+                      {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1.5 text-[10px] text-zinc-500">
+                  Subscribers auto-sync once, ~2h after the broadcast start time. Picking a broadcast fills the date above (still editable).
+                </div>
               </div>
               <div>
                 <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Registration Link</label>
@@ -3085,6 +3161,9 @@ export function PlanningPage() {
                   }
                   const currentBroadcast = w.broadcastId === "—" ? "" : w.broadcastId;
                   if (ew.broadcastId !== currentBroadcast) await handleUpdateWebinar(ew.id, "broadcast_id", ew.broadcastId);
+                  if (ew.webinargeekCredentialId !== (w.webinargeekCredentialId ?? "")) {
+                    await handleUpdateWebinar(ew.id, "webinargeek_credential_id", ew.webinargeekCredentialId || null);
+                  }
                   if (ew.registrationLink !== w.registrationLink) await handleUpdateWebinar(ew.id, "registration_link", ew.registrationLink);
                   if (ew.unsubscribeLink !== w.unsubscribeLink) await handleUpdateWebinar(ew.id, "unsubscribe_link", ew.unsubscribeLink);
                   if (ew.status !== w.status.toLowerCase()) await handleUpdateWebinar(ew.id, "status", ew.status);

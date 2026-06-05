@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.routers.outreach._helpers import LLOYD_USER_ID
@@ -190,6 +190,58 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
             state.contacts_synced = count
             await _heartbeat(state)
             return state.run_id
+
+
+# How long after a broadcast's start time to auto-sync its subscribers, once.
+AUTO_SYNC_DELAY = timedelta(hours=2)
+
+
+async def run_due_broadcast_autosyncs() -> int:
+    """Auto-sync subscribers for any planned webinar whose linked WebinarGeek
+    broadcast started >= AUTO_SYNC_DELAY ago and hasn't been auto-synced yet.
+
+    Keys off the broadcast's actual start time (webinargeek_webinars.starts_at),
+    not the planned Webinar.date. Fires exactly once per webinar — stamps
+    Webinar.broadcast_auto_synced_at only on success, so a transient failure
+    (API error, or "already syncing" from a concurrent manual run) is retried on
+    the next scheduler tick. Idempotent; safe to call repeatedly.
+
+    Returns the number of webinars auto-synced this pass.
+    """
+    cutoff = datetime.now(timezone.utc) - AUTO_SYNC_DELAY
+    async with AsyncSessionLocal() as db:
+        due = (await db.execute(
+            select(Webinar.id, Webinar.broadcast_id)
+            .join(WebinarGeekWebinar, WebinarGeekWebinar.broadcast_id == Webinar.broadcast_id)
+            .where(
+                Webinar.broadcast_id.isnot(None),
+                Webinar.broadcast_auto_synced_at.is_(None),
+                WebinarGeekWebinar.starts_at.isnot(None),
+                WebinarGeekWebinar.starts_at <= cutoff,
+            )
+        )).all()
+
+    synced = 0
+    for webinar_id, broadcast_id in due:
+        try:
+            await run_broadcast_sync(broadcast_id, trigger="scheduled")
+        except Exception as exc:
+            logger.warning(
+                "auto-sync: broadcast %s (webinar %s) failed, will retry: %s",
+                broadcast_id, webinar_id, exc,
+            )
+            continue
+        # Stamp only after a successful sync → one-shot.
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(Webinar)
+                .where(Webinar.id == webinar_id)
+                .values(broadcast_auto_synced_at=datetime.now(timezone.utc))
+            )
+            await db.commit()
+        synced += 1
+        logger.info("auto-sync: synced broadcast %s for webinar %s", broadcast_id, webinar_id)
+    return synced
 
 
 async def run_sync_all(trigger: SyncTrigger = "manual") -> str:
