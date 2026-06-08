@@ -193,6 +193,9 @@ class ContactDrilldownItem(BaseModel):
     book_source: str | None = None
     book_medium: str | None = None
     book_name: str | None = None
+    book_content: str | None = None
+    book_term: str | None = None
+    book_id: str | None = None
     # When metric unit is "opportunity"
     opportunity_id: str | None = None
     opportunity_url: str | None = None
@@ -347,6 +350,9 @@ async def list_contacts_for_metric(
                 "book_source": row.get("book_source"),
                 "book_medium": row.get("book_medium"),
                 "book_name": row.get("book_name"),
+                "book_content": row.get("book_content"),
+                "book_term": row.get("book_term"),
+                "book_id": row.get("book_id"),
             }
             if opportunity_id:
                 item.update({

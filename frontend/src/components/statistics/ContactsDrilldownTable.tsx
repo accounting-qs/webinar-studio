@@ -101,7 +101,7 @@ function groupItems(items: Item[]): Group[] {
 
 /* ── sorting ──────────────────────────────────────────────────────────── */
 
-type SortKey = "name" | "email" | "website" | "source" | "medium" | "bookName" | "call1" | "quality" | "value";
+type SortKey = "name" | "email" | "website" | "source" | "medium" | "bookName" | "content" | "term" | "bookId" | "call1" | "quality" | "value";
 
 function sortVal(g: Group, key: SortKey): string | number {
   const it = g.rep;
@@ -112,6 +112,9 @@ function sortVal(g: Group, key: SortKey): string | number {
     case "source": return (it.book_source || "￿").toLowerCase();
     case "medium": return (it.book_medium || "￿").toLowerCase();
     case "bookName": return (it.book_name || "￿").toLowerCase();
+    case "content": return (it.book_content || "￿").toLowerCase();
+    case "term": return (it.book_term || "￿").toLowerCase();
+    case "bookId": return (it.book_id || "￿").toLowerCase();
     case "call1": return (it.call1_status || "￿").toLowerCase();
     case "quality": return (it.lead_quality || "￿").toLowerCase();
     case "value": return g.valueSum;
@@ -295,6 +298,9 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
               <SortHeader label="Book Source" k="source" sort={sort} onSort={onSort} />
               <SortHeader label="Book Medium" k="medium" sort={sort} onSort={onSort} />
               <SortHeader label="Book Name" k="bookName" sort={sort} onSort={onSort} />
+              <SortHeader label="Book Content" k="content" sort={sort} onSort={onSort} />
+              <SortHeader label="Book Term" k="term" sort={sort} onSort={onSort} />
+              <SortHeader label="Book ID" k="bookId" sort={sort} onSort={onSort} />
               {isOpp && <SortHeader label="Call 1 Status" k="call1" sort={sort} onSort={onSort} />}
               {isOpp && <SortHeader label="Lead Quality" k="quality" sort={sort} onSort={onSort} />}
               {isOpp && <SortHeader label="Value" k="value" sort={sort} onSort={onSort} align="right" />}
@@ -331,6 +337,9 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
                     <td className="px-3 py-2 text-zinc-700 dark:text-zinc-300">{it.book_source ?? "—"}</td>
                     <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_medium ?? "—"}</td>
                     <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_name ?? "—"}</td>
+                    <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_content ?? "—"}</td>
+                    <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_term ?? "—"}</td>
+                    <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400 font-mono">{it.book_id ?? "—"}</td>
                     {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.call1_status ?? "—"}</td>}
                     {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.lead_quality ?? "—"}</td>}
                     {isOpp && <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-400">{money(grouped ? g.valueSum : it.opportunity_value)}</td>}
@@ -348,6 +357,9 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_source ?? "—"}</td>
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_medium ?? "—"}</td>
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_name ?? "—"}</td>
+                      <td className="px-3 py-1.5 text-zinc-500">{m.book_content ?? "—"}</td>
+                      <td className="px-3 py-1.5 text-zinc-500">{m.book_term ?? "—"}</td>
+                      <td className="px-3 py-1.5 text-zinc-500 font-mono">{m.book_id ?? "—"}</td>
                       {isOpp && <td className="px-3 py-1.5 text-zinc-500">{m.call1_status ?? "—"}</td>}
                       {isOpp && <td className="px-3 py-1.5 text-zinc-500">{m.lead_quality ?? "—"}</td>}
                       {isOpp && <td className="px-3 py-1.5 text-right font-mono text-zinc-500">{money(m.opportunity_value)}</td>}

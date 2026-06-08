@@ -1476,6 +1476,9 @@ export interface ContactDrilldownItem {
   book_source?: string | null;
   book_medium?: string | null;
   book_name?: string | null;
+  book_content?: string | null;
+  book_term?: string | null;
+  book_id?: string | null;
   opportunity_id?: string | null;
   opportunity_url?: string | null;
   opportunity_stage_id?: string | null;

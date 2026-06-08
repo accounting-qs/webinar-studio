@@ -28,9 +28,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import BlocklistEntry, GHLContact, GHLOpportunity, GHLSyncRun, GHLSyncSettings, GHLWebinarStats
 from db.session import AsyncSessionLocal
 from integrations.ghl_client import (
+    CONTACT_FIELD_BOOK_CAMPAIGN_CONTENT,
+    CONTACT_FIELD_BOOK_CAMPAIGN_ID,
     CONTACT_FIELD_BOOK_CAMPAIGN_MEDIUM,
     CONTACT_FIELD_BOOK_CAMPAIGN_NAME,
     CONTACT_FIELD_BOOK_CAMPAIGN_SOURCE,
+    CONTACT_FIELD_BOOK_CAMPAIGN_TERM,
     CONTACT_FIELD_BOOKED_CALL_WEBINAR_SERIES,
     CONTACT_FIELD_CALENDAR_INVITE_RESPONSE_HISTORY,
     CONTACT_FIELD_CALENDAR_WEBINAR_SERIES_HISTORY,
@@ -72,10 +75,17 @@ SyncTrigger = Literal["scheduled", "manual"]
 # legitimate gap between heartbeats (one batch ~1000 contacts, ~5-15s).
 STALE_HEARTBEAT_SECONDS = 600  # 10 minutes
 
-# Upsert batch size. Postgres handles INSERT ... ON CONFLICT for 1000 rows
-# easily (parameter count well under the 65535 limit at ~30 cols/row), and
-# bigger batches mean fewer round-trips to Supabase. Was 250.
+# Upsert batch size. Bigger batches mean fewer round-trips to Supabase. Was 250.
+# Capped at runtime by _MAX_BIND_PARAMS (below) so a wide table can't blow past
+# the driver's bind-parameter limit.
 _UPSERT_BATCH_SIZE = 1000
+
+# asyncpg rejects a statement with more than 32767 bind parameters. A batched
+# INSERT uses (rows * columns) params, so for wide tables (ghl_contact is ~34
+# columns) 1000 rows would exceed the cap. We flush early whenever the next row
+# would cross this threshold; the small headroom below 32767 absorbs a few
+# future columns without another regression.
+_MAX_BIND_PARAMS = 32000
 
 # Pipeline depth between the GHL fetcher (producer) and the DB upserter
 # (consumer). The producer runs ahead by up to this many batches while
@@ -182,6 +192,9 @@ def _build_contact_row(c: dict) -> dict:
         "book_campaign_source": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_SOURCE),
         "book_campaign_medium": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_MEDIUM),
         "book_campaign_name": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_NAME),
+        "book_campaign_content": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_CONTENT),
+        "book_campaign_term": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_TERM),
+        "book_campaign_id": custom.get(CONTACT_FIELD_BOOK_CAMPAIGN_ID),
         "registration_campaign_source": custom.get(CONTACT_FIELD_REGISTRATION_CAMPAIGN_SOURCE),
         "registration_campaign_medium": custom.get(CONTACT_FIELD_REGISTRATION_CAMPAIGN_MEDIUM),
         "registration_campaign_name": custom.get(CONTACT_FIELD_REGISTRATION_CAMPAIGN_NAME),
@@ -357,7 +370,12 @@ async def _stream_into_upserts(
                 state.errors.append({"type": error_kind, "id": raw.get("id"), "error": str(exc)[:500]})
                 logger.exception("Failed to build %s row %s", error_kind, raw.get("id"))
                 continue
-            if len(batch) >= _UPSERT_BATCH_SIZE:
+            # Flush at the row cap, or earlier if a wide row would push the
+            # batch past the driver's bind-parameter limit (rows * columns).
+            if (
+                len(batch) >= _UPSERT_BATCH_SIZE
+                or len(batch) * len(batch[0]) >= _MAX_BIND_PARAMS
+            ):
                 await queue.put(batch)
                 batch = []
         if batch:
