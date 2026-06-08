@@ -56,6 +56,7 @@ from integrations.ghl_client import (
     GHLClient,
     OPP_FIELD_CALL1_APPT_DATE,
     OPP_FIELD_CALL1_APPT_STATUS,
+    OPP_FIELD_CALL1_BOOKING_DATE,
     OPP_FIELD_LEAD_QUALITY,
     OPP_FIELD_PROJECTED_DEAL_SIZE,
     OPP_FIELD_WEBINAR_SOURCE_NUMBER,
@@ -205,9 +206,10 @@ def _build_contact_row(c: dict) -> dict:
     }
 
 
-def _build_opp_row(o: dict) -> dict:
+def _build_opp_row(o: dict, users: dict[str, str] | None = None) -> dict:
     custom = parse_custom_fields(o.get("customFields"))
     opt = custom.get(OPP_FIELD_PROJECTED_DEAL_SIZE)
+    assigned_to = o.get("assignedTo")
     return {
         "ghl_opportunity_id": o["id"],
         "ghl_contact_id": o.get("contactId"),
@@ -215,6 +217,9 @@ def _build_opp_row(o: dict) -> dict:
         "monetary_value": o.get("monetaryValue"),
         "call1_appointment_status": custom.get(OPP_FIELD_CALL1_APPT_STATUS),
         "call1_appointment_date": _parse_dt(custom.get(OPP_FIELD_CALL1_APPT_DATE)),
+        "call1_booking_date": _parse_dt(custom.get(OPP_FIELD_CALL1_BOOKING_DATE)),
+        "assigned_to_id": assigned_to,
+        "owner_name": (users or {}).get(assigned_to) if assigned_to else None,
         "webinar_source_number": parse_webinar_source_number(custom.get(OPP_FIELD_WEBINAR_SOURCE_NUMBER)),
         "lead_quality": custom.get(OPP_FIELD_LEAD_QUALITY),
         "projected_deal_size_option": str(opt) if opt is not None else None,
@@ -224,6 +229,19 @@ def _build_opp_row(o: dict) -> dict:
         "updated_at_ghl": _parse_dt(o.get("updatedAt")),
         "synced_at": datetime.now(timezone.utc),
     }
+
+
+async def _fetch_users_map(client: GHLClient, state: "_SyncState") -> dict[str, str]:
+    """Best-effort {user_id: name} for resolving opportunity owners. A failure
+    here must not abort the sync — owners just stay unresolved (owner_name None)."""
+    try:
+        return await client.fetch_users_map()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state.errors.append({"type": "users_fetch", "error": str(exc)[:500]})
+        logger.warning("Failed to fetch GHL users for owner resolution: %s", exc)
+        return {}
 
 
 async def _upsert_contacts_batch(db: AsyncSession, rows: list[dict]) -> None:
@@ -530,9 +548,10 @@ async def run_sync(sync_type: SyncType, trigger: SyncTrigger = "scheduled") -> s
             )
             await _heartbeat(state)
 
+            users_map = await _fetch_users_map(client, state)
             await _stream_into_upserts(
                 client.stream_opportunities(opp_updated_after),
-                _build_opp_row,
+                lambda o: _build_opp_row(o, users_map),
                 _upsert_opps_batch,
                 state,
                 is_contacts=False,
@@ -679,9 +698,10 @@ async def run_webinar_sync(
             # Opportunities are only pulled during the narrow phase — deep
             # is contact-only and would just waste GHL quota.
             if not deep:
+                users_map = await _fetch_users_map(client, state)
                 await _stream_into_upserts(
                     client.stream_opportunities(),
-                    _build_opp_row,
+                    lambda o: _build_opp_row(o, users_map),
                     _upsert_opps_batch,
                     state,
                     is_contacts=False,

@@ -250,6 +250,8 @@ def build_contacts_query(
             o.monetary_value,
             o.call1_appointment_status,
             o.call1_appointment_date,
+            o.call1_booking_date,
+            o.owner_name,
             o.lead_quality,
             o.webinar_source_number,
             g.ghl_contact_id,
@@ -321,7 +323,8 @@ def build_webinar_wide_opp_query(
 
     list_sql = f"""
         SELECT opportunity_id, pipeline_stage_id, monetary_value,
-               call1_appointment_status, call1_appointment_date, lead_quality,
+               call1_appointment_status, call1_appointment_date, call1_booking_date,
+               owner_name, lead_quality,
                webinar_source_number, ghl_contact_id, email,
                book_source, book_medium, book_name, book_content, book_term, book_id,
                first_name, last_name, company_website, assignment_id
@@ -332,6 +335,8 @@ def build_webinar_wide_opp_query(
                 o.monetary_value            AS monetary_value,
                 o.call1_appointment_status  AS call1_appointment_status,
                 o.call1_appointment_date    AS call1_appointment_date,
+                o.call1_booking_date        AS call1_booking_date,
+                o.owner_name                AS owner_name,
                 o.lead_quality              AS lead_quality,
                 o.webinar_source_number     AS webinar_source_number,
                 g.ghl_contact_id            AS ghl_contact_id,

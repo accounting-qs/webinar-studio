@@ -71,6 +71,11 @@ class GHLOpportunity(Base):
 
     call1_appointment_status: Mapped[Optional[str]] = mapped_column(Text)
     call1_appointment_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call1_booking_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Opportunity owner (Sales Rep): GHL `assignedTo` user id + resolved name
+    assigned_to_id: Mapped[Optional[str]] = mapped_column(Text)
+    owner_name: Mapped[Optional[str]] = mapped_column(Text)
 
     webinar_source_number: Mapped[Optional[int]] = mapped_column(Integer)
     lead_quality: Mapped[Optional[str]] = mapped_column(Text)

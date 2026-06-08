@@ -117,6 +117,7 @@ OPP_FIELD_PROJECTED_DEAL_SIZE = "Oo9ktilF7QwTNBzksT3k"
 # Call appointment fields (from reference project — used for shows / no-shows)
 OPP_FIELD_CALL1_APPT_STATUS = "V82ErbW24izA5aQUzRUv"
 OPP_FIELD_CALL1_APPT_DATE = "bFDWu3koncdxn26h6nAm"
+OPP_FIELD_CALL1_BOOKING_DATE = "SWkZeuGfSvQIe8HSvDlv"
 
 # Contact custom field IDs — primary signals
 CONTACT_FIELD_CALENDAR_INVITE_RESPONSE_HISTORY = "ghPIByTtKxRmHveNu4b1"
@@ -373,6 +374,34 @@ class GHLClient:
             "operator": "contains",
             "value": f"e{webinar_number}",
         }]
+
+    async def fetch_users_map(self) -> dict[str, str]:
+        """Return {user_id: display_name} for the location's GHL users.
+
+        Used to resolve an opportunity's `assignedTo` user id to a Sales Rep
+        name at sync time (denormalized onto the opportunity row).
+        """
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"{self._base_url}/users/",
+                params={"locationId": self._location_id},
+                headers=self._headers,
+            )
+            r.raise_for_status()
+            users = r.json().get("users", []) or []
+        out: dict[str, str] = {}
+        for u in users:
+            uid = u.get("id")
+            if not uid:
+                continue
+            name = (u.get("name") or "").strip()
+            if not name:
+                name = " ".join(
+                    str(p) for p in (u.get("firstName"), u.get("lastName")) if p
+                ).strip()
+            if name:
+                out[uid] = name
+        return out
 
     async def count_contacts_with_filter(self, filters: list[dict]) -> int:
         """Return the total count matching a filter in a single request.

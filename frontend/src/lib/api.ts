@@ -1483,8 +1483,11 @@ export interface ContactDrilldownItem {
   opportunity_url?: string | null;
   opportunity_stage_id?: string | null;
   opportunity_value?: number | null;
+  owner?: string | null;
   call1_status?: string | null;
   call1_date?: string | null;
+  call1_booking_date?: string | null;
+  webinar_source_number?: number | null;
   lead_quality?: string | null;
 }
 

@@ -41,6 +41,12 @@ function websiteHref(url: string | null | undefined): string | null {
   if (!u) return null;
   return /^https?:\/\//i.test(u) ? u : `https://${u}`;
 }
+function fmtDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
 
 /* ── grouping (union-find over name | email | company-domain) ─────────── */
 
@@ -101,7 +107,7 @@ function groupItems(items: Item[]): Group[] {
 
 /* ── sorting ──────────────────────────────────────────────────────────── */
 
-type SortKey = "name" | "email" | "website" | "source" | "medium" | "bookName" | "content" | "term" | "bookId" | "call1" | "quality" | "value";
+type SortKey = "name" | "email" | "website" | "source" | "medium" | "bookName" | "content" | "term" | "bookId" | "owner" | "call1" | "call1Date" | "call1Booking" | "quality" | "value" | "webinarSrc";
 
 function sortVal(g: Group, key: SortKey): string | number {
   const it = g.rep;
@@ -116,6 +122,10 @@ function sortVal(g: Group, key: SortKey): string | number {
     case "term": return (it.book_term || "￿").toLowerCase();
     case "bookId": return (it.book_id || "￿").toLowerCase();
     case "call1": return (it.call1_status || "￿").toLowerCase();
+    case "owner": return (it.owner || "￿").toLowerCase();
+    case "call1Date": return it.call1_date || "￿";
+    case "call1Booking": return it.call1_booking_date || "￿";
+    case "webinarSrc": return it.webinar_source_number ?? -1;
     case "quality": return (it.lead_quality || "￿").toLowerCase();
     case "value": return g.valueSum;
   }
@@ -171,6 +181,45 @@ function BookingSourceChart({ groups, itemCount }: { groups: Group[]; itemCount:
     <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/60 bg-zinc-50/60 dark:bg-zinc-900/30 px-4 py-3">
       <div className="flex items-center justify-between mb-2">
         <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">Booking source</div>
+        <div className="text-[11px] text-zinc-500">{total} unique · {itemCount} bookings</div>
+      </div>
+      <div className="flex items-center gap-5">
+        <Donut slices={slices} total={total} />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 min-w-0 flex-1">
+          {slices.map((s) => (
+            <div key={s.label} className="flex items-center gap-2 text-xs min-w-0">
+              <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: s.color }} />
+              <span className="truncate text-zinc-700 dark:text-zinc-300">{s.label}</span>
+              <span className="ml-auto font-mono text-zinc-500">{s.value}</span>
+              <span className="font-mono text-zinc-400 w-9 text-right">{Math.round((s.value / (total || 1)) * 100)}%</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SalesRepChart({ groups, itemCount }: { groups: Group[]; itemCount: number }) {
+  const slices = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const g of groups) {
+      const k = (g.rep.owner || "").trim() || "—";
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return [...m.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([label, value], i) => ({ label, value, color: CHART_COLORS[i % CHART_COLORS.length] }));
+  }, [groups]);
+
+  const hasOwner = groups.some((g) => g.rep.owner);
+  if (!hasOwner) return null;
+
+  const total = groups.length;
+  return (
+    <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/60 bg-zinc-50/60 dark:bg-zinc-900/30 px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">Sales rep (opportunity owner)</div>
         <div className="text-[11px] text-zinc-500">{total} unique · {itemCount} bookings</div>
       </div>
       <div className="flex items-center gap-5">
@@ -285,6 +334,7 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
 
   return (
     <div className="space-y-3">
+      {isOpp && <SalesRepChart groups={groups} itemCount={data.items.length} />}
       <BookingSourceChart groups={groups} itemCount={data.items.length} />
       <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/40 bg-white dark:bg-zinc-900/20 overflow-x-auto">
         <table className="w-full text-xs">
@@ -295,9 +345,13 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
               <PlainHeader label="GHL" />
               {isOpp && <PlainHeader label="Opp" />}
               <SortHeader label="Website" k="website" sort={sort} onSort={onSort} />
+              {isOpp && <SortHeader label="Sales Rep" k="owner" sort={sort} onSort={onSort} />}
               {isOpp && <SortHeader label="Call 1 Status" k="call1" sort={sort} onSort={onSort} />}
+              {isOpp && <SortHeader label="Call 1 Appt Date" k="call1Date" sort={sort} onSort={onSort} />}
+              {isOpp && <SortHeader label="Call 1 Booking Date" k="call1Booking" sort={sort} onSort={onSort} />}
               {isOpp && <SortHeader label="Lead Quality" k="quality" sort={sort} onSort={onSort} />}
               {isOpp && <SortHeader label="Value" k="value" sort={sort} onSort={onSort} align="right" />}
+              {isOpp && <SortHeader label="Webinar Src #" k="webinarSrc" sort={sort} onSort={onSort} align="right" />}
               <SortHeader label="Book Source" k="source" sort={sort} onSort={onSort} />
               <SortHeader label="Book Medium" k="medium" sort={sort} onSort={onSort} />
               <SortHeader label="Book Name" k="bookName" sort={sort} onSort={onSort} />
@@ -334,9 +388,13 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
                     <td className="px-3 py-2 text-center"><LinkCell href={it.ghl_url} color="text-violet-500 hover:text-violet-400" title="Open contact in GHL" /></td>
                     {isOpp && <td className="px-3 py-2 text-center"><LinkCell href={it.opportunity_url} color="text-sky-500 hover:text-sky-400" title="Open opportunity in GHL" /></td>}
                     <td className="px-3 py-2"><WebsiteCell url={it.company_website} /></td>
+                    {isOpp && <td className="px-3 py-2 text-zinc-700 dark:text-zinc-300">{it.owner ?? "—"}</td>}
                     {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.call1_status ?? "—"}</td>}
+                    {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{fmtDate(it.call1_date)}</td>}
+                    {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{fmtDate(it.call1_booking_date)}</td>}
                     {isOpp && <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.lead_quality ?? "—"}</td>}
                     {isOpp && <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-400">{money(grouped ? g.valueSum : it.opportunity_value)}</td>}
+                    {isOpp && <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-400">{it.webinar_source_number ?? "—"}</td>}
                     <td className="px-3 py-2 text-zinc-700 dark:text-zinc-300">{it.book_source ?? "—"}</td>
                     <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_medium ?? "—"}</td>
                     <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{it.book_name ?? "—"}</td>
@@ -354,9 +412,13 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
                       <td className="px-3 py-1.5 text-center"><LinkCell href={m.ghl_url} color="text-violet-500/80 hover:text-violet-400" title="Open contact in GHL" /></td>
                       {isOpp && <td className="px-3 py-1.5 text-center"><LinkCell href={m.opportunity_url} color="text-sky-500/80 hover:text-sky-400" title="Open opportunity in GHL" /></td>}
                       <td className="px-3 py-1.5"><WebsiteCell url={m.company_website} /></td>
+                      {isOpp && <td className="px-3 py-1.5 text-zinc-500">{m.owner ?? "—"}</td>}
                       {isOpp && <td className="px-3 py-1.5 text-zinc-500">{m.call1_status ?? "—"}</td>}
+                      {isOpp && <td className="px-3 py-1.5 text-zinc-500">{fmtDate(m.call1_date)}</td>}
+                      {isOpp && <td className="px-3 py-1.5 text-zinc-500">{fmtDate(m.call1_booking_date)}</td>}
                       {isOpp && <td className="px-3 py-1.5 text-zinc-500">{m.lead_quality ?? "—"}</td>}
                       {isOpp && <td className="px-3 py-1.5 text-right font-mono text-zinc-500">{money(m.opportunity_value)}</td>}
+                      {isOpp && <td className="px-3 py-1.5 text-right font-mono text-zinc-500">{m.webinar_source_number ?? "—"}</td>}
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_source ?? "—"}</td>
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_medium ?? "—"}</td>
                       <td className="px-3 py-1.5 text-zinc-500">{m.book_name ?? "—"}</td>

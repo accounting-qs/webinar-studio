@@ -201,8 +201,11 @@ class ContactDrilldownItem(BaseModel):
     opportunity_url: str | None = None
     opportunity_stage_id: str | None = None
     opportunity_value: float | None = None
+    owner: str | None = None
     call1_status: str | None = None
     call1_date: str | None = None
+    call1_booking_date: str | None = None
+    webinar_source_number: int | None = None
     lead_quality: str | None = None
 
 
@@ -360,8 +363,11 @@ async def list_contacts_for_metric(
                     "opportunity_url": f"https://app.gohighlevel.com/v2/location/{loc}/opportunities/{opportunity_id}?tab=Opportunity+Details",
                     "opportunity_stage_id": row.get("pipeline_stage_id"),
                     "opportunity_value": float(row["monetary_value"]) if row.get("monetary_value") is not None else None,
+                    "owner": row.get("owner_name"),
                     "call1_status": row.get("call1_appointment_status"),
                     "call1_date": row["call1_appointment_date"].isoformat() if row.get("call1_appointment_date") else None,
+                    "call1_booking_date": row["call1_booking_date"].isoformat() if row.get("call1_booking_date") else None,
+                    "webinar_source_number": row.get("webinar_source_number"),
                     "lead_quality": row.get("lead_quality"),
                 })
             items.append(item)
