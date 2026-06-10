@@ -36,6 +36,7 @@ from api.routers.outreach._helpers import LLOYD_USER_ID
 from db.models import (
     CalendarAccountSender, Contact, OutreachSender, Webinar,
     WebinarCalendarInvite, WebinarCalendarUpload, WebinarListAssignment,
+    WebinarNonjoinerInvite,
 )
 from db.session import get_db
 
@@ -98,6 +99,8 @@ def _parse_csv_line(line: str) -> list[str]:
 
 
 # Headers we recognise and the model column they map to. Anything else is ignored.
+# `response` / `calendar_response` are accepted aliases so a Non-joiners CSV can
+# be just two columns (Email, Response).
 _HEADER_MAP = {
     "email": "email",
     "calendar_invited_date": "calendar_invited_date",
@@ -106,6 +109,8 @@ _HEADER_MAP = {
     "calendar_account_prefix": "calendar_account_prefix",
     "calendar_webinar_series": "calendar_webinar_series",
     "calendar_invite_response": "calendar_invite_response",
+    "calendar_response": "calendar_invite_response",
+    "response": "calendar_invite_response",
 }
 
 
@@ -178,6 +183,7 @@ def _upload_dict(
         "id": u.id,
         "webinar_id": u.webinar_id,
         "webinar_label": webinar_label,
+        "kind": u.kind,
         "sender_id": u.sender_id,
         "sender_name": sender_name,
         "file_name": u.file_name,
@@ -637,8 +643,11 @@ async def presign_calendar_upload(
     filename = (body.get("filename") or "calendar.csv").strip()
     file_size = int(body.get("file_size") or 0)
     webinar_id = (body.get("webinar_id") or "").strip()
+    is_nonjoiner = bool(body.get("is_nonjoiner"))
+    kind = "nonjoiner" if is_nonjoiner else "calendar"
     raw_sender_id = body.get("sender_id")
-    sender_id = (raw_sender_id or "").strip() or None
+    # Sender (Pattern A) only applies to normal calendar uploads.
+    sender_id = None if is_nonjoiner else ((raw_sender_id or "").strip() or None)
 
     if not filename.endswith(".csv"):
         raise HTTPException(400, "Only CSV files are accepted")
@@ -694,6 +703,7 @@ async def presign_calendar_upload(
         user_id=LLOYD_USER_ID,
         webinar_id=webinar_id,
         sender_id=sender_id,
+        kind=kind,
         file_name=filename,
         storage_path=storage_path,
         status="uploading",
@@ -747,7 +757,15 @@ async def confirm_calendar_upload(
 
     headers = _parse_csv_line(lines[0])
     normalized = {_normalize_header(h) for h in headers}
-    has_responses = "calendar_invite_response" in normalized
+    has_email = "email" in normalized
+    # A response column may be named Calendar_invite_response / Calendar_response / Response.
+    has_responses = bool(normalized & {"calendar_invite_response", "calendar_response", "response"})
+
+    if upload.kind == "nonjoiner":
+        if not has_email:
+            raise HTTPException(400, "Non-joiners CSV needs an 'Email' column")
+        if not has_responses:
+            raise HTTPException(400, "Non-joiners CSV needs a response column (Yes/Maybe)")
 
     # Estimate total rows from file size & average row length (same trick as outreach uploads)
     if len(lines) > 1 and file_size > 0:
@@ -814,6 +832,7 @@ async def start_calendar_import(
     task = asyncio.create_task(
         _process_calendar_csv(
             upload_id, upload.webinar_id, upload.storage_path, upload.sender_id,
+            kind=upload.kind,
         )
     )
     _active_import_tasks[upload_id] = task
@@ -992,6 +1011,7 @@ def resume_orphan_calendar_import(upload: "WebinarCalendarUpload") -> bool:
             upload.webinar_id,
             upload.storage_path,
             upload.sender_id,
+            kind=upload.kind,
             start_from_row=upload.processed_rows or 0,
             initial_matched=upload.matched_count or 0,
             initial_unmatched=upload.unmatched_count or 0,
@@ -1008,6 +1028,7 @@ async def _process_calendar_csv(
     storage_path: str,
     sender_id: str | None,
     *,
+    kind: str = "calendar",
     start_from_row: int = 0,
     initial_matched: int = 0,
     initial_unmatched: int = 0,
@@ -1156,6 +1177,45 @@ async def _process_calendar_csv(
                 by_email[r["email"]] = r
             rows = list(by_email.values())
             emails = list(by_email.keys())
+
+            # Non-joiner uploads: no per-list matching (one cohort). Store
+            # email + response only into webinar_nonjoiner_invites; the
+            # Statistics Nonjoiners row intersects these with the auto-derived
+            # cohort at read time.
+            if kind == "nonjoiner":
+                now = datetime.now(tz=timezone.utc)
+                nj_rows = [{
+                    "id": str(uuid.uuid4()),
+                    "upload_id": upload_id,
+                    "webinar_id": webinar_id,
+                    "email": r["email"],
+                    "calendar_invite_response": r["calendar_invite_response"],
+                    "updated_at": now,
+                } for r in rows]
+                rows_affected = 0
+                for attempt in range(3):
+                    try:
+                        async with engine.begin() as conn:
+                            stmt = pg_insert(WebinarNonjoinerInvite.__table__).values(nj_rows)
+                            stmt = stmt.on_conflict_do_update(
+                                constraint="uq_wnji_webinar_email",
+                                set_={
+                                    "upload_id": stmt.excluded.upload_id,
+                                    "calendar_invite_response": stmt.excluded.calendar_invite_response,
+                                    "updated_at": stmt.excluded.updated_at,
+                                },
+                            )
+                            result = await conn.execute(stmt)
+                            rows_affected = result.rowcount or 0
+                        break
+                    except Exception as e:
+                        if attempt < 2 and ("connection" in str(e).lower() or "timeout" in str(e).lower()):
+                            print(f"[CAL_IMPORT] NJ upsert retry {attempt+1}: {e}")
+                            await asyncio.sleep(1)
+                        else:
+                            raise
+                # matched/unmatched aren't meaningful for nonjoiner uploads
+                return 0, 0, rows_affected
 
             # Match: contacts assigned to this webinar via WebinarListAssignment
             match_map: dict[str, tuple[str, str]] = {}  # email → (assignment_id, contact_id)
@@ -1335,8 +1395,9 @@ async def _process_calendar_csv(
             )
 
         # Pattern A: stamp every distinct calendar_account in this CSV with
-        # the sender chosen at upload time. Last write wins.
-        if sender_id and accounts_seen:
+        # the sender chosen at upload time. Last write wins. (Calendar uploads
+        # only — Non-joiner CSVs carry no calendar_account.)
+        if kind != "nonjoiner" and sender_id and accounts_seen:
             now = datetime.now(tz=timezone.utc)
             cas_rows = [
                 {

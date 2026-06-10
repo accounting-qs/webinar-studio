@@ -191,7 +191,14 @@ function UploadsTable({
             const dateLabel = u.created_at ? new Date(u.created_at).toLocaleString() : "—";
             return (
               <tr key={u.id} className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
-                <td className="px-3 py-2 font-mono text-zinc-800 dark:text-zinc-200">{u.webinar_label ?? u.webinar_id.slice(0, 8)}</td>
+                <td className="px-3 py-2 font-mono text-zinc-800 dark:text-zinc-200">
+                  {u.webinar_label ?? u.webinar_id.slice(0, 8)}
+                  {u.kind === "nonjoiner" && (
+                    <span className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30 align-middle not-italic font-sans">
+                      Non-joiners
+                    </span>
+                  )}
+                </td>
                 <td className="px-3 py-2 text-zinc-700 dark:text-zinc-300">
                   {u.sender_name ?? <span className="text-zinc-500">—</span>}
                 </td>
@@ -289,6 +296,7 @@ function UploadModal({
 }) {
   const [webinarId, setWebinarId] = useState<string>("");
   const [senderId, setSenderId] = useState<string>("");
+  const [isNonjoiner, setIsNonjoiner] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [step, setStep] = useState<ModalStep>("pick");
   const [progress, setProgress] = useState(0);
@@ -314,7 +322,8 @@ function UploadModal({
         file.name,
         file.size,
         webinarId,
-        senderId || null,
+        isNonjoiner ? null : (senderId || null),
+        isNonjoiner,
       );
       await uploadToStorage(signed_url, file, setProgress);
       const conf = await confirmCalendarUpload(upload_id, file.size);
@@ -349,7 +358,7 @@ function UploadModal({
         className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-y-auto"
       >
         <div className="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 flex justify-between items-center">
-          <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Upload Added-to-Calendar CSV</h3>
+          <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{isNonjoiner ? "Upload Non-joiners CSV" : "Upload Added-to-Calendar CSV"}</h3>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 text-lg leading-none">×</button>
         </div>
 
@@ -376,24 +385,41 @@ function UploadModal({
                 </select>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">
-                  Sender <span className="text-zinc-500 font-normal">(optional)</span>
-                </label>
-                <select
-                  value={senderId}
-                  onChange={(e) => setSenderId(e.target.value)}
-                  className="w-full bg-zinc-50 dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
-                >
-                  <option value="">No sender (leave accounts unmapped)</option>
-                  {sortedSenders.map((s) => (
-                    <option key={s.id} value={s.id}>{s.name}</option>
-                  ))}
-                </select>
-                <div className="mt-1 text-[11px] text-zinc-500">
-                  Every calendar_account in this file will be mapped to the chosen sender. Re-uploading overrides existing mappings.
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={isNonjoiner}
+                  onChange={(e) => setIsNonjoiner(e.target.checked)}
+                  className="mt-0.5 accent-violet-600"
+                />
+                <span className="text-xs text-zinc-700 dark:text-zinc-300">
+                  <span className="font-semibold">This is a Non-joiners list</span> (email + Yes/Maybe response)
+                  <span className="block text-[11px] text-zinc-500 font-normal mt-0.5">
+                    Stored separately and used only to fill the Statistics Nonjoiners row Yes/Maybe. Does not affect planned-list calendar data.
+                  </span>
+                </span>
+              </label>
+
+              {!isNonjoiner && (
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">
+                    Sender <span className="text-zinc-500 font-normal">(optional)</span>
+                  </label>
+                  <select
+                    value={senderId}
+                    onChange={(e) => setSenderId(e.target.value)}
+                    className="w-full bg-zinc-50 dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                  >
+                    <option value="">No sender (leave accounts unmapped)</option>
+                    {sortedSenders.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                  <div className="mt-1 text-[11px] text-zinc-500">
+                    Every calendar_account in this file will be mapped to the chosen sender. Re-uploading overrides existing mappings.
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">CSV file</label>
@@ -411,12 +437,19 @@ function UploadModal({
                 )}
               </div>
 
-              <div className="text-[11px] text-zinc-500 leading-relaxed">
-                Auto-mapped columns: <span className="font-mono">Email</span>, <span className="font-mono">Calendar_invited_date</span>,{" "}
-                <span className="font-mono">Calendar_account</span>, <span className="font-mono">Calendar account prefix</span>,{" "}
-                <span className="font-mono">Calendar_webinar_series</span>,{" "}
-                <span className="font-mono">Calendar_invite_response</span> (optional). All other columns are ignored.
-              </div>
+              {isNonjoiner ? (
+                <div className="text-[11px] text-zinc-500 leading-relaxed">
+                  Columns used: <span className="font-mono">Email</span>,{" "}
+                  <span className="font-mono">Calendar_invite_response</span> (Yes/Maybe). All other columns are ignored.
+                </div>
+              ) : (
+                <div className="text-[11px] text-zinc-500 leading-relaxed">
+                  Auto-mapped columns: <span className="font-mono">Email</span>, <span className="font-mono">Calendar_invited_date</span>,{" "}
+                  <span className="font-mono">Calendar_account</span>, <span className="font-mono">Calendar account prefix</span>,{" "}
+                  <span className="font-mono">Calendar_webinar_series</span>,{" "}
+                  <span className="font-mono">Calendar_invite_response</span> (optional). All other columns are ignored.
+                </div>
+              )}
             </>
           )}
 

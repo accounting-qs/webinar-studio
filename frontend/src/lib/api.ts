@@ -2049,6 +2049,7 @@ export interface ApiCalendarUpload {
   id: string;
   webinar_id: string;
   webinar_label: string | null;
+  kind: string; // 'calendar' | 'nonjoiner'
   sender_id: string | null;
   sender_name: string | null;
   file_name: string;
@@ -2085,6 +2086,7 @@ export async function presignCalendarUpload(
   fileSize: number,
   webinarId: string,
   senderId?: string | null,
+  isNonjoiner?: boolean,
 ): Promise<{ upload_id: string; signed_url: string; storage_path: string }> {
   const res = await fetch(`${API_URL}/calendar-uploads/presign`, {
     method: "POST",
@@ -2094,6 +2096,7 @@ export async function presignCalendarUpload(
       file_size: fileSize,
       webinar_id: webinarId,
       sender_id: senderId ?? null,
+      is_nonjoiner: isNonjoiner ?? false,
     }),
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to get signed URL"));

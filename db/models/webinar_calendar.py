@@ -31,6 +31,10 @@ class WebinarCalendarUpload(Base):
     file_name: Mapped[str] = mapped_column(Text, nullable=False)
     storage_path: Mapped[Optional[str]] = mapped_column(Text)
     has_responses: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # 'calendar' (normal Added-to-Calendar CSV → webinar_calendar_invites) or
+    # 'nonjoiner' (Yes/Maybe responses for the auto-derived Nonjoiners cohort →
+    # webinar_nonjoiner_invites). Routes parsing + destination table.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="calendar")
 
     total_rows: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -87,6 +91,37 @@ class WebinarCalendarInvite(Base):
         Index("ix_wci_webinar_account", "webinar_id", "calendar_account"),
         Index("ix_wci_webinar_response", "webinar_id", "calendar_invite_response"),
         Index("ix_wci_upload", "upload_id"),
+    )
+
+
+class WebinarNonjoinerInvite(Base):
+    """One row per uploaded Non-joiners CSV record: email + calendar response.
+
+    Separate from webinar_calendar_invites so a Non-joiners upload never feeds
+    the normal calendar-CSV mode (planned-list / No-List-Data Yes/Maybe). The
+    Statistics Nonjoiners row uses these rows only to LABEL Yes/Maybe on the
+    auto-derived nonjoiner cohort. Upsert key (webinar_id, email): re-uploading
+    the same email for the same webinar updates the row; the same email across
+    different webinars yields independent rows.
+    """
+
+    __tablename__ = "webinar_nonjoiner_invites"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    upload_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("webinar_calendar_uploads.id", ondelete="CASCADE"), nullable=False)
+    webinar_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("webinars.id", ondelete="CASCADE"), nullable=False)
+
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    calendar_invite_response: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("webinar_id", "email", name="uq_wnji_webinar_email"),
+        Index("ix_wnji_webinar_email", "webinar_id", "email"),
+        Index("ix_wnji_webinar_response", "webinar_id", "calendar_invite_response"),
+        Index("ix_wnji_upload", "upload_id"),
     )
 
 

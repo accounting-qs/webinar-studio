@@ -149,18 +149,31 @@ async def _fetch_wg_broadcast_totals(db: AsyncSession, broadcast_id: str) -> dic
 async def _csv_mode_for_webinar(db: AsyncSession, webinar_id: str) -> bool:
     """Return True when a completed Added-to-Calendar CSV with response data
     exists for this webinar. When True, Yes/Maybe metrics source from
-    webinar_calendar_invites instead of parsing GHL response history regex."""
+    webinar_calendar_invites instead of parsing GHL response history regex.
+
+    Scoped to kind='calendar' so a Non-joiners upload (kind='nonjoiner') does
+    NOT flip planned-list / No-List-Data into CSV mode."""
     from sqlalchemy import text as sa_text
     r = await db.execute(sa_text(
         """
         SELECT 1 FROM webinar_calendar_uploads
         WHERE webinar_id = CAST(:wid AS uuid)
+          AND kind = 'calendar'
           AND status = 'complete'
           AND has_responses = TRUE
         LIMIT 1
         """
     ).bindparams(wid=webinar_id))
     return r.scalar() is not None
+
+
+# Reusable CTE: per-webinar Non-joiners CSV responses (lowercased email + resp).
+# Empty when no Non-joiners CSV was uploaded for :wid, so Yes/Maybe naturally
+# fall to 0. Caller binds :wid and prefixes/joins this.
+NJ_CSV_CTE = (
+    "njcsv AS (SELECT LOWER(email) AS email, LOWER(calendar_invite_response) AS resp "
+    "FROM webinar_nonjoiner_invites WHERE webinar_id = CAST(:wid AS uuid))"
+)
 
 
 def _csv_yes_maybe_ctes() -> str:
@@ -781,23 +794,44 @@ class GoHighLevelStatisticsSource:
 
         # Attendance for the nonjoiner cohort, matched by email against this
         # webinar's broadcast (same ATT definition as the per-list Batch B).
-        # nonjoiner_regs/attended are also used to carve nonjoiners out of the
-        # NO LIST DATA broadcast-gap below.
+        # Also breaks attendance down by uploaded Yes/Maybe response (njcsv,
+        # empty when no Non-joiners CSV → 0) and by self-reg (GHL form-date in
+        # window). nonjoiner_regs/attended also carve nonjoiners out of the NO
+        # LIST DATA broadcast-gap below.
         nonjoiner_regs = 0
         nonjoiner_attended = 0
+        has_window = bool(prev_date and current_date)
+        sr_pred = (
+            "g.webinar_registration_in_form_date > :sr_start "
+            "AND g.webinar_registration_in_form_date <= :sr_end"
+        ) if has_window else "FALSE"
         if nonjoiner_emails and broadcast_id:
             ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
+            wg_att_params: dict[str, Any] = {
+                "bid": broadcast_id, "nj_emails": nonjoiner_emails, "wid": wid,
+            }
+            if has_window:
+                wg_att_params["sr_start"] = prev_date
+                wg_att_params["sr_end"] = current_date
             r = await db.execute(sa_text(f"""
-                WITH {NJ_EMAILS_CTE}
+                WITH {NJ_EMAILS_CTE}, {NJ_CSV_CTE}
                 SELECT
                     COUNT(DISTINCT LOWER(wgs.email))                                                    AS total_regs,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT})                                AS total_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10)  AS total_10m,
-                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)  AS total_30m
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)  AS total_30m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'yes')                                 AS yes_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'yes'   AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe')                               AS maybe_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe' AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}))                                    AS self_reg_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}) AND wgs.minutes_viewing >= 10)      AS self_reg_10m
                 FROM webinargeek_subscribers wgs
                 JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)
+                LEFT JOIN njcsv c ON c.email = LOWER(wgs.email)
+                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
                 WHERE wgs.broadcast_id = :bid
-            """).bindparams(bid=broadcast_id, nj_emails=nonjoiner_emails))
+            """).bindparams(**wg_att_params))
             wrow = r.mappings().one_or_none()
             if wrow:
                 nonjoiner_regs = int(wrow["total_regs"] or 0)
@@ -806,13 +840,20 @@ class GoHighLevelStatisticsSource:
                 nj_metrics["totalAttended"] = nonjoiner_attended
                 nj_metrics["total10MinPlus"] = int(wrow["total_10m"] or 0)
                 nj_metrics["total30MinPlus"] = int(wrow["total_30m"] or 0)
+                nj_metrics["yesAttended"] = int(wrow["yes_attended"] or 0)
+                nj_metrics["yes10MinPlus"] = int(wrow["yes_10m"] or 0)
+                nj_metrics["maybeAttended"] = int(wrow["maybe_attended"] or 0)
+                nj_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
+                if has_window:
+                    nj_metrics["selfRegAttended"] = int(wrow["self_reg_attended"] or 0)
+                    nj_metrics["selfReg10MinPlus"] = int(wrow["self_reg_10m"] or 0)
 
         # Sales + quality for the nonjoiner cohort (same join shape / filter as
         # the per-list Batch C: opp.webinar_source_number = N OR booked_call = N).
         if nonjoiner_emails:
             qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
             r = await db.execute(sa_text(f"""
-                WITH {NJ_EMAILS_CTE}
+                WITH {NJ_EMAILS_CTE}, {NJ_CSV_CTE}
                 SELECT
                     COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
@@ -826,13 +867,16 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
-                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE c.resp = 'yes')   AS yes_bookings,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE c.resp = 'maybe') AS maybe_bookings
                 FROM nj_emails_cte njx
                 JOIN ghl_contact g ON LOWER(g.email) = njx.email
                 JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+                LEFT JOIN njcsv c ON c.email = njx.email
                 WHERE (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             """).bindparams(
-                nj_emails=nonjoiner_emails, N=N,
+                nj_emails=nonjoiner_emails, N=N, wid=wid,
                 now_ts=datetime.now(timezone.utc),
                 won_stage=DEAL_WON_STAGE_ID,
                 dq_stage=DISQUALIFIED_STAGE_ID,
@@ -856,6 +900,35 @@ class GoHighLevelStatisticsSource:
                 nj_metrics["leadQualityOk"] = int(orow["lq_ok"] or 0)
                 nj_metrics["leadQualityBarelyPassable"] = int(orow["lq_barely"] or 0)
                 nj_metrics["leadQualityBadDq"] = int(orow["lq_dq"] or 0)
+                nj_metrics["yesBookings"] = int(orow["yes_bookings"] or 0)
+                nj_metrics["maybeBookings"] = int(orow["maybe_bookings"] or 0)
+
+        # Yes/Maybe marked (from the uploaded Non-joiners CSV; 0 when none) and
+        # Self-Reg marked (GHL form-date in window) for the cohort. These don't
+        # need a broadcast, so they run whenever the cohort exists.
+        if nonjoiner_emails:
+            marked_params: dict[str, Any] = {"nj_emails": nonjoiner_emails, "wid": wid}
+            if has_window:
+                marked_params["sr_start"] = prev_date
+                marked_params["sr_end"] = current_date
+            r = await db.execute(sa_text(f"""
+                WITH {NJ_EMAILS_CTE}, {NJ_CSV_CTE}
+                SELECT
+                    COUNT(DISTINCT e.email) FILTER (WHERE c.resp = 'yes')   AS yes_marked,
+                    COUNT(DISTINCT e.email) FILTER (WHERE c.resp = 'maybe') AS maybe_marked,
+                    COUNT(DISTINCT e.email) FILTER (WHERE {sr_pred})        AS self_reg_marked
+                FROM nj_emails_cte e
+                LEFT JOIN njcsv c ON c.email = e.email
+                LEFT JOIN ghl_contact g ON LOWER(g.email) = e.email
+            """).bindparams(**marked_params))
+            mrow = r.mappings().one_or_none()
+            if mrow:
+                nj_metrics["yesMarked"] = int(mrow["yes_marked"] or 0)
+                nj_metrics["maybeMarked"] = int(mrow["maybe_marked"] or 0)
+                if has_window:
+                    sr = int(mrow["self_reg_marked"] or 0)
+                    nj_metrics["selfRegMarked"] = sr
+                    nj_metrics["lpRegs"] = sr
 
         # Default queried-but-empty cohort metrics to 0 so they render "0"
         # (we genuinely queried and found none) instead of "—". Mirrors the
@@ -864,9 +937,17 @@ class GoHighLevelStatisticsSource:
             "totalBookings", "totalCallsDatePassed", "confirmed", "shows",
             "noShows", "canceled", "won", "disqualified", "qualified",
             "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+            "yesBookings", "maybeBookings",
         ]
+        if has_window:
+            nj_default_zero.extend(["selfRegMarked", "lpRegs"])
         if broadcast_id:
-            nj_default_zero.extend(["totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus"])
+            nj_default_zero.extend([
+                "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus",
+                "yesAttended", "yes10MinPlus", "maybeAttended", "maybe10MinPlus",
+            ])
+            if has_window:
+                nj_default_zero.extend(["selfRegAttended", "selfReg10MinPlus"])
         for k in nj_default_zero:
             nj_metrics.setdefault(k, 0)
 
