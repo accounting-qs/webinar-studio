@@ -163,8 +163,13 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
             ) : (
               <>
                 {/* Summary stats */}
-                <div className="grid grid-cols-3 gap-2">
-                  <Stat label="Unique domains" value={data.domains.unique_domains.toLocaleString()} />
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  <Stat label="Total contacts" value={data.domains.total.toLocaleString()} />
+                  <Stat
+                    label="Unique domains"
+                    value={data.domains.unique_domains.toLocaleString()}
+                    sub={data.domains.total ? `${((100 * data.domains.unique_domains) / data.domains.total).toFixed(1)}% of contacts` : undefined}
+                  />
                   <Stat
                     label="Free-domain contacts"
                     value={data.domains.free_domain_contacts.toLocaleString()}
