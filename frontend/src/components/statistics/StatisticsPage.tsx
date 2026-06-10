@@ -26,6 +26,7 @@ import {
 } from "./metricRegistry";
 import { ChatPanel } from "./ChatPanel";
 import { BookingSourceModal, type DrillTarget } from "./BookingSourceModal";
+import { ListDistributionModal, type ListDistTarget } from "./ListDistributionModal";
 
 /* ─── Identity columns (pinned left side of table) ────────────────────── */
 
@@ -609,6 +610,7 @@ function renderGroupedRows(
   sortKey: string | null,
   sortDir: "asc" | "desc",
   onDrill: (t: DrillTarget) => void,
+  onListDist: (t: ListDistTarget) => void,
 ): ReactNode[] {
   // Sort comparator: numeric metric value, null last, respecting asc/desc.
   const cmp = (a: ApiStatisticsRow, b: ApiStatisticsRow): number => {
@@ -686,7 +688,24 @@ function renderGroupedRows(
         </span>
       </td>
       <td className={`px-2 py-1.5 ${W_DESC} ${desc}`}>
-        <span className={`block truncate ${isSpecial ? "text-zinc-500" : "text-zinc-800 dark:text-zinc-300"}`} title={row.description ?? undefined}>
+        <span
+          className={`block truncate ${
+            isSpecial
+              ? "text-zinc-500"
+              : row.assignmentId
+              ? "text-zinc-800 dark:text-zinc-300 cursor-pointer hover:text-violet-500 hover:underline decoration-dotted underline-offset-2"
+              : "text-zinc-800 dark:text-zinc-300"
+          }`}
+          title={!isSpecial && row.assignmentId ? "Show list-name distribution for this list" : row.description ?? undefined}
+          onClick={!isSpecial && row.assignmentId ? (e) => {
+            e.stopPropagation();
+            onListDist({
+              scope: "assignment",
+              assignment: row.assignmentId,
+              label: row.description ?? row.listName ?? "Assigned list",
+            });
+          } : undefined}
+        >
           {row.description ?? (row.kind === "nonjoiners" ? "Nonjoiners" : row.kind === "no_list_data" ? "NO LIST DATA" : "")}
           {row.kind === "no_list_data" && row.sharedAcrossVariants && (
             <span
@@ -910,6 +929,8 @@ export function StatisticsPage() {
   const [infoModalCol, setInfoModalCol] = useState<MetricColumn | null>(null);
   /** Metric-cell drill-down: opens the booking-source + contacts modal. */
   const [drill, setDrill] = useState<DrillTarget | null>(null);
+  /** List-name distribution modal (assigned-list or whole-webinar scope). */
+  const [listDist, setListDist] = useState<ListDistTarget | null>(null);
   /** Planning webinars (full editable rows) for the shared Edit modal. */
   const [planningWebinars, setPlanningWebinars] = useState<ApiWebinar[]>([]);
   const [editWebinar, setEditWebinar] = useState<EditableWebinar | null>(null);
@@ -1534,6 +1555,22 @@ export function StatisticsPage() {
                       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                       Edit
                     </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setListDist({
+                          scope: "webinar",
+                          webinarId: w.webinarId,
+                          webinarNumber: w.number,
+                          label: `Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`,
+                        });
+                      }}
+                      title="Show list-name distribution across all assigned lists for this webinar"
+                      className="ml-1.5 px-2 py-1 text-[10px] font-semibold rounded bg-zinc-500/15 text-zinc-500 hover:bg-zinc-500/25 hover:text-zinc-700 dark:hover:text-zinc-300 border border-zinc-400/30 transition-colors inline-flex items-center gap-1"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="8"/><rect x="12" y="6" width="3" height="12"/><rect x="17" y="13" width="3" height="5"/></svg>
+                      List dist.
+                    </button>
                   </td>
                   {METRIC_COLUMNS.map((col, idx) => (
                     <MetricCell
@@ -1553,7 +1590,7 @@ export function StatisticsPage() {
 
                 {/* ── Child rows (bucket-grouped) ─────────────────── */}
                 {isExpanded && w.rows.length > 0 &&
-                  renderGroupedRows(w, collapsedBuckets, toggleBucketGroup, setCopyModalRow, sortKey, sortDir, setDrill)}
+                  renderGroupedRows(w, collapsedBuckets, toggleBucketGroup, setCopyModalRow, sortKey, sortDir, setDrill, setListDist)}
                 {isExpanded && w.rows.length === 0 && (
                   <tr className="bg-white dark:bg-zinc-950 border-b border-zinc-200 dark:border-zinc-800/20">
                     <td colSpan={IDENTITY_COL_COUNT + METRIC_COLUMNS.length} className="px-4 py-6 text-center text-xs text-zinc-500">
@@ -1596,6 +1633,11 @@ export function StatisticsPage() {
       {/* ── Booking-source + contacts drill-down modal ─────────────── */}
       {drill && (
         <BookingSourceModal target={drill} onClose={() => setDrill(null)} />
+      )}
+
+      {/* ── List-name distribution modal ───────────────────────────── */}
+      {listDist && (
+        <ListDistributionModal target={listDist} onClose={() => setListDist(null)} />
       )}
 
       {/* ── Edit Webinar modal (shared with Planning) ──────────────── */}

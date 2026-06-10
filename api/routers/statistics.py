@@ -385,6 +385,107 @@ async def list_contacts_for_metric(
         }
 
 
+class ListDistributionItem(BaseModel):
+    list_name: str | None = None  # contacts.lead_list_name (None = no list name on the contact)
+    count: int
+    pct: float  # share of the scope's total contacts, 0–100
+
+
+class ListDistributionResponse(BaseModel):
+    scope: str  # "assignment" | "webinar"
+    assignment_id: str | None = None
+    webinar_id: str | None = None
+    webinar_number: int | None = None
+    label: str | None = None
+    total: int
+    items: list[ListDistributionItem]
+
+
+@router.get("/list-distribution", response_model=ListDistributionResponse)
+async def list_name_distribution(
+    assignment: str | None = None,
+    webinar_id: str | None = None,
+    webinar: int | None = None,
+):
+    """Distribution of source list names (`contacts.lead_list_name`) for either a
+    single assigned list (`assignment`) or every assigned list on a webinar
+    (`webinar_id` / `webinar`).
+
+    Each contact carries the list name it originated from (set at upload time).
+    This groups the contacts in scope by that list name and returns the count +
+    percentage share so the dashboard can show "which lists, and what % of
+    contacts came from each."
+    """
+    from sqlalchemy import select, text
+    from db.models import Webinar as WebinarModel
+    from db.session import AsyncSessionLocal
+
+    if assignment is None and webinar_id is None and webinar is None:
+        raise HTTPException(400, "Provide either assignment or webinar_id / webinar")
+
+    async with AsyncSessionLocal() as db:
+        if assignment is not None:
+            scope = "assignment"
+            sql = (
+                "SELECT c.lead_list_name AS list_name, COUNT(*) AS cnt "
+                "FROM contacts c WHERE c.assignment_id = CAST(:aid AS uuid) "
+                "GROUP BY c.lead_list_name ORDER BY cnt DESC, list_name ASC"
+            )
+            params: dict = {"aid": assignment}
+            resp_webinar_id = None
+            resp_webinar_number = None
+        else:
+            scope = "webinar"
+            # Resolve the webinar — UUID takes precedence; bare number falls
+            # back to the unlabeled row, matching the /contacts endpoint.
+            if webinar_id is not None:
+                r = await db.execute(select(WebinarModel).where(WebinarModel.id == webinar_id))
+                w = r.scalar_one_or_none()
+            else:
+                r = await db.execute(
+                    select(WebinarModel).where(
+                        WebinarModel.number == webinar,
+                        WebinarModel.variant_label.is_(None),
+                    )
+                )
+                w = r.scalar_one_or_none()
+            if w is None:
+                return {
+                    "scope": scope, "assignment_id": None, "webinar_id": webinar_id,
+                    "webinar_number": webinar, "label": None, "total": 0, "items": [],
+                }
+            resp_webinar_id = w.id
+            resp_webinar_number = w.number
+            sql = (
+                "SELECT c.lead_list_name AS list_name, COUNT(*) AS cnt "
+                "FROM contacts c "
+                "JOIN webinar_list_assignments wla ON c.assignment_id = wla.id "
+                "WHERE wla.webinar_id = CAST(:wid AS uuid) "
+                "GROUP BY c.lead_list_name ORDER BY cnt DESC, list_name ASC"
+            )
+            params = {"wid": w.id}
+
+        rows = (await db.execute(text(sql).bindparams(**params))).mappings().all()
+        total = sum(int(r["cnt"]) for r in rows)
+        items = [
+            {
+                "list_name": r["list_name"],
+                "count": int(r["cnt"]),
+                "pct": round(100.0 * int(r["cnt"]) / total, 1) if total else 0.0,
+            }
+            for r in rows
+        ]
+        return {
+            "scope": scope,
+            "assignment_id": assignment,
+            "webinar_id": resp_webinar_id,
+            "webinar_number": resp_webinar_number,
+            "label": None,
+            "total": total,
+            "items": items,
+        }
+
+
 async def _resolve_meta(source: str) -> dict:
     used = "workbook" if source == "workbook" else "ghl"
     last_sync = None

@@ -1524,6 +1524,43 @@ export async function fetchStatisticsContacts(params: {
   return res.json();
 }
 
+/* ── List-name distribution ─────────────────────────────────────────────── */
+
+export interface ListDistributionItem {
+  list_name: string | null;
+  count: number;
+  pct: number; // 0–100
+}
+
+export interface ListDistributionResponse {
+  scope: "assignment" | "webinar";
+  assignment_id: string | null;
+  webinar_id: string | null;
+  webinar_number: number | null;
+  label: string | null;
+  total: number;
+  items: ListDistributionItem[];
+}
+
+/** Distribution of source list names (contacts.lead_list_name) for either a
+ * single assigned list (`assignment`) or all assigned lists on a webinar
+ * (`webinarId` / `webinarNumber`). */
+export async function fetchListDistribution(params: {
+  assignment?: string | null;
+  webinarId?: string | null;
+  webinarNumber?: number | null;
+}): Promise<ListDistributionResponse> {
+  const qs = new URLSearchParams();
+  if (params.assignment) qs.set("assignment", params.assignment);
+  else if (params.webinarId) qs.set("webinar_id", params.webinarId);
+  else if (params.webinarNumber != null) qs.set("webinar", String(params.webinarNumber));
+  const res = await fetch(`${API_URL}/statistics/list-distribution?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch list distribution");
+  return res.json();
+}
+
 /* ── GHL Sync ───────────────────────────────────────────────────────────── */
 
 export interface GhlSyncRun {
