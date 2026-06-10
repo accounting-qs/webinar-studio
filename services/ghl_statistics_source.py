@@ -45,6 +45,11 @@ LEAD_QUALITY_BAD_DQ = "Bad / DQ"
 # Qualified = any lead_quality except DQ (per user: qualified = shows with a non-DQ quality)
 QUALIFIED_SET = {LEAD_QUALITY_GREAT, LEAD_QUALITY_OK, LEAD_QUALITY_BARELY}
 
+# Reusable CTE turning the :nj_emails bind (a text[] of nonjoiner emails) into a
+# small joinable relation, so semi/anti-joins against it compile to hash joins
+# instead of per-row array scans.
+NJ_EMAILS_CTE = "nj_emails_cte AS (SELECT DISTINCT e AS email FROM UNNEST(CAST(:nj_emails AS text[])) AS e)"
+
 
 # ---------------------------------------------------------------------------
 # Webinars-list TTL cache
@@ -710,37 +715,60 @@ class GoHighLevelStatisticsSource:
         # ── Nonjoiners ────────────────────────────────────────────────
         # If this webinar links to a previous one (nonjoiner_source_webinar_id),
         # Nonjoiners = that webinar's WebinarGeek broadcast registrants who did
-        # NOT watch live (registered no-shows). Otherwise fall back to the
-        # GHL-based count: prefer the cached value from run_webinar_sync, else a
-        # live regex scan.
-        nj_count: int | None = None
+        # NOT watch live (registered no-shows). Otherwise fall back to the GHL
+        # nonjoiner custom fields. Either way we materialise the actual *email
+        # set* (not just a count) so we can match the cohort against this
+        # webinar's broadcast + opportunities and show attendance/sales for it,
+        # and carve it out of NO LIST DATA below so each contact is counted
+        # once. Precedence: planned > nonjoiner (planned emails are excluded).
         if w.nonjoiner_source_webinar_id:
             src_bid = (await db.execute(sa_text(
                 "SELECT broadcast_id FROM webinars WHERE id = CAST(:sid AS uuid)"
             ).bindparams(sid=w.nonjoiner_source_webinar_id))).scalar()
             if src_bid:
-                nj_count = int((await db.execute(sa_text("""
-                    SELECT COUNT(DISTINCT LOWER(email))
+                nj_source_sql = """
+                    SELECT DISTINCT LOWER(email) AS email
                     FROM webinargeek_subscribers
-                    WHERE broadcast_id = :bid AND watched_live IS NOT TRUE
-                """).bindparams(bid=src_bid))).scalar() or 0)
-
-        if nj_count is None:
-            cached_nj = (await db.execute(
-                select(GHLWebinarStats.nj_count).where(GHLWebinarStats.webinar_number == N)
-            )).scalar()
-            if cached_nj is not None:
-                nj_count = int(cached_nj)
+                    WHERE broadcast_id = :nj_src_bid AND watched_live IS NOT TRUE
+                      AND email IS NOT NULL
+                """
+                nj_source_params: dict[str, Any] = {"nj_src_bid": src_bid}
             else:
-                r = await db.execute(sa_text("""
-                    SELECT COUNT(DISTINCT g.ghl_contact_id)
-                    FROM ghl_contact g
-                    WHERE g.calendar_webinar_series_non_joiners ~* :re
-                       OR g.calendar_invite_response_prefix_non_joiners ~* :re
-                """).bindparams(re=series_nj_re))
-                nj_count = int(r.scalar() or 0)
+                nj_source_sql = "SELECT NULL::text AS email WHERE FALSE"
+                nj_source_params = {}
+        else:
+            nj_source_sql = """
+                SELECT DISTINCT LOWER(email) AS email
+                FROM ghl_contact
+                WHERE (calendar_webinar_series_non_joiners ~* :nj_src_re
+                       OR calendar_invite_response_prefix_non_joiners ~* :nj_src_re)
+                  AND email IS NOT NULL
+            """
+            nj_source_params = {"nj_src_re": series_nj_re}
 
-        # Nonjoiners row metrics
+        # Materialise the nonjoiner email set, minus any email already on a
+        # planned list for this webinar (or its sibling variants).
+        nj_emails_rows = await db.execute(sa_text(f"""
+            WITH nj_src AS (
+                {nj_source_sql}
+            ),
+            nj_planned AS (
+                SELECT DISTINCT LOWER(c.email) AS email
+                FROM contacts c
+                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                WHERE wla.webinar_id = ANY(CAST(:nj_planned_wids AS uuid[]))
+                  AND c.email IS NOT NULL
+            )
+            SELECT s.email
+            FROM nj_src s
+            LEFT JOIN nj_planned p ON p.email = s.email
+            WHERE p.email IS NULL
+        """).bindparams(nj_planned_wids=planned_webinar_ids, **nj_source_params))
+        nonjoiner_emails: list[str] = [r[0] for r in nj_emails_rows.all() if r[0]]
+        nj_count = len(nonjoiner_emails)
+
+        # Nonjoiners row metrics. invited = the full nonjoiner pool (rates fall
+        # back to it since actuallyUsed is None); self-reg has no data for them.
         nj_metrics: dict[str, float | None] = {
             "accountsNeeded": None,
             "invited": nj_count,  # treat nonjoiners as part of the invited pool
@@ -750,6 +778,97 @@ class GoHighLevelStatisticsSource:
             "selfRegMarked": 0,
             "gcalInvitedGhl": nj_count,
         }
+
+        # Attendance for the nonjoiner cohort, matched by email against this
+        # webinar's broadcast (same ATT definition as the per-list Batch B).
+        # nonjoiner_regs/attended are also used to carve nonjoiners out of the
+        # NO LIST DATA broadcast-gap below.
+        nonjoiner_regs = 0
+        nonjoiner_attended = 0
+        if nonjoiner_emails and broadcast_id:
+            ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
+            r = await db.execute(sa_text(f"""
+                WITH {NJ_EMAILS_CTE}
+                SELECT
+                    COUNT(DISTINCT LOWER(wgs.email))                                                    AS total_regs,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT})                                AS total_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10)  AS total_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)  AS total_30m
+                FROM webinargeek_subscribers wgs
+                JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)
+                WHERE wgs.broadcast_id = :bid
+            """).bindparams(bid=broadcast_id, nj_emails=nonjoiner_emails))
+            wrow = r.mappings().one_or_none()
+            if wrow:
+                nonjoiner_regs = int(wrow["total_regs"] or 0)
+                nonjoiner_attended = int(wrow["total_attended"] or 0)
+                nj_metrics["totalRegs"] = nonjoiner_regs
+                nj_metrics["totalAttended"] = nonjoiner_attended
+                nj_metrics["total10MinPlus"] = int(wrow["total_10m"] or 0)
+                nj_metrics["total30MinPlus"] = int(wrow["total_30m"] or 0)
+
+        # Sales + quality for the nonjoiner cohort (same join shape / filter as
+        # the per-list Batch C: opp.webinar_source_number = N OR booked_call = N).
+        if nonjoiner_emails:
+            qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
+            r = await db.execute(sa_text(f"""
+                WITH {NJ_EMAILS_CTE}
+                SELECT
+                    COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'cancelled') AS canceled,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :won_stage) AS won,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :dq_stage) AS disqualified,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed' AND o.lead_quality IN {qual_in}) AS qualified,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
+                    COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
+                FROM nj_emails_cte njx
+                JOIN ghl_contact g ON LOWER(g.email) = njx.email
+                JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+                WHERE (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
+            """).bindparams(
+                nj_emails=nonjoiner_emails, N=N,
+                now_ts=datetime.now(timezone.utc),
+                won_stage=DEAL_WON_STAGE_ID,
+                dq_stage=DISQUALIFIED_STAGE_ID,
+                lq_great=LEAD_QUALITY_GREAT,
+                lq_ok=LEAD_QUALITY_OK,
+                lq_barely=LEAD_QUALITY_BARELY,
+                lq_dq=LEAD_QUALITY_BAD_DQ,
+            ))
+            orow = r.mappings().one_or_none()
+            if orow:
+                nj_metrics["totalBookings"] = int(orow["total_bookings"] or 0)
+                nj_metrics["totalCallsDatePassed"] = int(orow["calls_passed"] or 0)
+                nj_metrics["confirmed"] = int(orow["confirmed"] or 0)
+                nj_metrics["shows"] = int(orow["shows"] or 0)
+                nj_metrics["noShows"] = int(orow["no_shows"] or 0)
+                nj_metrics["canceled"] = int(orow["canceled"] or 0)
+                nj_metrics["won"] = int(orow["won"] or 0)
+                nj_metrics["disqualified"] = int(orow["disqualified"] or 0)
+                nj_metrics["qualified"] = int(orow["qualified"] or 0)
+                nj_metrics["leadQualityGreat"] = int(orow["lq_great"] or 0)
+                nj_metrics["leadQualityOk"] = int(orow["lq_ok"] or 0)
+                nj_metrics["leadQualityBarelyPassable"] = int(orow["lq_barely"] or 0)
+                nj_metrics["leadQualityBadDq"] = int(orow["lq_dq"] or 0)
+
+        # Default queried-but-empty cohort metrics to 0 so they render "0"
+        # (we genuinely queried and found none) instead of "—". Mirrors the
+        # per-list default-zero pattern; attendance only when a broadcast exists.
+        nj_default_zero = [
+            "totalBookings", "totalCallsDatePassed", "confirmed", "shows",
+            "noShows", "canceled", "won", "disqualified", "qualified",
+            "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+        ]
+        if broadcast_id:
+            nj_default_zero.extend(["totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus"])
+        for k in nj_default_zero:
+            nj_metrics.setdefault(k, 0)
 
         # ── No List Data ──────────────────────────────────────────────
         # Contacts with any webinar-N signal NOT mapped to any Planning list
@@ -827,9 +946,21 @@ class GoHighLevelStatisticsSource:
             nld_csv_prefix = ""
             relevant_csv_union = ""
 
+        # Carve nonjoiners out of the leftover pool so the signals we just
+        # attributed to the Nonjoiners row aren't double-counted here (each
+        # contact lands in exactly one of planned / nonjoiners / NLD).
+        if nonjoiner_emails:
+            nld_params["nj_emails"] = nonjoiner_emails
+            nj_cte_sql = NJ_EMAILS_CTE + ","
+            nj_join_sql = "LEFT JOIN nj_emails_cte njx ON njx.email = r.lem"
+            nj_filter_sql = "AND njx.email IS NULL"
+        else:
+            nj_cte_sql = nj_join_sql = nj_filter_sql = ""
+
         nld_counts_sql = f"""
             WITH
             {nld_csv_prefix}
+            {nj_cte_sql}
             relevant AS (
                 SELECT g.ghl_contact_id, LOWER(g.email) AS lem,
                        g.calendar_invite_response_history AS irh,
@@ -855,7 +986,9 @@ class GoHighLevelStatisticsSource:
                 SELECT r.*
                 FROM relevant r
                 LEFT JOIN planned p ON p.email = r.lem
+                {nj_join_sql}
                 WHERE p.email IS NULL
+                  {nj_filter_sql}
             )
             SELECT
                 COUNT(DISTINCT COALESCE(ghl_contact_id, lem))                          AS total_unplanned,
@@ -910,9 +1043,20 @@ class GoHighLevelStatisticsSource:
                 wg_nld_params["yes_re"] = yes_re
                 wg_nld_params["maybe_re"] = maybe_re
 
+            # Exclude nonjoiner attendees here too — their attendance is shown
+            # on the Nonjoiners row, so it must not also count in NLD.
+            if nonjoiner_emails:
+                wg_nld_params["nj_emails"] = nonjoiner_emails
+                wg_nj_cte_sql = NJ_EMAILS_CTE + ","
+                wg_nj_join_sql = "LEFT JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)"
+                wg_nj_filter_sql = "AND njx.email IS NULL"
+            else:
+                wg_nj_cte_sql = wg_nj_join_sql = wg_nj_filter_sql = ""
+
             wg_nld_sql = f"""
                 WITH
                 {wg_csv_prefix}
+                {wg_nj_cte_sql}
                 planned AS (
                     SELECT DISTINCT LOWER(c.email) AS email
                     FROM contacts c
@@ -931,8 +1075,10 @@ class GoHighLevelStatisticsSource:
                 FROM webinargeek_subscribers wgs
                 LEFT JOIN planned p ON p.email = LOWER(wgs.email)
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
+                {wg_nj_join_sql}
                 WHERE wgs.broadcast_id = :bid
                   AND p.email IS NULL
+                  {wg_nj_filter_sql}
             """
             r = await db.execute(sa_text(wg_nld_sql).bindparams(**wg_nld_params))
             wrow = r.mappings().one_or_none()
@@ -973,8 +1119,10 @@ class GoHighLevelStatisticsSource:
                     mrow = matched.mappings().one()
                     planned_regs = int(mrow["planned_regs"] or 0)
                     planned_attended = int(mrow["planned_attended"] or 0)
-                    nld_total_regs = max(0, wg_totals_nld["subscriptions_count"] - planned_regs)
-                    nld_total_attended = max(0, wg_totals_nld["live_viewers_count"] - planned_attended)
+                    # Subtract nonjoiners too — they're now their own partition,
+                    # so the NLD remainder = broadcast − planned − nonjoiners.
+                    nld_total_regs = max(0, wg_totals_nld["subscriptions_count"] - planned_regs - nonjoiner_regs)
+                    nld_total_attended = max(0, wg_totals_nld["live_viewers_count"] - planned_attended - nonjoiner_attended)
                     nld_metrics["totalRegs"] = nld_total_regs
                     nld_metrics["totalAttended"] = nld_total_attended
                     total_u = max(total_u, nld_total_regs)
