@@ -417,6 +417,7 @@ class DomainDistribution(BaseModel):
     free_domain_contacts: int  # contacts whose domain is a free / personal provider
     free_domain_unique: int  # distinct free / personal domains seen
     top: list[DomainItem]  # top domains by contact count (capped)
+    free: list[DomainItem]  # every free / personal domain seen, by contact count
 
 
 class ListDistributionResponse(BaseModel):
@@ -458,7 +459,7 @@ async def list_name_distribution(
     def _empty_domains() -> dict:
         return {
             "total": 0, "unique_domains": 0, "free_domain_contacts": 0,
-            "free_domain_unique": 0, "top": [],
+            "free_domain_unique": 0, "top": [], "free": [],
         }
 
     async with AsyncSessionLocal() as db:
@@ -525,28 +526,25 @@ async def list_name_distribution(
         drows = (await db.execute(text(domain_sql).bindparams(**params))).mappings().all()
         domain_total = sum(int(r["cnt"]) for r in drows)
         free_contacts = 0
-        free_unique = 0
         top: list[dict] = []
+        free: list[dict] = []  # drows is sorted by count desc, so free stays sorted too
         for i, r in enumerate(drows):
             dom = r["domain"] or None
             cnt = int(r["cnt"])
+            pct = round(100.0 * cnt / domain_total, 1) if domain_total else 0.0
             is_free = bool(dom and dom in FREE_EMAIL_DOMAINS)
             if is_free:
                 free_contacts += cnt
-                free_unique += 1
+                free.append({"domain": dom, "count": cnt, "pct": pct, "is_free": True})
             if i < DOMAIN_TOP_N:
-                top.append({
-                    "domain": dom,
-                    "count": cnt,
-                    "pct": round(100.0 * cnt / domain_total, 1) if domain_total else 0.0,
-                    "is_free": is_free,
-                })
+                top.append({"domain": dom, "count": cnt, "pct": pct, "is_free": is_free})
         domains = {
             "total": domain_total,
             "unique_domains": len(drows),
             "free_domain_contacts": free_contacts,
-            "free_domain_unique": free_unique,
+            "free_domain_unique": len(free),
             "top": top,
+            "free": free,
         }
 
         return {

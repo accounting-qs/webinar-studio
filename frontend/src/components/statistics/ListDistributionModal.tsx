@@ -186,6 +186,27 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
                     badge: it.is_free ? "free" : undefined,
                   }))}
                 />
+
+                {data.domains.free.length > 0 && (
+                  <>
+                    <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold pt-2">
+                      Free domains · {data.domains.free_domain_contacts.toLocaleString()} contact
+                      {data.domains.free_domain_contacts === 1 ? "" : "s"}
+                      {data.domains.total
+                        ? ` (${((100 * data.domains.free_domain_contacts) / data.domains.total).toFixed(1)}% of volume)`
+                        : ""}
+                    </div>
+                    <DistTable
+                      head="Free domain"
+                      rows={data.domains.free.map((it) => ({
+                        label: it.domain,
+                        emptyLabel: "— no domain",
+                        count: it.count,
+                        pct: it.pct,
+                      }))}
+                    />
+                  </>
+                )}
               </>
             )
           )}

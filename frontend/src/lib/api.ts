@@ -1545,6 +1545,7 @@ export interface DomainDistribution {
   free_domain_contacts: number;
   free_domain_unique: number;
   top: DomainItem[];
+  free: DomainItem[];
 }
 
 export interface ListDistributionResponse {

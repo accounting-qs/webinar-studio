@@ -67,7 +67,7 @@ export function BookingSourceModal({ target, onClose }: { target: DrillTarget; o
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-2xl max-w-5xl w-full max-h-[85vh] overflow-y-auto"
+        className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-2xl w-[80vw] max-w-none max-h-[85vh] overflow-y-auto"
       >
         <div className="flex items-start justify-between px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 z-10">
           <div>

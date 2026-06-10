@@ -334,8 +334,10 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
 
   return (
     <div className="space-y-3">
-      {isOpp && <SalesRepChart groups={groups} itemCount={data.items.length} />}
-      <BookingSourceChart groups={groups} itemCount={data.items.length} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
+        <BookingSourceChart groups={groups} itemCount={data.items.length} />
+        {isOpp && <SalesRepChart groups={groups} itemCount={data.items.length} />}
+      </div>
       <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/40 bg-white dark:bg-zinc-900/20 overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
