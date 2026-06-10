@@ -800,6 +800,24 @@ function renderGroupedRows(
             <span className="text-[10px] font-semibold text-zinc-500 dark:text-zinc-400 px-1.5 py-0.5 rounded bg-zinc-200 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/40">
               {lists.length}
             </span>
+            {groupKey !== "__unique__" && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onListDist({
+                    scope: "bucket",
+                    bucket: groupKey,
+                    webinarId: w.webinarId,
+                    webinarNumber: w.number,
+                    label: bucketName,
+                  });
+                }}
+                title="Show list-name + domain distribution across this bucket's assigned lists"
+                className="shrink-0 px-1.5 py-0.5 text-[9px] font-semibold rounded bg-violet-500/15 text-violet-500 hover:bg-violet-500/25 border border-violet-500/30 transition-colors"
+              >
+                Dist.
+              </button>
+            )}
           </div>
         </td>
         <td className={`px-2 py-2 ${W_COPY} ${sCopyG}`}></td>

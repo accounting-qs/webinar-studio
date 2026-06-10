@@ -1549,8 +1549,9 @@ export interface DomainDistribution {
 }
 
 export interface ListDistributionResponse {
-  scope: "assignment" | "webinar";
+  scope: "assignment" | "webinar" | "bucket";
   assignment_id: string | null;
+  bucket_id: string | null;
   webinar_id: string | null;
   webinar_number: number | null;
   label: string | null;
@@ -1559,18 +1560,28 @@ export interface ListDistributionResponse {
   domains: DomainDistribution;
 }
 
-/** Distribution of source list names (contacts.lead_list_name) for either a
- * single assigned list (`assignment`) or all assigned lists on a webinar
+/** Distribution of source list names (contacts.lead_list_name) + email domains
+ * for a single assigned list (`assignment`), a bucket group on a webinar
+ * (`bucket` + `webinarId`/`webinarNumber`), or all assigned lists on a webinar
  * (`webinarId` / `webinarNumber`). */
 export async function fetchListDistribution(params: {
   assignment?: string | null;
+  bucket?: string | null;
   webinarId?: string | null;
   webinarNumber?: number | null;
 }): Promise<ListDistributionResponse> {
   const qs = new URLSearchParams();
-  if (params.assignment) qs.set("assignment", params.assignment);
-  else if (params.webinarId) qs.set("webinar_id", params.webinarId);
-  else if (params.webinarNumber != null) qs.set("webinar", String(params.webinarNumber));
+  if (params.assignment) {
+    qs.set("assignment", params.assignment);
+  } else if (params.bucket) {
+    qs.set("bucket", params.bucket);
+    if (params.webinarId) qs.set("webinar_id", params.webinarId);
+    else if (params.webinarNumber != null) qs.set("webinar", String(params.webinarNumber));
+  } else if (params.webinarId) {
+    qs.set("webinar_id", params.webinarId);
+  } else if (params.webinarNumber != null) {
+    qs.set("webinar", String(params.webinarNumber));
+  }
   const res = await fetch(`${API_URL}/statistics/list-distribution?${qs.toString()}`, {
     headers: authHeaders(),
   });

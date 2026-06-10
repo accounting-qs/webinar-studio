@@ -421,8 +421,9 @@ class DomainDistribution(BaseModel):
 
 
 class ListDistributionResponse(BaseModel):
-    scope: str  # "assignment" | "webinar"
+    scope: str  # "assignment" | "webinar" | "bucket"
     assignment_id: str | None = None
+    bucket_id: str | None = None
     webinar_id: str | None = None
     webinar_number: int | None = None
     label: str | None = None
@@ -434,12 +435,17 @@ class ListDistributionResponse(BaseModel):
 @router.get("/list-distribution", response_model=ListDistributionResponse)
 async def list_name_distribution(
     assignment: str | None = None,
+    bucket: str | None = None,
     webinar_id: str | None = None,
     webinar: int | None = None,
 ):
     """Distribution of source list names (`contacts.lead_list_name`) and email
-    domains for either a single assigned list (`assignment`) or every assigned
-    list on a webinar (`webinar_id` / `webinar`).
+    domains for one of three scopes:
+
+    - `assignment` — a single assigned list.
+    - `bucket` (+ `webinar_id` / `webinar`) — every assigned list of that bucket
+      on the given webinar (i.e. the bucket group shown under a webinar).
+    - `webinar_id` / `webinar` — every assigned list on a webinar.
 
     Each contact carries the list name it originated from (set at upload time)
     and an email address. This groups the contacts in scope by list name and by
@@ -451,8 +457,8 @@ async def list_name_distribution(
     from db.models import Webinar as WebinarModel
     from db.session import AsyncSessionLocal
 
-    if assignment is None and webinar_id is None and webinar is None:
-        raise HTTPException(400, "Provide either assignment or webinar_id / webinar")
+    if assignment is None and bucket is None and webinar_id is None and webinar is None:
+        raise HTTPException(400, "Provide assignment, bucket (+ webinar), or webinar_id / webinar")
 
     DOMAIN_TOP_N = 10
 
@@ -463,32 +469,49 @@ async def list_name_distribution(
         }
 
     async with AsyncSessionLocal() as db:
+        # Resolve the webinar when given — needed for both the webinar and bucket
+        # scopes. UUID takes precedence; a bare number falls back to the
+        # unlabeled row, matching the /contacts endpoint.
+        w = None
+        if webinar_id is not None:
+            w = (await db.execute(select(WebinarModel).where(WebinarModel.id == webinar_id))).scalar_one_or_none()
+        elif webinar is not None:
+            w = (await db.execute(
+                select(WebinarModel).where(
+                    WebinarModel.number == webinar,
+                    WebinarModel.variant_label.is_(None),
+                )
+            )).scalar_one_or_none()
+
         if assignment is not None:
             scope = "assignment"
             from_where = "FROM contacts c WHERE c.assignment_id = CAST(:aid AS uuid)"
             params: dict = {"aid": assignment}
-            resp_webinar_id = None
-            resp_webinar_number = None
-        else:
-            scope = "webinar"
-            # Resolve the webinar — UUID takes precedence; bare number falls
-            # back to the unlabeled row, matching the /contacts endpoint.
-            if webinar_id is not None:
-                r = await db.execute(select(WebinarModel).where(WebinarModel.id == webinar_id))
-                w = r.scalar_one_or_none()
-            else:
-                r = await db.execute(
-                    select(WebinarModel).where(
-                        WebinarModel.number == webinar,
-                        WebinarModel.variant_label.is_(None),
-                    )
-                )
-                w = r.scalar_one_or_none()
+            resp_webinar_id = w.id if w else None
+            resp_webinar_number = w.number if w else None
+        elif bucket is not None:
+            scope = "bucket"
             if w is None:
                 return {
-                    "scope": scope, "assignment_id": None, "webinar_id": webinar_id,
-                    "webinar_number": webinar, "label": None, "total": 0, "items": [],
-                    "domains": _empty_domains(),
+                    "scope": scope, "assignment_id": None, "bucket_id": bucket,
+                    "webinar_id": webinar_id, "webinar_number": webinar, "label": None,
+                    "total": 0, "items": [], "domains": _empty_domains(),
+                }
+            resp_webinar_id = w.id
+            resp_webinar_number = w.number
+            from_where = (
+                "FROM contacts c "
+                "JOIN webinar_list_assignments wla ON c.assignment_id = wla.id "
+                "WHERE wla.webinar_id = CAST(:wid AS uuid) AND wla.bucket_id = CAST(:bid AS uuid)"
+            )
+            params = {"wid": w.id, "bid": bucket}
+        else:
+            scope = "webinar"
+            if w is None:
+                return {
+                    "scope": scope, "assignment_id": None, "bucket_id": None,
+                    "webinar_id": webinar_id, "webinar_number": webinar, "label": None,
+                    "total": 0, "items": [], "domains": _empty_domains(),
                 }
             resp_webinar_id = w.id
             resp_webinar_number = w.number
@@ -550,6 +573,7 @@ async def list_name_distribution(
         return {
             "scope": scope,
             "assignment_id": assignment,
+            "bucket_id": bucket,
             "webinar_id": resp_webinar_id,
             "webinar_number": resp_webinar_number,
             "label": None,

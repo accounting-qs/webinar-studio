@@ -7,11 +7,13 @@ type DistTab = "list" | "domain";
 
 /** What opens the list-name distribution modal. */
 export type ListDistTarget = {
-  scope: "assignment" | "webinar";
+  scope: "assignment" | "webinar" | "bucket";
   assignment?: string | null;
+  /** Bucket id — required for the "bucket" scope (paired with a webinar). */
+  bucket?: string | null;
   webinarId?: string | null;
   webinarNumber?: number;
-  /** Human label for the header (list description or "Webinar N"). */
+  /** Human label for the header (list description, bucket name, or "Webinar N"). */
   label: string;
 };
 
@@ -46,8 +48,9 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
       try {
         const res = await fetchListDistribution({
           assignment: target.scope === "assignment" ? target.assignment ?? undefined : undefined,
-          webinarId: target.scope === "webinar" ? target.webinarId ?? undefined : undefined,
-          webinarNumber: target.scope === "webinar" ? target.webinarNumber ?? undefined : undefined,
+          bucket: target.scope === "bucket" ? target.bucket ?? undefined : undefined,
+          webinarId: target.scope !== "assignment" ? target.webinarId ?? undefined : undefined,
+          webinarNumber: target.scope !== "assignment" ? target.webinarNumber ?? undefined : undefined,
         });
         if (!cancelled) setData(res);
       } catch (e) {
@@ -57,7 +60,16 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
       }
     })();
     return () => { cancelled = true; };
-  }, [target.scope, target.assignment, target.webinarId, target.webinarNumber]);
+  }, [target.scope, target.assignment, target.bucket, target.webinarId, target.webinarNumber]);
+
+  // Scope-dependent phrasing reused across the header / intro / empty states.
+  const acrossPhrase =
+    target.scope === "assignment"
+      ? "in this assigned list"
+      : target.scope === "bucket"
+      ? "across the assigned lists in this bucket"
+      : "across all assigned lists for this webinar";
+  const scopeNoun = target.scope === "assignment" ? "list" : target.scope === "bucket" ? "bucket" : "webinar";
 
   return (
     <div
@@ -71,7 +83,11 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
         <div className="flex items-start justify-between px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 z-10">
           <div>
             <div className="text-[10px] text-zinc-500 uppercase tracking-wider font-semibold mb-0.5">
-              {target.scope === "webinar" ? "Webinar · all assigned lists" : "Assigned list"}
+              {target.scope === "webinar"
+                ? "Webinar · all assigned lists"
+                : target.scope === "bucket"
+                ? "Bucket · assigned lists"
+                : "Assigned list"}
             </div>
             <div className="text-base font-bold text-zinc-900 dark:text-zinc-100">{target.label}</div>
             <div className="text-[11px] text-zinc-500 mt-0.5">
@@ -116,11 +132,11 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
             {tab === "list" ? (
               <>
                 Each contact carries the source list name it was uploaded under. This shows what
-                share of the contacts {target.scope === "webinar" ? "across all assigned lists for this webinar" : "in this assigned list"} came from each list name.
+                share of the contacts {acrossPhrase} came from each list name.
               </>
             ) : (
               <>
-                Email domains across the contacts {target.scope === "webinar" ? "in all assigned lists for this webinar" : "in this assigned list"}. Free /
+                Email domains across the contacts {acrossPhrase}. Free /
                 personal providers (Gmail, Outlook, …) are flagged so you can see how many contacts aren&apos;t on a company domain.
               </>
             )}
@@ -140,7 +156,7 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
           {data && !loading && tab === "list" && (
             data.items.length === 0 ? (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-500">
-                No contacts found for this {target.scope === "webinar" ? "webinar" : "list"}.
+                No contacts found for this {scopeNoun}.
               </div>
             ) : (
               <DistTable
@@ -158,7 +174,7 @@ export function ListDistributionModal({ target, onClose }: { target: ListDistTar
           {data && !loading && tab === "domain" && (
             data.domains.total === 0 ? (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-500">
-                No contacts with an email address found for this {target.scope === "webinar" ? "webinar" : "list"}.
+                No contacts with an email address found for this {scopeNoun}.
               </div>
             ) : (
               <>
