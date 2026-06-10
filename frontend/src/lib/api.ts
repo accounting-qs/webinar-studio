@@ -1532,6 +1532,21 @@ export interface ListDistributionItem {
   pct: number; // 0–100
 }
 
+export interface DomainItem {
+  domain: string | null;
+  count: number;
+  pct: number; // 0–100
+  is_free: boolean;
+}
+
+export interface DomainDistribution {
+  total: number; // contacts with a parseable email (the % denominator)
+  unique_domains: number;
+  free_domain_contacts: number;
+  free_domain_unique: number;
+  top: DomainItem[];
+}
+
 export interface ListDistributionResponse {
   scope: "assignment" | "webinar";
   assignment_id: string | null;
@@ -1540,6 +1555,7 @@ export interface ListDistributionResponse {
   label: string | null;
   total: number;
   items: ListDistributionItem[];
+  domains: DomainDistribution;
 }
 
 /** Distribution of source list names (contacts.lead_list_name) for either a

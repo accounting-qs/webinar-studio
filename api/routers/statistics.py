@@ -385,10 +385,38 @@ async def list_contacts_for_metric(
         }
 
 
+# Free / personal email providers — contacts on these domains are not tied to a
+# company, so we flag them separately in the domain distribution.
+FREE_EMAIL_DOMAINS: frozenset[str] = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com",
+    "rocketmail.com", "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com",
+    "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "gmx.com", "gmx.net",
+    "gmx.de", "proton.me", "protonmail.com", "pm.me", "mail.com", "zoho.com",
+    "yandex.com", "yandex.ru", "fastmail.com", "hey.com", "tutanota.com",
+    "web.de", "qq.com", "163.com", "126.com", "naver.com", "hanmail.net",
+    "comcast.net", "verizon.net", "sbcglobal.net", "att.net", "btinternet.com",
+})
+
+
 class ListDistributionItem(BaseModel):
     list_name: str | None = None  # contacts.lead_list_name (None = no list name on the contact)
     count: int
     pct: float  # share of the scope's total contacts, 0–100
+
+
+class DomainItem(BaseModel):
+    domain: str | None = None  # email domain, lowercased (None = no parseable email)
+    count: int
+    pct: float  # share of contacts with a parseable email, 0–100
+    is_free: bool = False  # True when the domain is a known free / personal provider
+
+
+class DomainDistribution(BaseModel):
+    total: int  # contacts with a parseable email address (the % denominator)
+    unique_domains: int  # distinct domains across those contacts
+    free_domain_contacts: int  # contacts whose domain is a free / personal provider
+    free_domain_unique: int  # distinct free / personal domains seen
+    top: list[DomainItem]  # top domains by contact count (capped)
 
 
 class ListDistributionResponse(BaseModel):
@@ -399,6 +427,7 @@ class ListDistributionResponse(BaseModel):
     label: str | None = None
     total: int
     items: list[ListDistributionItem]
+    domains: DomainDistribution
 
 
 @router.get("/list-distribution", response_model=ListDistributionResponse)
@@ -407,14 +436,15 @@ async def list_name_distribution(
     webinar_id: str | None = None,
     webinar: int | None = None,
 ):
-    """Distribution of source list names (`contacts.lead_list_name`) for either a
-    single assigned list (`assignment`) or every assigned list on a webinar
-    (`webinar_id` / `webinar`).
+    """Distribution of source list names (`contacts.lead_list_name`) and email
+    domains for either a single assigned list (`assignment`) or every assigned
+    list on a webinar (`webinar_id` / `webinar`).
 
-    Each contact carries the list name it originated from (set at upload time).
-    This groups the contacts in scope by that list name and returns the count +
-    percentage share so the dashboard can show "which lists, and what % of
-    contacts came from each."
+    Each contact carries the list name it originated from (set at upload time)
+    and an email address. This groups the contacts in scope by list name and by
+    email domain, returning counts + percentage shares so the dashboard can show
+    "which lists / domains, and what % of contacts came from each", plus how many
+    sit on free / personal email providers.
     """
     from sqlalchemy import select, text
     from db.models import Webinar as WebinarModel
@@ -423,14 +453,18 @@ async def list_name_distribution(
     if assignment is None and webinar_id is None and webinar is None:
         raise HTTPException(400, "Provide either assignment or webinar_id / webinar")
 
+    DOMAIN_TOP_N = 10
+
+    def _empty_domains() -> dict:
+        return {
+            "total": 0, "unique_domains": 0, "free_domain_contacts": 0,
+            "free_domain_unique": 0, "top": [],
+        }
+
     async with AsyncSessionLocal() as db:
         if assignment is not None:
             scope = "assignment"
-            sql = (
-                "SELECT c.lead_list_name AS list_name, COUNT(*) AS cnt "
-                "FROM contacts c WHERE c.assignment_id = CAST(:aid AS uuid) "
-                "GROUP BY c.lead_list_name ORDER BY cnt DESC, list_name ASC"
-            )
+            from_where = "FROM contacts c WHERE c.assignment_id = CAST(:aid AS uuid)"
             params: dict = {"aid": assignment}
             resp_webinar_id = None
             resp_webinar_number = None
@@ -453,19 +487,23 @@ async def list_name_distribution(
                 return {
                     "scope": scope, "assignment_id": None, "webinar_id": webinar_id,
                     "webinar_number": webinar, "label": None, "total": 0, "items": [],
+                    "domains": _empty_domains(),
                 }
             resp_webinar_id = w.id
             resp_webinar_number = w.number
-            sql = (
-                "SELECT c.lead_list_name AS list_name, COUNT(*) AS cnt "
+            from_where = (
                 "FROM contacts c "
                 "JOIN webinar_list_assignments wla ON c.assignment_id = wla.id "
-                "WHERE wla.webinar_id = CAST(:wid AS uuid) "
-                "GROUP BY c.lead_list_name ORDER BY cnt DESC, list_name ASC"
+                "WHERE wla.webinar_id = CAST(:wid AS uuid)"
             )
             params = {"wid": w.id}
 
-        rows = (await db.execute(text(sql).bindparams(**params))).mappings().all()
+        # ── List-name distribution ──────────────────────────────────────────
+        list_sql = (
+            f"SELECT c.lead_list_name AS list_name, COUNT(*) AS cnt {from_where} "
+            "GROUP BY c.lead_list_name ORDER BY cnt DESC, list_name ASC"
+        )
+        rows = (await db.execute(text(list_sql).bindparams(**params))).mappings().all()
         total = sum(int(r["cnt"]) for r in rows)
         items = [
             {
@@ -475,6 +513,42 @@ async def list_name_distribution(
             }
             for r in rows
         ]
+
+        # ── Email-domain distribution ───────────────────────────────────────
+        # Only contacts with a parseable address (contains '@') count toward the
+        # domain breakdown; the domain is the lowercased part after the '@'.
+        domain_sql = (
+            "SELECT lower(split_part(c.email, '@', 2)) AS domain, COUNT(*) AS cnt "
+            f"{from_where} AND c.email LIKE '%@%' "
+            "GROUP BY domain ORDER BY cnt DESC, domain ASC"
+        )
+        drows = (await db.execute(text(domain_sql).bindparams(**params))).mappings().all()
+        domain_total = sum(int(r["cnt"]) for r in drows)
+        free_contacts = 0
+        free_unique = 0
+        top: list[dict] = []
+        for i, r in enumerate(drows):
+            dom = r["domain"] or None
+            cnt = int(r["cnt"])
+            is_free = bool(dom and dom in FREE_EMAIL_DOMAINS)
+            if is_free:
+                free_contacts += cnt
+                free_unique += 1
+            if i < DOMAIN_TOP_N:
+                top.append({
+                    "domain": dom,
+                    "count": cnt,
+                    "pct": round(100.0 * cnt / domain_total, 1) if domain_total else 0.0,
+                    "is_free": is_free,
+                })
+        domains = {
+            "total": domain_total,
+            "unique_domains": len(drows),
+            "free_domain_contacts": free_contacts,
+            "free_domain_unique": free_unique,
+            "top": top,
+        }
+
         return {
             "scope": scope,
             "assignment_id": assignment,
@@ -483,6 +557,7 @@ async def list_name_distribution(
             "label": None,
             "total": total,
             "items": items,
+            "domains": domains,
         }
 
 
