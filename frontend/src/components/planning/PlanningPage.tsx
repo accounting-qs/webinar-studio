@@ -19,6 +19,7 @@ import {
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
+import { SendersEditModal } from "./SendersEditModal";
 
 /* ─── Copy link helper ────────────────────────────────────────────────── */
 
@@ -586,14 +587,6 @@ export function PlanningPage() {
   const [assignSendPerAcct, setAssignSendPerAcct] = useState(0);
   const [assignDays, setAssignDays] = useState(5);
 
-  // New Sender form state
-  const [showNewSenderForm, setShowNewSenderForm] = useState(false);
-  const [newSenderName, setNewSenderName] = useState("");
-  const [newSenderAccounts, setNewSenderAccounts] = useState(5);
-  const [newSenderSendPerAcct, setNewSenderSendPerAcct] = useState(50);
-  const [newSenderDaysPerWeb, setNewSenderDaysPerWeb] = useState(5);
-  const [creatingSender, setCreatingSender] = useState(false);
-
   const updateSender = async (id: string, field: keyof Sender, value: number) => {
     // Optimistic update
     setSenders((prev) => prev.map((s) => s.id === id ? { ...s, [field]: value } : s));
@@ -611,28 +604,19 @@ export function PlanningPage() {
     }
   };
 
-  const handleAddSender = async () => {
-    if (!newSenderName.trim()) return;
-    setCreatingSender(true);
-    try {
-      const created = await apiCreateSender({
-        name: newSenderName.trim(),
-        total_accounts: newSenderAccounts,
-        send_per_account: newSenderSendPerAcct,
-        days_per_webinar: newSenderDaysPerWeb,
-      });
-      setSenders(prev => [...prev, apiSenderToLocal(created)]);
-      setNewSenderName("");
-      setNewSenderAccounts(5);
-      setNewSenderSendPerAcct(50);
-      setNewSenderDaysPerWeb(5);
-      setShowNewSenderForm(false);
-    } catch (err) {
-      console.error("Failed to create sender:", err);
-      alert(err instanceof Error ? err.message : "Failed to create sender");
-    } finally {
-      setCreatingSender(false);
-    }
+  const renameSender = (id: string, name: string) => {
+    setSenders(prev => prev.map(x => x.id === id ? { ...x, name } : x));
+    apiUpdateSender(id, { name }).catch(err => console.error("Failed to rename sender:", err));
+  };
+
+  const addSender = async (data: { name: string; accounts: number; sendPerAccount: number; daysPerWeek: number }) => {
+    const created = await apiCreateSender({
+      name: data.name,
+      total_accounts: data.accounts,
+      send_per_account: data.sendPerAccount,
+      days_per_webinar: data.daysPerWeek,
+    });
+    setSenders(prev => [...prev, apiSenderToLocal(created)]);
   };
 
   /* ── Stats ─────────────────────────────────────────────────────────── */
@@ -1582,130 +1566,34 @@ export function PlanningPage() {
         </div>
       </div>
 
-      {/* Sender legend — editable */}
+      {/* Sender legend — editable via modal */}
       <div className="px-6 py-2 border-b border-zinc-200 dark:border-zinc-800/20 bg-white dark:bg-zinc-950/50">
         <div className="flex items-center gap-2 mb-0">
           <span className="text-xs text-zinc-500 uppercase tracking-wider font-semibold">Senders:</span>
-          <button onClick={() => setEditingSenders(!editingSenders)} className="text-xs text-zinc-600 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200 transition-colors ml-1">
-            {editingSenders ? "Done" : "Edit"}
+          <button onClick={() => setEditingSenders(true)} className="text-xs text-zinc-600 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200 transition-colors ml-1">
+            Edit
           </button>
         </div>
-        {!editingSenders ? (
-          <div className="flex items-center gap-5 mt-1.5 overflow-x-auto">
-            {senders.map((s) => (
-              <div key={s.id} className="flex items-center gap-2 shrink-0">
-                <SenderBadge name={s.name} color={s.color} />
-                <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono whitespace-nowrap">{s.accounts} accts · {s.sendPerAccount}/acct · {s.daysPerWeek}d/webinar</span>
-                <span className="text-xs text-zinc-700 dark:text-zinc-300 font-mono font-semibold whitespace-nowrap">= {(s.accounts * s.sendPerAccount).toLocaleString()}/d</span>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="flex items-center gap-5 mt-2 overflow-x-auto">
-            {senders.map((s) => (
-              <div key={s.id} className="flex items-center gap-2.5 bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40 rounded-lg px-3 py-2 shrink-0">
-                <input
-                  type="text"
-                  defaultValue={s.name}
-                  onBlur={(e) => {
-                    const newName = e.target.value.trim();
-                    if (newName && newName !== s.name) {
-                      setSenders(prev => prev.map(x => x.id === s.id ? { ...x, name: newName } : x));
-                      apiUpdateSender(s.id, { name: newName }).catch(err => console.error("Failed to rename sender:", err));
-                    }
-                  }}
-                  onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                  className="w-24 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-semibold focus:outline-none focus:ring-1 focus:ring-violet-500"
-                />
-                <div className="flex items-center gap-2">
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Accts</span>
-                    <input type="number" key={`accts-${s.id}-${s.accounts}`} defaultValue={s.accounts}
-                      onBlur={(e) => { const v = parseInt(e.target.value) || 0; if (v !== s.accounts) updateSender(s.id, "accounts", v); }}
-                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                      className="w-14 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                  <span className="text-zinc-500 text-xs">×</span>
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Send/Acct</span>
-                    <input type="number" key={`spa-${s.id}-${s.sendPerAccount}`} defaultValue={s.sendPerAccount}
-                      onBlur={(e) => { const v = parseInt(e.target.value) || 0; if (v !== s.sendPerAccount) updateSender(s.id, "sendPerAccount", v); }}
-                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                      className="w-14 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                  <span className="text-zinc-500 text-xs">×</span>
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Days/Web</span>
-                    <input type="number" key={`dpw-${s.id}-${s.daysPerWeek}`} defaultValue={s.daysPerWeek}
-                      onBlur={(e) => { const v = parseInt(e.target.value) || 0; if (v !== s.daysPerWeek) updateSender(s.id, "daysPerWeek", v); }}
-                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                      className="w-14 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                  <span className="text-zinc-500 text-xs">=</span>
-                  <span className="text-sm text-violet-600 dark:text-violet-400 font-mono font-bold">{(s.accounts * s.sendPerAccount).toLocaleString()}/d</span>
-                </div>
-              </div>
-            ))}
-
-            {/* Add Sender button / form */}
-            {!showNewSenderForm ? (
-              <button
-                onClick={() => setShowNewSenderForm(true)}
-                className="flex items-center gap-1.5 px-3 py-2 border-2 border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg text-xs text-zinc-500 hover:text-violet-400 hover:border-violet-500/40 transition-colors"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-                Add Sender
-              </button>
-            ) : (
-              <div className="flex items-center gap-2.5 bg-violet-50 dark:bg-violet-500/5 border border-violet-200 dark:border-violet-500/20 rounded-lg px-3 py-2">
-                <div className="flex flex-col">
-                  <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Name</span>
-                  <input
-                    type="text"
-                    value={newSenderName}
-                    onChange={(e) => setNewSenderName(e.target.value)}
-                    placeholder="Name..."
-                    autoFocus
-                    className="w-24 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
-                  />
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Accts</span>
-                    <input type="number" value={newSenderAccounts} onChange={(e) => setNewSenderAccounts(parseInt(e.target.value) || 0)}
-                      className="w-14 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                  <span className="text-zinc-500 text-xs">×</span>
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Send/Acct</span>
-                    <input type="number" value={newSenderSendPerAcct} onChange={(e) => setNewSenderSendPerAcct(parseInt(e.target.value) || 0)}
-                      className="w-14 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                  <span className="text-zinc-500 text-xs">×</span>
-                  <div className="flex flex-col items-center">
-                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Days/Web</span>
-                    <input type="number" value={newSenderDaysPerWeb} onChange={(e) => setNewSenderDaysPerWeb(parseInt(e.target.value) || 0)}
-                      className="w-14 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 font-mono text-center focus:outline-none focus:ring-1 focus:ring-violet-500" />
-                  </div>
-                </div>
-                <button
-                  onClick={handleAddSender}
-                  disabled={!newSenderName.trim() || creatingSender}
-                  className="px-3 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-semibold rounded-md transition-colors"
-                >
-                  {creatingSender ? "Adding..." : "Add"}
-                </button>
-                <button
-                  onClick={() => setShowNewSenderForm(false)}
-                  className="text-xs text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200 transition-colors"
-                >
-                  Cancel
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+        <div className="flex items-center gap-5 mt-1.5 overflow-x-auto">
+          {senders.map((s) => (
+            <div key={s.id} className="flex items-center gap-2 shrink-0">
+              <SenderBadge name={s.name} color={s.color} />
+              <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono whitespace-nowrap">{s.accounts} accts · {s.sendPerAccount}/acct · {s.daysPerWeek}d/webinar</span>
+              <span className="text-xs text-zinc-700 dark:text-zinc-300 font-mono font-semibold whitespace-nowrap">= {(s.accounts * s.sendPerAccount).toLocaleString()}/d</span>
+            </div>
+          ))}
+        </div>
       </div>
+
+      {editingSenders && (
+        <SendersEditModal
+          senders={senders}
+          onClose={() => setEditingSenders(false)}
+          onRename={renameSender}
+          onUpdateField={updateSender}
+          onAddSender={addSender}
+        />
+      )}
 
       {/* ── Loading state ─────────────────────────────────────────── */}
       {loadingData && (
