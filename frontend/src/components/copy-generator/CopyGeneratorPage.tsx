@@ -56,9 +56,10 @@ function MergeBucketsModal({
 }: {
   candidates: ApiBucket[];
   onClose: () => void;
-  onConfirm: (keeperId: string) => Promise<void>;
+  onConfirm: (keeperId: string, sourceIds: string[]) => Promise<void>;
 }) {
   const [keeperId, setKeeperId] = useState<string>(candidates[0]?.id ?? "");
+  const [removedIds, setRemovedIds] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   const [blockingBuckets, setBlockingBuckets] = useState<MergeBlockingBucket[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -70,9 +71,21 @@ function MergeBucketsModal({
     return () => document.removeEventListener("keydown", handler);
   }, [onClose]);
 
-  const keeper = candidates.find(b => b.id === keeperId);
-  const sources = candidates.filter(b => b.id !== keeperId);
+  const activeCandidates = candidates.filter(b => !removedIds.has(b.id));
+  const keeper = activeCandidates.find(b => b.id === keeperId);
+  const sources = activeCandidates.filter(b => b.id !== keeperId);
   const totalContactsToMove = sources.reduce((s, b) => s + (b.total_contacts || 0), 0);
+
+  // Drop a bucket from the merge. Merging needs ≥2 buckets, so removal is only
+  // allowed while more than two remain. Removing the keeper promotes the next.
+  const removeCandidate = (id: string) => {
+    if (activeCandidates.length <= 2) return;
+    setRemovedIds(prev => new Set(prev).add(id));
+    if (id === keeperId) {
+      const next = candidates.find(b => b.id !== id && !removedIds.has(b.id));
+      setKeeperId(next?.id ?? "");
+    }
+  };
 
   const handleConfirm = async () => {
     if (!keeperId) return;
@@ -80,7 +93,7 @@ function MergeBucketsModal({
     setBlockingBuckets([]);
     setErrorMsg(null);
     try {
-      await onConfirm(keeperId);
+      await onConfirm(keeperId, sources.map(b => b.id));
       onClose();
     } catch (err) {
       if (err instanceof MergeBlockedError) {
@@ -147,10 +160,11 @@ function MergeBucketsModal({
         {/* Candidate list */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500 mb-2">
-            Pick keeper ({candidates.length} buckets selected)
+            Pick keeper ({activeCandidates.length} buckets selected)
           </p>
-          {candidates.map(b => {
+          {activeCandidates.map(b => {
             const isKeeper = b.id === keeperId;
+            const canRemove = activeCandidates.length > 2;
             return (
               <label
                 key={b.id}
@@ -184,6 +198,15 @@ function MergeBucketsModal({
                     <span className="font-mono">{b.copies_count.titles}T / {b.copies_count.descriptions}D variants</span>
                   </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); removeCandidate(b.id); }}
+                  disabled={!canRemove || submitting}
+                  title={canRemove ? "Remove this bucket from the merge" : "Keep at least 2 buckets to merge"}
+                  className="shrink-0 p-1 rounded-lg text-zinc-400 hover:text-red-500 hover:bg-red-500/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-zinc-400"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
               </label>
             );
           })}
@@ -718,8 +741,7 @@ export function CopyGeneratorPage() {
 
   /* ── Merge buckets ──────────────────────────────────────────────────── */
 
-  const doMergeBuckets = async (keeperId: string) => {
-    const sourceIds = Array.from(selectedIds).filter(id => id !== keeperId);
+  const doMergeBuckets = async (keeperId: string, sourceIds: string[]) => {
     await apiMergeBuckets({
       keeper_bucket_id: keeperId,
       source_bucket_ids: sourceIds,
