@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import { BrainPanel } from "./BrainPanel";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
+import { BucketContactsModal, type BucketContactsTarget } from "./BucketContactsModal";
 
 /* ─── Types ────────────────────────────────────────────────────────────── */
 
@@ -426,6 +427,7 @@ export function CopyGeneratorPage() {
   const [activeAction, setActiveAction] = useState<"title" | "description" | "both" | null>(null);
   const [modalState, setModalState] = useState<{ bucketId: string; tab: "title" | "description" } | null>(null);
   const [mergeModalOpen, setMergeModalOpen] = useState(false);
+  const [contactsView, setContactsView] = useState<BucketContactsTarget | null>(null);
   const [editingCell, setEditingCell] = useState<{ bucketId: string; type: "title" | "description" } | null>(null);
   const [editCellText, setEditCellText] = useState("");
   const editRef = useRef<HTMLTextAreaElement>(null);
@@ -1330,8 +1332,28 @@ export function CopyGeneratorPage() {
                       )}
                     </td>
                     <td className="px-3 py-3 text-zinc-500 dark:text-zinc-400 text-xs">{bucket.industry}</td>
-                    <td className="px-3 py-3 text-right font-mono text-zinc-700 dark:text-zinc-300 text-xs">{bucket.total_contacts.toLocaleString()}</td>
-                    <td className="px-3 py-3 text-right font-mono text-violet-600 dark:text-violet-400 text-xs">{bucket.remaining_contacts.toLocaleString()}</td>
+                    <td className="px-3 py-3 text-right font-mono text-zinc-700 dark:text-zinc-300 text-xs">
+                      {bucket.total_contacts > 0 ? (
+                        <button
+                          onClick={() => setContactsView({ bucketId: bucket.id, bucketName: bucket.name, scope: "total" })}
+                          title="View all contacts in this bucket"
+                          className="hover:text-violet-500 dark:hover:text-violet-400 underline underline-offset-2 decoration-zinc-300/50 dark:decoration-zinc-600/50 hover:decoration-violet-400/60 transition-colors"
+                        >
+                          {bucket.total_contacts.toLocaleString()}
+                        </button>
+                      ) : bucket.total_contacts.toLocaleString()}
+                    </td>
+                    <td className="px-3 py-3 text-right font-mono text-violet-600 dark:text-violet-400 text-xs">
+                      {bucket.remaining_contacts > 0 ? (
+                        <button
+                          onClick={() => setContactsView({ bucketId: bucket.id, bucketName: bucket.name, scope: "remaining" })}
+                          title="View remaining (available) contacts in this bucket"
+                          className="hover:text-violet-500 dark:hover:text-violet-300 underline underline-offset-2 decoration-violet-400/40 hover:decoration-violet-400/70 transition-colors"
+                        >
+                          {bucket.remaining_contacts.toLocaleString()}
+                        </button>
+                      ) : bucket.remaining_contacts.toLocaleString()}
+                    </td>
                     <td className="px-3 py-3 text-center">
                       <div className="flex gap-1 justify-center">{(bucket.countries || []).map(c => <CountryBadge key={c} code={c} />)}</div>
                     </td>
@@ -1573,6 +1595,11 @@ export function CopyGeneratorPage() {
           onClose={() => setMergeModalOpen(false)}
           onConfirm={doMergeBuckets}
         />
+      )}
+
+      {/* ── Bucket contacts (Total / Remaining drill-down) ─────────────── */}
+      {contactsView && (
+        <BucketContactsModal target={contactsView} onClose={() => setContactsView(null)} />
       )}
     </main>
   );

@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func as sa_func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -851,3 +854,115 @@ async def merge_buckets(
         "keeper_total_contacts": keeper.total_contacts,
         "keeper_remaining_contacts": keeper.remaining_contacts,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUCKET CONTACTS (view + export by bucket)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Buckets can hold tens of thousands of contacts; paginate the UI fetch. The CSV
+# export below streams with no page limit.
+_BUCKET_CONTACTS_DEFAULT_LIMIT = 1000
+_BUCKET_CONTACTS_MAX_LIMIT = 5000
+
+
+def _bucket_contacts_conditions(bucket_id: str, scope: str):
+    """WHERE clauses matching the bucket's displayed counts (see merge recount):
+    `total` = every contact in the bucket; `remaining` = the available ones."""
+    conds = [Contact.bucket_id == bucket_id, Contact.user_id == LLOYD_USER_ID]
+    if scope == "remaining":
+        conds.append(Contact.outreach_status == "available")
+    return conds
+
+
+async def _load_bucket_or_404(db: AsyncSession, bucket_id: str) -> OutreachBucket:
+    bucket = (await db.execute(
+        select(OutreachBucket).where(
+            OutreachBucket.id == bucket_id,
+            OutreachBucket.user_id == LLOYD_USER_ID,
+            OutreachBucket.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if not bucket:
+        raise HTTPException(404, "Bucket not found")
+    return bucket
+
+
+@router.get("/buckets/{bucket_id}/contacts")
+async def get_bucket_contacts(
+    bucket_id: str,
+    scope: str = Query("total", regex="^(total|remaining)$"),
+    limit: int = Query(_BUCKET_CONTACTS_DEFAULT_LIMIT, ge=1, le=_BUCKET_CONTACTS_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    conds = _bucket_contacts_conditions(bucket_id, scope)
+
+    total = (await db.execute(select(sa_func.count()).where(*conds))).scalar_one()
+
+    rows = (await db.execute(
+        select(Contact.id, Contact.first_name, Contact.last_name, Contact.email)
+        .where(*conds)
+        .order_by(Contact.first_name, Contact.email)
+        .limit(limit)
+        .offset(offset)
+    )).all()
+
+    return {
+        "bucket": {"id": bucket.id, "name": bucket.name, "scope": scope},
+        "contacts": [
+            {"id": r.id, "first_name": r.first_name, "last_name": r.last_name, "email": r.email}
+            for r in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "returned": len(rows),
+            "filtered_total": int(total or 0),
+        },
+    }
+
+
+@router.get("/buckets/{bucket_id}/contacts.csv")
+async def stream_bucket_contacts_csv(
+    bucket_id: str,
+    scope: str = Query("total", regex="^(total|remaining)$"),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    conds = _bucket_contacts_conditions(bucket_id, scope)
+
+    async def row_iter():
+        header_buf = io.StringIO()
+        csv.writer(header_buf).writerow(["first_name", "last_name", "email"])
+        yield header_buf.getvalue()
+
+        q = (
+            select(Contact.first_name, Contact.last_name, Contact.email)
+            .where(*conds)
+            .order_by(Contact.first_name, Contact.email)
+            .execution_options(yield_per=2000)
+        )
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        stream = await db.stream(q)
+        async for first_name, last_name, email in stream:
+            writer.writerow([first_name or "", last_name or "", email or ""])
+            # Flush in ~64KB chunks so bytes leave the server steadily.
+            if buf.tell() > 64 * 1024:
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+        if buf.tell() > 0:
+            yield buf.getvalue()
+
+    safe = "".join(ch for ch in (bucket.name or "bucket") if ch.isalnum() or ch in (" ", "-", "_")).strip().replace(" ", "_") or "bucket"
+    filename = f"{safe}_{scope}.csv"
+    return StreamingResponse(
+        row_iter(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

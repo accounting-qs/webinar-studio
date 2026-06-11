@@ -1249,6 +1249,57 @@ export async function downloadAssignmentGroupContactsCsv(
   return { blob, filename };
 }
 
+/* ── Bucket contacts (Copy Generator view + export) ─────────────────────── */
+
+export type BucketContactsScope = "total" | "remaining";
+
+export interface BucketContact {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+}
+
+export interface BucketContactsResponse {
+  bucket: { id: string; name: string; scope: BucketContactsScope };
+  contacts: BucketContact[];
+  pagination: { limit: number; offset: number; returned: number; filtered_total: number };
+}
+
+/** Paginated contact list for a bucket. `scope="total"` returns every contact in
+ * the bucket; `scope="remaining"` returns only the available (unassigned) ones —
+ * matching the Total / Remaining numbers shown on the Copy Generator. */
+export async function fetchBucketContacts(
+  bucketId: string,
+  scope: BucketContactsScope,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<BucketContactsResponse> {
+  const qs = new URLSearchParams({ scope });
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  if (opts.offset != null) qs.set("offset", String(opts.offset));
+  const res = await fetch(`${API_URL}/outreach/buckets/${bucketId}/contacts?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch bucket contacts");
+  return res.json();
+}
+
+/** Streamed full CSV export of a bucket's contacts (no page limit). */
+export async function downloadBucketContactsCsv(
+  bucketId: string,
+  scope: BucketContactsScope,
+): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`${API_URL}/outreach/buckets/${bucketId}/contacts.csv?scope=${scope}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to export CSV");
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match ? match[1] : `bucket_contacts_${scope}.csv`;
+  return { blob, filename };
+}
+
 export async function markGroupContactsUsed(
   contactIds: string[]
 ): Promise<{ marked: number; by_assignment: Record<string, number> }> {
