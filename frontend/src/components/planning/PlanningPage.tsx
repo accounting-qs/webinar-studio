@@ -1740,6 +1740,23 @@ export function PlanningPage() {
                                 Assign
                               </button>
                             )}
+                            {w.lists.length > 0 && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setListDist({
+                                    scope: "webinar",
+                                    webinarId: w.id,
+                                    webinarNumber: w.number,
+                                    label: `Webinar ${w.number}`,
+                                  });
+                                }}
+                                title="Show list-name + domain distribution across all assigned lists for this webinar"
+                                className="ml-1 px-2 py-0.5 text-[9px] font-semibold rounded bg-violet-500/15 text-violet-500 hover:bg-violet-500/25 border border-violet-500/30 transition-colors"
+                              >
+                                Dist.
+                              </button>
+                            )}
                           </div>
                         )}
                       </div>
