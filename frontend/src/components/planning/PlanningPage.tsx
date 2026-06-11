@@ -334,6 +334,16 @@ function getDefaultListName(lists: PlannedList[], list: PlannedList): string {
 interface DropdownOption {
   value: string;
   label: string;
+  /** Optional small tag rendered next to the label (e.g. "Copy ✓"). */
+  badge?: string;
+}
+
+function OptionBadge({ text }: { text: string }) {
+  return (
+    <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+      {text}
+    </span>
+  );
 }
 
 function Dropdown({
@@ -342,25 +352,40 @@ function Dropdown({
   onChange,
   placeholder = "Select...",
   className = "",
+  searchable = false,
 }: {
   options: DropdownOption[];
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   className?: string;
+  searchable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setQuery(""); }
     }
     if (open) document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [open]);
 
+  // Focus the search box as soon as the menu opens.
+  useEffect(() => {
+    if (open && searchable) inputRef.current?.focus();
+  }, [open, searchable]);
+
   const selected = options.find((o) => o.value === value);
+  const q = query.trim().toLowerCase();
+  const filtered = searchable && q
+    ? options.filter((o) => o.label.toLowerCase().includes(q))
+    : options;
+
+  const choose = (val: string) => { onChange(val); setOpen(false); setQuery(""); };
 
   return (
     <div ref={ref} className={`relative ${className}`}>
@@ -369,8 +394,11 @@ function Dropdown({
         onClick={() => setOpen(!open)}
         className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-left flex items-center justify-between gap-2 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
       >
-        <span className={selected ? "text-zinc-800 dark:text-zinc-200 truncate" : "text-zinc-500 truncate"}>
-          {selected ? selected.label : placeholder}
+        <span className="flex items-center gap-1.5 min-w-0">
+          <span className={selected ? "text-zinc-800 dark:text-zinc-200 truncate" : "text-zinc-500 truncate"}>
+            {selected ? selected.label : placeholder}
+          </span>
+          {selected?.badge && <OptionBadge text={selected.badge} />}
         </span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
           className={`text-zinc-500 shrink-0 transition-transform duration-150 ${open ? "rotate-180" : ""}`}>
@@ -379,21 +407,40 @@ function Dropdown({
       </button>
 
       {open && (
-        <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg shadow-xl shadow-black/10 dark:shadow-black/40 max-h-[240px] overflow-y-auto py-1">
-          {options.map((o) => (
-            <button
-              key={o.value}
-              type="button"
-              onClick={() => { onChange(o.value); setOpen(false); }}
-              className={`w-full text-left px-3 py-1.5 text-sm transition-colors ${
-                o.value === value
-                  ? "bg-violet-500/10 text-violet-600 dark:text-violet-400 font-medium"
-                  : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60"
-              }`}
-            >
-              {o.label}
-            </button>
-          ))}
+        <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg shadow-xl shadow-black/10 dark:shadow-black/40 flex flex-col max-h-[280px]">
+          {searchable && (
+            <div className="p-1.5 border-b border-zinc-200 dark:border-zinc-800/60 shrink-0">
+              <input
+                ref={inputRef}
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search…"
+                className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+            </div>
+          )}
+          <div className="overflow-y-auto py-1">
+            {filtered.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-zinc-500">No matches</div>
+            ) : (
+              filtered.map((o) => (
+                <button
+                  key={o.value}
+                  type="button"
+                  onClick={() => choose(o.value)}
+                  className={`w-full text-left px-3 py-1.5 text-sm transition-colors flex items-center justify-between gap-2 ${
+                    o.value === value
+                      ? "bg-violet-500/10 text-violet-600 dark:text-violet-400 font-medium"
+                      : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60"
+                  }`}
+                >
+                  <span className="truncate">{o.label}</span>
+                  {o.badge && <OptionBadge text={o.badge} />}
+                </button>
+              ))
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1881,6 +1928,7 @@ export function PlanningPage() {
                             <div className="flex-1 min-w-[200px]">
                               <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Bucket</label>
                               <Dropdown
+                                searchable
                                 placeholder="Select bucket..."
                                 value={assignBucket}
                                 onChange={(val) => {
@@ -1908,6 +1956,7 @@ export function PlanningPage() {
                                 options={buckets.filter((b) => b.remaining_contacts > 0).map((b) => ({
                                   value: b.id,
                                   label: `${b.name} (${b.remaining_contacts.toLocaleString()} remaining)`,
+                                  badge: b.copies_count.titles > 0 && b.copies_count.descriptions > 0 ? "Copy ✓" : undefined,
                                 }))}
                               />
                             </div>
