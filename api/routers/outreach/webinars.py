@@ -105,6 +105,7 @@ async def create_webinar(
         number=body.number,
         variant_label=variant_label,
         webinargeek_credential_id=body.webinargeek_credential_id,
+        broadcast_id=body.broadcast_id,
         date=body.date,
         status="planning",
         registration_link=latest.registration_link if latest else None,

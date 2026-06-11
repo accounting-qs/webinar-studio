@@ -179,7 +179,7 @@ export function WebinarEditModal({
               )}
               {broadcasts.map((b) => (
                 <option key={b.broadcast_id} value={b.broadcast_id}>
-                  {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""}
+                  {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""} · {b.broadcast_id}
                 </option>
               ))}
             </select>

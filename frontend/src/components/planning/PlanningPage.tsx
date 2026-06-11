@@ -12,9 +12,9 @@ import {
   fetchCustomLists, fetchCustomListCopies, createCustomListCopy as apiCreateCustomListCopy,
   startWebinarListExport, fetchActiveWebinarListExports, fetchLatestWebinarListExport,
   downloadWebinarListExport,
-  fetchWgCredentials,
+  fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
-  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential,
+  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
 } from "@/lib/api";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
@@ -562,6 +562,12 @@ export function PlanningPage() {
   /** WG credentials list for the dropdown — fetched lazily when the new
    * webinar / edit modals open. */
   const [wgCredentials, setWgCredentials] = useState<ApiWgCredential[]>([]);
+  /** Selected WebinarGeek broadcast id for the new webinar. Empty → none. */
+  const [newWebinarBroadcastId, setNewWebinarBroadcastId] = useState("");
+  /** Broadcasts for the new-webinar dropdown, scoped to the selected
+   * WebinarGeek account (mirrors the Edit modal's account filtering). */
+  const [newWebinarBroadcasts, setNewWebinarBroadcasts] = useState<WgWebinar[]>([]);
+  const [newWebinarBcLoading, setNewWebinarBcLoading] = useState(false);
 
   // Edit Webinar modal state (shared WebinarEditModal manages its own internals)
   const [editWebinar, setEditWebinar] = useState<EditableWebinar | null>(null);
@@ -1436,17 +1442,42 @@ export function PlanningPage() {
     setSelectedIds(new Set());
   };
 
+  /** Load broadcasts for the new-webinar dropdown, scoped to the selected
+   * WebinarGeek account (or the default credential when none is picked).
+   * Mirrors the Edit modal so each modal only shows its account's broadcasts. */
+  const loadNewWebinarBroadcasts = async (credId: string | undefined, refresh: boolean) => {
+    setNewWebinarBcLoading(true);
+    try {
+      if (refresh) {
+        try { await refreshWgWebinars(); } catch (e) { console.error("WG refresh failed", e); }
+      }
+      const { broadcasts } = await fetchWgWebinars({ credential_id: credId, limit: 500 });
+      setNewWebinarBroadcasts(broadcasts);
+    } catch (e) {
+      console.error("Failed to load broadcasts", e);
+      setNewWebinarBroadcasts([]);
+    } finally {
+      setNewWebinarBcLoading(false);
+    }
+  };
+
   const openNewWebinarModal = () => {
     const { nextNumber, nextDate } = getNextWebinarDefaults();
     setNewWebinarNumber(nextNumber);
     setNewWebinarDate(nextDate);
     setNewWebinarVariantLabel("");
     setNewWebinarWgCredentialId("");
+    setNewWebinarBroadcastId("");
+    setNewWebinarBroadcasts([]);
     setShowNewWebinarModal(true);
-    // Lazy-fetch WG credentials so the dropdown is populated by the time
-    // the user reaches the WebinarGeek field.
+    // Lazy-fetch WG credentials, then load the default account's broadcasts so
+    // both dropdowns are populated by the time the user reaches them.
     fetchWgCredentials()
-      .then((res) => setWgCredentials(res.credentials))
+      .then((res) => {
+        setWgCredentials(res.credentials);
+        const defaultCredId = res.credentials.find((c) => c.name === "default")?.id;
+        loadNewWebinarBroadcasts(defaultCredId, true);
+      })
       .catch((err) => console.error("Failed to load WG credentials:", err));
   };
 
@@ -1474,6 +1505,7 @@ export function PlanningPage() {
         date: newWebinarDate,
         variant_label: trimmedLabel || null,
         webinargeek_credential_id: newWebinarWgCredentialId || null,
+        broadcast_id: newWebinarBroadcastId || null,
       });
       const d = new Date(newWebinarDate + "T00:00:00");
       const dateStr = d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
@@ -1483,7 +1515,7 @@ export function PlanningPage() {
         date: dateStr,
         isoDate: newWebinarDate,
         status: "Planning",
-        broadcastId: "—",
+        broadcastId: created.broadcast_id || "—",
         mainTitle: "",
         registrationLink: created.registration_link || "",
         unsubscribeLink: created.unsubscribe_link || "",
@@ -2899,7 +2931,15 @@ export function PlanningPage() {
                 <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">WebinarGeek Account</label>
                 <select
                   value={newWebinarWgCredentialId}
-                  onChange={(e) => setNewWebinarWgCredentialId(e.target.value)}
+                  onChange={(e) => {
+                    const credId = e.target.value;
+                    setNewWebinarWgCredentialId(credId);
+                    setNewWebinarBroadcastId("");
+                    loadNewWebinarBroadcasts(
+                      credId || wgCredentials.find((c) => c.name === "default")?.id,
+                      false,
+                    );
+                  }}
                   className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors"
                 >
                   <option value="">Default credential</option>
@@ -2912,6 +2952,33 @@ export function PlanningPage() {
                 <div className="mt-1.5 text-[10px] text-zinc-500">
                   Pick a different account when this variant runs on a separate WebinarGeek workspace.
                   Manage accounts in the Connectors page.
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5 flex items-center gap-2">
+                  WebinarGeek Broadcast
+                  {newWebinarBcLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
+                </label>
+                <select
+                  value={newWebinarBroadcastId}
+                  disabled={newWebinarBcLoading}
+                  onChange={(e) => {
+                    const bid = e.target.value;
+                    const b = newWebinarBroadcasts.find((x) => x.broadcast_id === bid);
+                    setNewWebinarBroadcastId(bid);
+                    if (b?.starts_at) setNewWebinarDate(new Date(b.starts_at).toISOString().slice(0, 10));
+                  }}
+                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors disabled:opacity-60"
+                >
+                  <option value="">— None —</option>
+                  {newWebinarBroadcasts.map((b) => (
+                    <option key={b.broadcast_id} value={b.broadcast_id}>
+                      {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""} · {b.broadcast_id}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1.5 text-[10px] text-zinc-500">
+                  Only broadcasts from the selected account are shown. Picking one fills the date above (still editable).
                 </div>
               </div>
               {/* Preview */}

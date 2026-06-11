@@ -576,6 +576,7 @@ export async function createWebinar(data: {
   date: string;
   variant_label?: string | null;
   webinargeek_credential_id?: string | null;
+  broadcast_id?: string | null;
 }): Promise<ApiWebinar> {
   const res = await fetch(`${API_URL}/outreach/webinars`, {
     method: "POST",

@@ -87,6 +87,9 @@ class WebinarCreate(BaseModel):
     # Per-variant WebinarGeek credential. NULL → fall back to the row in
     # connector_credentials with name='default'.
     webinargeek_credential_id: str | None = None
+    # Optional WebinarGeek broadcast to link at creation time. NULL → none
+    # selected yet (operator can pick one later in the Edit modal).
+    broadcast_id: str | None = None
 
 class WebinarUpdate(BaseModel):
     number: int | None = None
