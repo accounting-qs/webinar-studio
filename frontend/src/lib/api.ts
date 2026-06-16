@@ -9,6 +9,40 @@ function jsonHeaders(): Record<string, string> {
   return { ...authHeaders(), "Content-Type": "application/json" };
 }
 
+/* ── SOP Videos ────────────────────────────────────────────────────────── */
+
+export interface ApiSopVideo {
+  id: string;
+  title: string;
+  subtitle: string;
+  loom_url: string;
+  display_order: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export async function fetchSopVideos(): Promise<ApiSopVideo[]> {
+  const res = await fetch(`${API_URL}/sop-videos`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch SOP videos");
+  return res.json();
+}
+
+export async function updateSopVideo(
+  videoId: string,
+  data: Partial<{ title: string; subtitle: string; loom_url: string }>,
+): Promise<ApiSopVideo> {
+  const res = await fetch(`${API_URL}/sop-videos/${videoId}`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to update SOP video");
+  }
+  return res.json();
+}
+
 /* ── Calendar Blocker ──────────────────────────────────────────────────── */
 
 export interface CalendarVariant {
