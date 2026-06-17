@@ -162,7 +162,7 @@ function UploadsTable({
     try { await cancelCalendarImport(id); onChanged(); } finally { setBusyId(null); }
   };
   const handleDelete = async (id: string) => {
-    if (!confirm("Delete this upload and all its calendar invite rows?")) return;
+    if (!confirm("Delete this upload and any imported rows? This cannot be undone.")) return;
     setBusyId(id);
     try { await deleteCalendarUpload(id); onChanged(); } finally { setBusyId(null); }
   };
@@ -259,15 +259,16 @@ function UploadsTable({
                         Cancel
                       </button>
                     )}
-                    {TERMINAL_STATUSES.has(u.status) && (
-                      <button
-                        onClick={() => handleDelete(u.id)}
-                        disabled={busyId === u.id}
-                        className="px-2 py-0.5 text-[10px] rounded bg-red-600/80 hover:bg-red-600 text-white disabled:opacity-50"
-                      >
-                        Delete
-                      </button>
-                    )}
+                    {/* Always available so a stuck pending/uploading (or a dead
+                        processing/paused) row can be removed. The backend cancels
+                        any running import, cleans Storage, then deletes the row. */}
+                    <button
+                      onClick={() => handleDelete(u.id)}
+                      disabled={busyId === u.id}
+                      className="px-2 py-0.5 text-[10px] rounded bg-red-600/80 hover:bg-red-600 text-white disabled:opacity-50"
+                    >
+                      Delete
+                    </button>
                   </div>
                 </td>
               </tr>
