@@ -2155,9 +2155,11 @@ export interface CalendarConfirmResponse {
   id: string;
   file_name: string;
   webinar_id: string;
+  kind: string; // 'calendar' | 'nonjoiner'
   total_rows: number;
   has_responses: boolean;
   headers: string[];
+  auto_mapping: Record<string, string>; // target_field -> detected CSV header
   preview_rows: string[][];
 }
 
@@ -2202,10 +2204,14 @@ export async function confirmCalendarUpload(
   return res.json();
 }
 
-export async function startCalendarImport(uploadId: string): Promise<{ id: string; status: string }> {
+export async function startCalendarImport(
+  uploadId: string,
+  columnMap?: Record<string, string>,
+): Promise<{ id: string; status: string }> {
   const res = await fetch(`${API_URL}/calendar-uploads/${uploadId}/import`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: jsonHeaders(),
+    body: JSON.stringify({ column_map: columnMap ?? null }),
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start calendar import"));
   return res.json();

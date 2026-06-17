@@ -283,6 +283,20 @@ function UploadsTable({
 
 type ModalStep = "pick" | "uploading" | "confirmed" | "starting";
 
+type MapField = { key: string; label: string; required: boolean };
+const CALENDAR_FIELDS: MapField[] = [
+  { key: "email", label: "Email", required: true },
+  { key: "calendar_invited_date", label: "Calendar invited date", required: false },
+  { key: "calendar_account", label: "Calendar account", required: false },
+  { key: "calendar_account_prefix", label: "Calendar account prefix", required: false },
+  { key: "calendar_webinar_series", label: "Calendar webinar series", required: false },
+  { key: "calendar_invite_response", label: "Calendar invite response (Yes/Maybe)", required: false },
+];
+const NONJOINER_FIELDS: MapField[] = [
+  { key: "email", label: "Email", required: true },
+  { key: "calendar_invite_response", label: "Response (Yes/Maybe)", required: true },
+];
+
 function UploadModal({
   webinars,
   senders,
@@ -297,6 +311,7 @@ function UploadModal({
   const [webinarId, setWebinarId] = useState<string>("");
   const [senderId, setSenderId] = useState<string>("");
   const [isNonjoiner, setIsNonjoiner] = useState(false);
+  const [colMap, setColMap] = useState<Record<string, string>>({});
   const [file, setFile] = useState<File | null>(null);
   const [step, setStep] = useState<ModalStep>("pick");
   const [progress, setProgress] = useState(0);
@@ -311,6 +326,8 @@ function UploadModal({
     () => [...senders].sort((a, b) => a.display_order - b.display_order || a.name.localeCompare(b.name)),
     [senders],
   );
+  const mapFields = confirmed?.kind === "nonjoiner" ? NONJOINER_FIELDS : CALENDAR_FIELDS;
+  const requiredUnmapped = !!confirmed && mapFields.some((f) => f.required && !colMap[f.key]);
 
   const handleUpload = async () => {
     if (!file || !webinarId) return;
@@ -328,6 +345,7 @@ function UploadModal({
       await uploadToStorage(signed_url, file, setProgress);
       const conf = await confirmCalendarUpload(upload_id, file.size);
       setConfirmed(conf);
+      setColMap({ ...(conf.auto_mapping ?? {}) });
       setStep("confirmed");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -340,7 +358,7 @@ function UploadModal({
     setError(null);
     setStep("starting");
     try {
-      await startCalendarImport(confirmed.id);
+      await startCalendarImport(confirmed.id, colMap);
       onCreated();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -469,36 +487,41 @@ function UploadModal({
                 <Stat label="Rows" value={confirmed.total_rows.toLocaleString()} />
                 <Stat
                   label="Response col"
-                  value={confirmed.has_responses ? "Present ✓" : "Absent"}
-                  tone={confirmed.has_responses ? "good" : "muted"}
+                  value={colMap["calendar_invite_response"] ? "Mapped ✓" : "Not mapped"}
+                  tone={colMap["calendar_invite_response"] ? "good" : "muted"}
                 />
                 <Stat label="Headers" value={confirmed.headers.length.toString()} />
               </div>
 
               <div>
-                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-1">Detected headers</div>
-                <div className="flex flex-wrap gap-1">
-                  {confirmed.headers.map((h, i) => {
-                    const hl = h.toLowerCase();
-                    const recognised = [
-                      "email", "calendar_invited_date", "calendar_account",
-                      "calendar account prefix", "calendar_account_prefix",
-                      "calendar_webinar_series", "calendar_invite_response",
-                    ].includes(hl);
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-1.5">Column mapping</div>
+                <div className="space-y-1.5">
+                  {mapFields.map((f) => {
+                    const missing = f.required && !colMap[f.key];
                     return (
-                      <span
-                        key={i}
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
-                          recognised
-                            ? "bg-violet-500/10 text-violet-400 border-violet-500/30"
-                            : "bg-zinc-500/10 text-zinc-500 border-zinc-500/20"
-                        }`}
-                        title={recognised ? "Will be imported" : "Ignored"}
-                      >
-                        {h}
-                      </span>
+                      <div key={f.key} className="flex items-center gap-2">
+                        <label className="w-44 shrink-0 text-xs text-zinc-700 dark:text-zinc-300">
+                          {f.label}
+                          {f.required && <span className="text-red-400"> *</span>}
+                        </label>
+                        <select
+                          value={colMap[f.key] ?? ""}
+                          onChange={(e) => setColMap((m) => ({ ...m, [f.key]: e.target.value }))}
+                          className={`flex-1 bg-zinc-50 dark:bg-zinc-950 border rounded-lg px-2 py-1.5 text-xs text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 ${
+                            missing ? "border-red-500/60" : "border-zinc-300 dark:border-zinc-700"
+                          }`}
+                        >
+                          <option value="">— Not mapped —</option>
+                          {confirmed.headers.map((h, i) => (
+                            <option key={i} value={h}>{h}</option>
+                          ))}
+                        </select>
+                      </div>
                     );
                   })}
+                </div>
+                <div className="mt-1.5 text-[11px] text-zinc-500">
+                  Auto-filled from the header names. Adjust any row whose column did not match.
                 </div>
               </div>
 
@@ -551,7 +574,9 @@ function UploadModal({
           {step === "confirmed" && (
             <button
               onClick={handleStart}
-              className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-semibold"
+              disabled={requiredUnmapped}
+              title={requiredUnmapped ? "Map the required columns first" : undefined}
+              className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Start Import
             </button>

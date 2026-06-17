@@ -11,7 +11,7 @@ CalendarAccountSender — maps (webinar_id, calendar_account) → outreach
 
 from db.models._common import (
     Base, Boolean, CheckConstraint, DateTime, ForeignKey, Index,
-    Integer, Mapped, Optional, String, Text, UUID, UniqueConstraint,
+    Integer, JSONB, Mapped, Optional, String, Text, UUID, UniqueConstraint,
     datetime, func, gen_uuid, mapped_column,
 )
 
@@ -31,6 +31,10 @@ class WebinarCalendarUpload(Base):
     file_name: Mapped[str] = mapped_column(Text, nullable=False)
     storage_path: Mapped[Optional[str]] = mapped_column(Text)
     has_responses: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Optional user-edited CSV column mapping: {target_field: csv_header_name}.
+    # When set, the import uses it instead of header auto-detection so a
+    # mis-named header can be mapped by hand in the modal.
+    column_map: Mapped[Optional[dict]] = mapped_column(JSONB)
     # 'calendar' (normal Added-to-Calendar CSV → webinar_calendar_invites) or
     # 'nonjoiner' (Yes/Maybe responses for the auto-derived Nonjoiners cohort →
     # webinar_nonjoiner_invites). Routes parsing + destination table.

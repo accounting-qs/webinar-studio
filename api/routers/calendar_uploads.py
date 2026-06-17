@@ -25,7 +25,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import select, func as sa_func, update, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -756,16 +756,13 @@ async def confirm_calendar_upload(
         raise HTTPException(400, "CSV file appears empty")
 
     headers = _parse_csv_line(lines[0])
-    normalized = {_normalize_header(h) for h in headers}
-    has_email = "email" in normalized
-    # A response column may be named Calendar_invite_response / Calendar_response / Response.
-    has_responses = bool(normalized & {"calendar_invite_response", "calendar_response", "response"})
-
-    if upload.kind == "nonjoiner":
-        if not has_email:
-            raise HTTPException(400, "Non-joiners CSV needs an 'Email' column")
-        if not has_responses:
-            raise HTTPException(400, "Non-joiners CSV needs a response column (Yes/Maybe)")
+    # Auto-detected mapping (target field -> CSV header). Returned so the modal
+    # can pre-fill the column-mapping dropdowns; the user can override any field
+    # when a header doesn't match. Required-field validation happens at import,
+    # so confirm never hard-fails on a mis-named column.
+    auto_col_map = _build_col_map(headers)  # {idx: target}
+    auto_mapping = {target: headers[idx] for idx, target in auto_col_map.items()}
+    has_responses = "calendar_invite_response" in auto_col_map.values()
 
     # Estimate total rows from file size & average row length (same trick as outreach uploads)
     if len(lines) > 1 and file_size > 0:
@@ -786,9 +783,11 @@ async def confirm_calendar_upload(
         "id": upload.id,
         "file_name": upload.file_name,
         "webinar_id": upload.webinar_id,
+        "kind": upload.kind,
         "total_rows": total_rows,
         "has_responses": has_responses,
         "headers": headers,
+        "auto_mapping": auto_mapping,
         "preview_rows": preview_rows,
     }
 
@@ -796,10 +795,12 @@ async def confirm_calendar_upload(
 @router.post("/{upload_id}/import", status_code=202)
 async def start_calendar_import(
     upload_id: str,
+    body: dict = Body(default={}),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
-    """Step 3: kick off background import. Auto-mapped — no user mapping required."""
+    """Step 3: kick off background import. Optional `column_map` ({target_field:
+    csv_header}) overrides header auto-detection when a column is mis-named."""
     result = await db.execute(
         select(WebinarCalendarUpload).where(
             WebinarCalendarUpload.id == upload_id,
@@ -814,6 +815,18 @@ async def start_calendar_import(
             409,
             f"Cannot start import: status is '{upload.status}', expected 'pending'",
         )
+
+    # Persist the (optionally user-edited) column mapping so both this run and
+    # any orphan-resume use it instead of header auto-detection. Drop empty
+    # targets so an unmapped field falls through cleanly.
+    raw_map = (body or {}).get("column_map") or None
+    column_map = {k: v for k, v in raw_map.items() if v} if isinstance(raw_map, dict) else None
+    if column_map:
+        required = ["email"] + (["calendar_invite_response"] if upload.kind == "nonjoiner" else [])
+        missing = [f for f in required if not column_map.get(f)]
+        if missing:
+            raise HTTPException(400, f"Map a column for: {', '.join(missing)}")
+        upload.column_map = column_map
 
     upload.status = "processing"
     upload.progress = 0
@@ -832,7 +845,7 @@ async def start_calendar_import(
     task = asyncio.create_task(
         _process_calendar_csv(
             upload_id, upload.webinar_id, upload.storage_path, upload.sender_id,
-            kind=upload.kind,
+            kind=upload.kind, column_map=upload.column_map,
         )
     )
     _active_import_tasks[upload_id] = task
@@ -1012,6 +1025,7 @@ def resume_orphan_calendar_import(upload: "WebinarCalendarUpload") -> bool:
             upload.storage_path,
             upload.sender_id,
             kind=upload.kind,
+            column_map=upload.column_map,
             start_from_row=upload.processed_rows or 0,
             initial_matched=upload.matched_count or 0,
             initial_unmatched=upload.unmatched_count or 0,
@@ -1029,6 +1043,7 @@ async def _process_calendar_csv(
     sender_id: str | None,
     *,
     kind: str = "calendar",
+    column_map: dict | None = None,
     start_from_row: int = 0,
     initial_matched: int = 0,
     initial_unmatched: int = 0,
@@ -1120,7 +1135,19 @@ async def _process_calendar_csv(
             if skipped_ahead < start_from_row:
                 print(f"[CAL_IMPORT] Resume skip-ahead ran out of rows at {skipped_ahead} (expected {start_from_row}) — finalizing")
 
-        col_map = _build_col_map(headers)
+        # A user-supplied column_map ({target_field: csv_header}) overrides
+        # header auto-detection so a mis-named header can be mapped by hand.
+        if column_map:
+            norm = {_normalize_header(h): i for i, h in enumerate(headers)}
+            col_map = {}
+            for target, hdr in column_map.items():
+                if not hdr:
+                    continue
+                idx = norm.get(_normalize_header(str(hdr)))
+                if idx is not None:
+                    col_map[idx] = target
+        else:
+            col_map = _build_col_map(headers)
         if "email" not in col_map.values():
             raise Exception("CSV is missing an 'Email' column")
         has_responses = "calendar_invite_response" in col_map.values()
