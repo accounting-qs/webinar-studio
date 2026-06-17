@@ -611,15 +611,17 @@ class GoHighLevelStatisticsSource:
                 if show_specials else []
             )
 
-            if is_variant:
-                summary = self._summary_from_per_list(
-                    assignments, per_list,
-                    extra_metrics=[s["metrics"] for s in synthetic],
-                )
-            else:
-                summary = await self._compute_webinar_summary(
-                    db, w, assignments, prev_date, current_date,
-                )
+            # Parent summary = Assigned lists + NO LIST DATA + Nonjoiners for
+            # every metric — the sum of the partition rows beneath it — for both
+            # variants AND non-variants, so the Total Webinar row always equals
+            # the rows shown under it (including CSV-sourced nonjoiner Yes/Maybe,
+            # which a webinar-wide GHL query can't see). invited/accountsNeeded
+            # stay planned volume; totalRegs/totalAttended are overridden to the
+            # WG broadcast totals below (equal to the partition sum by design).
+            summary = self._summary_from_per_list(
+                assignments, per_list,
+                extra_metrics=[s["metrics"] for s in synthetic],
+            )
 
             # Override registration/attendance totals with the WG broadcast
             # cache when available. Both the per-list count and the
