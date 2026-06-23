@@ -726,7 +726,7 @@ async def confirm_calendar_upload(
     _: str = Depends(require_auth),
 ):
     """Step 2: read headers from Storage, detect Calendar_invite_response presence,
-    estimate row count, set status to 'pending' awaiting import start."""
+    count row count exactly, set status to 'pending' awaiting import start."""
     result = await db.execute(
         select(WebinarCalendarUpload).where(
             WebinarCalendarUpload.id == upload_id,
@@ -739,23 +739,36 @@ async def confirm_calendar_upload(
     if not upload.storage_path:
         raise HTTPException(400, "No storage path")
 
-    file_size = int(body.get("file_size") or 0)
-
     import httpx
     async with httpx.AsyncClient() as client:
+        # Download the full file so the row count is exact (no Range header).
         resp = await client.get(
             _storage_url(f"/storage/v1/object/{CSV_BUCKET}/{upload.storage_path}"),
-            headers=_supabase_headers(Range="bytes=0-32767"),
-            timeout=30.0,
+            headers=_supabase_headers(),
+            timeout=120.0,
         )
-        if resp.status_code not in (200, 206):
+        if resp.status_code != 200:
             raise HTTPException(500, f"Failed to read CSV from Storage: {resp.status_code}")
 
-    lines = [l.strip() for l in resp.text.split("\n") if l.strip()]
-    if not lines:
+    # Count rows exactly with csv.reader so embedded newlines inside quoted fields
+    # are handled correctly (matches how the import worker counts).
+    reader = csv.reader(io.StringIO(resp.text))
+    headers: list[str] | None = None
+    preview_rows: list[list[str]] = []
+    total_rows = 0
+    for row in reader:
+        if not any((cell or "").strip() for cell in row):
+            continue  # skip fully-blank lines
+        if headers is None:
+            headers = [h.strip() for h in row]
+            continue
+        if len(preview_rows) < 5:
+            preview_rows.append(row)
+        total_rows += 1
+
+    if headers is None:
         raise HTTPException(400, "CSV file appears empty")
 
-    headers = _parse_csv_line(lines[0])
     # Auto-detected mapping (target field -> CSV header). Returned so the modal
     # can pre-fill the column-mapping dropdowns; the user can override any field
     # when a header doesn't match. Required-field validation happens at import,
@@ -763,16 +776,6 @@ async def confirm_calendar_upload(
     auto_col_map = _build_col_map(headers)  # {idx: target}
     auto_mapping = {target: headers[idx] for idx, target in auto_col_map.items()}
     has_responses = "calendar_invite_response" in auto_col_map.values()
-
-    # Estimate total rows from file size & average row length (same trick as outreach uploads)
-    if len(lines) > 1 and file_size > 0:
-        sample_bytes = sum(len(l.encode("utf-8")) + 1 for l in lines[:min(20, len(lines))])
-        avg_row_bytes = sample_bytes / min(20, len(lines))
-        total_rows = max(1, int(file_size / avg_row_bytes) - 1)
-    else:
-        total_rows = max(0, len(lines) - 1)
-
-    preview_rows = [_parse_csv_line(lines[i]) for i in range(1, min(6, len(lines)))]
 
     upload.total_rows = total_rows
     upload.has_responses = has_responses
