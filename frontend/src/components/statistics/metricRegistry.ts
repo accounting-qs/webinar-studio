@@ -402,6 +402,12 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     description: "Registration rate relative to Actually Used (falls back to Invited when Actually Used is 0).",
   },
   {
+    key: "totalRegsPer1kInv", label: "Reg/1k", group: "Attendance", format: "per1k",
+    formulaText: "totalRegs / (actuallyUsed (fallback invited) / 1000)",
+    formulaSources: ["totalRegs", "actuallyUsed", "invited"],
+    description: "Registrations per 1,000 (Actually Used; falls back to Invited when Actually Used is 0).",
+  },
+  {
     key: "totalAttended", label: "Attended", group: "Attendance", format: "number",
     description: "All WebinarGeek attendees (regardless of channel).",
     fieldsUsed: [F_WG_BROADCAST, F_WG_WATCHED],

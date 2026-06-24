@@ -111,6 +111,7 @@ def compute_derived_metrics(
         "selfRegBookingsPer1kInv": _safe_per1k(m.get("selfRegBookings"), inv),
         # Attendance
         "invitedToRegPercent": _safe_div(m.get("totalRegs"), inv),
+        "totalRegsPer1kInv": _safe_per1k(m.get("totalRegs"), inv),
         "regToAttendPercent": _safe_div(
             m.get("totalAttended"), m.get("totalRegs")
         ),

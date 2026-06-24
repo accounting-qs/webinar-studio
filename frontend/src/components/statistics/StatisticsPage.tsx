@@ -570,6 +570,7 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
     selfRegStay10MinPercent: _safeDiv(g("selfReg10MinPlus"), g("selfRegAttended")),
     selfRegBookingsPer1kInv: _safePer1k(g("selfRegBookings"), inv),
     invitedToRegPercent: _safeDiv(g("totalRegs"), inv),
+    totalRegsPer1kInv: _safePer1k(g("totalRegs"), inv),
     regToAttendPercent: _safeDiv(g("totalAttended"), g("totalRegs")),
     invitedToAttendPercent: _safeDiv(g("totalAttended"), inv),
     totalAttendedPer1kInv: _safePer1k(g("totalAttended"), inv),
