@@ -78,6 +78,7 @@ class StatisticsMetrics(BaseModel):
     selfRegStay10MinPercent: float | None = None
     selfRegBookingsPer1kInv: float | None = None
     invitedToRegPercent: float | None = None
+    totalRegsPer1kInv: float | None = None
     regToAttendPercent: float | None = None
     invitedToAttendPercent: float | None = None
     totalAttendedPer1kInv: float | None = None
