@@ -259,6 +259,9 @@ class ContactReleaseLog(Base):
         Index("ix_release_log_webinar", "webinar_id"),
         Index("ix_release_log_batch", "release_batch_id"),
         Index("ix_release_log_email", "user_id", "email"),
+        # FK to contacts.id (ON DELETE SET NULL) — indexed so contact deletes
+        # don't sequentially scan this table per row. See migration 051.
+        Index("ix_release_log_contact", "contact_id"),
     )
 
 

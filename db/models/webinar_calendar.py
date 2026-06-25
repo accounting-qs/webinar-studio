@@ -95,6 +95,9 @@ class WebinarCalendarInvite(Base):
         Index("ix_wci_webinar_account", "webinar_id", "calendar_account"),
         Index("ix_wci_webinar_response", "webinar_id", "calendar_invite_response"),
         Index("ix_wci_upload", "upload_id"),
+        # FK to contacts.id (ON DELETE SET NULL) — indexed so contact deletes
+        # don't sequentially scan this table per row. See migration 051.
+        Index("ix_wci_matched_contact_id", "matched_contact_id"),
     )
 
 
