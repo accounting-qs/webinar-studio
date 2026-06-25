@@ -1155,20 +1155,29 @@ async def _process_csv_import(
             CREATE/COPY/INSERT and the upload-history progress UPDATE share one commit
             (and the temp table is dropped at COMMIT). Returns (inserted, skipped,
             overwritten)."""
+            # Drop rows with no email. Outreach contacts are unusable without one, and a
+            # NULL email can never be claimed by an assignment — the assign filter
+            # `lower(email) NOT IN (blocklist)` evaluates to NULL for them, so they would
+            # otherwise pile up in buckets as un-assignable phantom inventory that inflates
+            # the "remaining" counts and breaks "assign all remaining". Counted as skipped.
+            no_email = sum(1 for r in rows_to_insert if not r.get("email"))
+            if no_email:
+                rows_to_insert = [r for r in rows_to_insert if r.get("email")]
+
             seen: dict[str, int] = {}
             dupes = 0
             for i, r in enumerate(rows_to_insert):
-                email = r.get("email")
-                if email:
-                    if email in seen:
-                        dupes += 1
-                    seen[email] = i
+                email = r["email"]
+                if email in seen:
+                    dupes += 1
+                seen[email] = i
             if dupes > 0:
-                keep = set(seen.values()) | {i for i, r in enumerate(rows_to_insert) if not r.get("email")}
+                keep = set(seen.values())
                 rows_to_insert = [rows_to_insert[i] for i in sorted(keep)]
 
+            skipped = no_email + dupes
             if not rows_to_insert:
-                return 0, dupes, 0
+                return 0, skipped, 0
 
             # Reach the raw asyncpg connection for COPY + JSONB codec.
             raw = await conn.get_raw_connection()
@@ -1198,8 +1207,8 @@ async def _process_csv_import(
             affected = result.rowcount or 0
             if duplicate_mode == "overwrite":
                 # rowcount = inserts + updates combined; today's code reports this as overwritten.
-                return 0, dupes, affected
-            return affected, dupes + (len(rows_to_insert) - affected), 0
+                return 0, skipped, affected
+            return affected, skipped + (len(rows_to_insert) - affected), 0
 
         # Single-pass: iterate rows, create buckets on the fly, batch insert via COPY.
         # asyncpg's 32767-param limit applied to pg_insert.values(); the COPY path
