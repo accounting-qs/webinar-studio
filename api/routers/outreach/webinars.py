@@ -403,48 +403,63 @@ async def assign_bucket(
     db.add(assignment)
     await db.flush()  # get assignment.id
 
-    # Claim available contacts — excluding blocklisted
+    # Claim available contacts — excluding blocklisted.
+    #
+    # Issued in chunks rather than as one big UPDATE. Claiming tens of thousands of
+    # rows in a single statement runs past Postgres' 120s statement_timeout: each row
+    # is a non-HOT update that rewrites ~9 indexes, so the write is ~3ms/row
+    # (measured: ~5k rows ≈ 15s → 44k ≈ 135s → the statement is cancelled mid-flight
+    # and the browser surfaces it as "Failed to fetch"). statement_timeout is
+    # per-statement, so several smaller UPDATEs each stay well under the cap while
+    # remaining in one transaction — still atomic, and neither transaction_timeout nor
+    # idle_in_transaction_session_timeout is set on this database. Each chunk re-selects
+    # `outreach_status == 'available'` rows, so rows already flipped to 'assigned' by an
+    # earlier chunk drop out of the next chunk's candidate set and it advances onto
+    # fresh rows.
     if is_custom_list:
-        claim_subq = (
-            select(Contact.id)
-            .where(
-                Contact.upload_id == body.upload_id,
-                Contact.bucket_id.is_(None),
-                Contact.outreach_status == "available",
-                not_blocklisted,
-            )
-            .limit(body.volume)
+        claim_where = (
+            Contact.upload_id == body.upload_id,
+            Contact.bucket_id.is_(None),
+            Contact.outreach_status == "available",
+            not_blocklisted,
         )
     else:
-        claim_subq = (
-            select(Contact.id)
-            .where(
-                Contact.bucket_id == body.bucket_id,
-                Contact.outreach_status == "available",
-                not_blocklisted,
-            )
-            .limit(body.volume)
+        claim_where = (
+            Contact.bucket_id == body.bucket_id,
+            Contact.outreach_status == "available",
+            not_blocklisted,
         )
 
-    # Re-check `outreach_status == 'available'` on the outer UPDATE so PostgreSQL's
+    # Re-check `outreach_status == 'available'` on each outer UPDATE so PostgreSQL's
     # EvalPlanQual re-evaluates against the row's current state under READ COMMITTED.
     # Without this predicate, a concurrent assign request (double-click race) would
     # silently overwrite the first request's assignment_id on the same rows once it
     # acquired the row locks — leaving the first assignment with volume>0 but zero
     # contacts attached. See https://www.postgresql.org/docs/current/transaction-iso.html
-    claim_result = await db.execute(
-        update(Contact)
-        .where(
-            Contact.id.in_(claim_subq),
-            Contact.outreach_status == "available",
+    CLAIM_CHUNK = 5000
+    claimed = 0
+    while claimed < body.volume:
+        chunk_limit = min(CLAIM_CHUNK, body.volume - claimed)
+        chunk_subq = select(Contact.id).where(*claim_where).limit(chunk_limit)
+        chunk_result = await db.execute(
+            update(Contact)
+            .where(
+                Contact.id.in_(chunk_subq),
+                Contact.outreach_status == "available",
+            )
+            .values(
+                assignment_id=assignment.id,
+                outreach_status="assigned",
+                assigned_date=webinar.date,
+            )
         )
-        .values(
-            assignment_id=assignment.id,
-            outreach_status="assigned",
-            assigned_date=webinar.date,
-        )
-    )
-    claimed = claim_result.rowcount
+        n = chunk_result.rowcount or 0
+        claimed += n
+        if n < chunk_limit:
+            # Fewer rows than requested → the bucket/list is exhausted (or a concurrent
+            # assign claimed the remainder). Stop instead of looping on an empty set;
+            # the reconciliation below trues up assignment.volume to what was claimed.
+            break
 
     # Reconcile assignment.volume / .remaining with what was actually claimed.
     # The pre-claim available_count check (line ~328) can race against a
