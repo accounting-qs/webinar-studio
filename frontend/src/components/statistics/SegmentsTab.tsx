@@ -209,8 +209,36 @@ function webinarRangeLabel(
 /* ── Funnel table ───────────────────────────────────────────────────────── */
 
 const COL = "px-3 py-2 text-right tabular-nums whitespace-nowrap";
-const HEAD =
-  "px-3 py-2 text-right font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap";
+
+type CellKey = keyof FunnelCells;
+type SortKey = "segment" | CellKey;
+type SortDir = "asc" | "desc";
+
+/** Single source of truth for the numeric columns — drives the header, the body
+ * cells, the totals row, and the sort keys so they can never drift apart. */
+const NUMERIC_COLUMNS: {
+  key: CellKey;
+  label: string;
+  title?: string;
+  fmt: (c: FunnelCells) => string;
+}[] = [
+  { key: "invites", label: "Invites", fmt: (c) => fmtInt(c.invites) },
+  { key: "regs", label: "Regs", fmt: (c) => fmtInt(c.regs) },
+  { key: "regPct", label: "Reg%", fmt: (c) => fmtPct(c.regPct) },
+  { key: "attendees10m", label: "Attendees (10m+)", fmt: (c) => fmtInt(c.attendees10m) },
+  { key: "attOfInv", label: "Att% (of inv)", title: "10-min+ attendees ÷ invites", fmt: (c) => fmtPct(c.attOfInv) },
+  { key: "attOfReg", label: "Att% (of reg)", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
+  { key: "bookings", label: "Bookings", fmt: (c) => fmtInt(c.bookings) },
+  { key: "bookOfAtt", label: "Book% (of att)", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
+  { key: "bookPer1kInv", label: "Book/1k inv", title: "Bookings per 1,000 invites", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
+];
+
+function SortArrow({ active, dir }: { active: boolean; dir: SortDir }) {
+  if (!active) {
+    return <span className="text-zinc-400 dark:text-zinc-600 text-[10px]">↕</span>;
+  }
+  return <span className="text-violet-500 text-[10px]">{dir === "asc" ? "↑" : "↓"}</span>;
+}
 
 function FunnelTable({
   segments,
@@ -221,6 +249,20 @@ function FunnelTable({
   totals: SegmentFunnelRow;
   includedCount: number;
 }) {
+  // Default to invites desc — matches the server's initial ordering.
+  const [sortKey, setSortKey] = useState<SortKey>("invites");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+
+  const handleSort = (key: SortKey) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      // Names default A→Z; numbers default high→low (most interesting first).
+      setSortDir(key === "segment" ? "asc" : "desc");
+    }
+  };
+
   // Named bucket rows lead the column-leader comparison; the "Other (no bucket)"
   // row (bucketId === null) and the Total row are excluded so a catch-all bucket
   // doesn't win every column.
@@ -230,21 +272,46 @@ function FunnelTable({
   );
 
   const maxes = useMemo(() => {
-    const keys: (keyof FunnelCells)[] = [
-      "invites", "regs", "regPct", "attendees10m",
-      "attOfInv", "attOfReg", "bookings", "bookOfAtt", "bookPer1kInv",
-    ];
-    const m = {} as Record<keyof FunnelCells, number>;
-    for (const k of keys) {
+    const m = {} as Record<CellKey, number>;
+    for (const col of NUMERIC_COLUMNS) {
       let best = -Infinity;
       for (const c of namedCells) {
-        const v = c[k];
+        const v = c[col.key];
         if (v !== null && v > best) best = v;
       }
-      m[k] = best;
+      m[col.key] = best;
     }
     return m;
   }, [namedCells]);
+
+  // Sort the named bucket rows by the active column; the "Other (no bucket)" row
+  // stays pinned at the bottom (it's a catch-all, like the Total row).
+  const sortedNamed = useMemo(() => {
+    const decorated = segments
+      .filter((s) => s.bucketId !== null)
+      .map((row) => ({ row, cells: deriveCells(row) }));
+    decorated.sort((a, b) => {
+      let cmp: number;
+      if (sortKey === "segment") {
+        cmp = (a.row.bucketName ?? "").localeCompare(b.row.bucketName ?? "");
+      } else {
+        const av = a.cells[sortKey];
+        const bv = b.cells[sortKey];
+        // Nulls (e.g. a % with a zero denominator) always sort last.
+        if (av === null && bv === null) return 0;
+        if (av === null) return 1;
+        if (bv === null) return -1;
+        cmp = av - bv;
+      }
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return decorated.map((d) => d.row);
+  }, [segments, sortKey, sortDir]);
+
+  const otherRows = useMemo(
+    () => segments.filter((s) => s.bucketId === null),
+    [segments],
+  );
 
   if (segments.length === 0) {
     return (
@@ -254,34 +321,45 @@ function FunnelTable({
     );
   }
 
+  const headBase =
+    "px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800";
+
   return (
     <div className="mt-2 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
         <table className="w-full text-xs border-collapse">
           <thead className="bg-zinc-50 dark:bg-zinc-900 text-[11px] uppercase tracking-wider">
             <tr>
-              <th className="px-3 py-2 text-left font-semibold text-zinc-500 dark:text-zinc-500 min-w-[220px]">
-                Segment
+              <th
+                onClick={() => handleSort("segment")}
+                className={`${headBase} text-left min-w-[220px]`}
+              >
+                <span className="inline-flex items-center gap-1">
+                  Segment
+                  <SortArrow active={sortKey === "segment"} dir={sortDir} />
+                </span>
               </th>
-              <th className={HEAD}>Invites</th>
-              <th className={HEAD}>Regs</th>
-              <th className={HEAD}>Reg%</th>
-              <th className={HEAD}>Attendees (10m+)</th>
-              <th className={HEAD} title="10-min+ attendees ÷ invites">Att% (of inv)</th>
-              <th className={HEAD} title="10-min+ attendees ÷ registrations">Att% (of reg)</th>
-              <th className={HEAD}>Bookings</th>
-              <th className={HEAD} title="Bookings ÷ 10-min+ attendees">Book% (of att)</th>
-              <th className={HEAD} title="Bookings per 1,000 invites">Book/1k inv</th>
+              {NUMERIC_COLUMNS.map((col) => (
+                <th
+                  key={col.key}
+                  onClick={() => handleSort(col.key)}
+                  title={col.title}
+                  className={`${headBase} text-right`}
+                >
+                  <span className="inline-flex items-center justify-end gap-1">
+                    {col.label}
+                    <SortArrow active={sortKey === col.key} dir={sortDir} />
+                  </span>
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
-            {segments.map((s, i) => (
-              <SegmentRow
-                key={s.bucketId ?? `other-${i}`}
-                row={s}
-                maxes={maxes}
-                isOther={s.bucketId === null}
-              />
+            {sortedNamed.map((s) => (
+              <SegmentRow key={s.bucketId} row={s} maxes={maxes} isOther={false} />
+            ))}
+            {otherRows.map((s, i) => (
+              <SegmentRow key={`other-${i}`} row={s} maxes={maxes} isOther />
             ))}
           </tbody>
           <tfoot>
@@ -305,7 +383,7 @@ function SegmentRow({
   isOther,
 }: {
   row: SegmentFunnelRow;
-  maxes: Record<keyof FunnelCells, number>;
+  maxes: Record<CellKey, number>;
   isOther: boolean;
 }) {
   const c = deriveCells(row);
@@ -321,15 +399,11 @@ function SegmentRow({
       >
         {row.bucketName ?? "—"}
       </td>
-      <td className={`${COL} ${leaderCls(c.invites, maxes.invites)}`}>{fmtInt(c.invites)}</td>
-      <td className={`${COL} ${leaderCls(c.regs, maxes.regs)}`}>{fmtInt(c.regs)}</td>
-      <td className={`${COL} ${leaderCls(c.regPct, maxes.regPct)}`}>{fmtPct(c.regPct)}</td>
-      <td className={`${COL} ${leaderCls(c.attendees10m, maxes.attendees10m)}`}>{fmtInt(c.attendees10m)}</td>
-      <td className={`${COL} ${leaderCls(c.attOfInv, maxes.attOfInv)}`}>{fmtPct(c.attOfInv)}</td>
-      <td className={`${COL} ${leaderCls(c.attOfReg, maxes.attOfReg)}`}>{fmtPct(c.attOfReg)}</td>
-      <td className={`${COL} ${leaderCls(c.bookings, maxes.bookings)}`}>{fmtInt(c.bookings)}</td>
-      <td className={`${COL} ${leaderCls(c.bookOfAtt, maxes.bookOfAtt)}`}>{fmtPct(c.bookOfAtt)}</td>
-      <td className={`${COL} ${leaderCls(c.bookPer1kInv, maxes.bookPer1kInv)}`}>{fmtPer1k(c.bookPer1kInv)}</td>
+      {NUMERIC_COLUMNS.map((col) => (
+        <td key={col.key} className={`${COL} ${leaderCls(c[col.key], maxes[col.key])}`}>
+          {col.fmt(c)}
+        </td>
+      ))}
     </tr>
   );
 }
@@ -351,15 +425,11 @@ function TotalsRow({
           {includedCount} webinar{includedCount === 1 ? "" : "s"}
         </span>
       </td>
-      <td className={cls}>{fmtInt(c.invites)}</td>
-      <td className={cls}>{fmtInt(c.regs)}</td>
-      <td className={cls}>{fmtPct(c.regPct)}</td>
-      <td className={cls}>{fmtInt(c.attendees10m)}</td>
-      <td className={cls}>{fmtPct(c.attOfInv)}</td>
-      <td className={cls}>{fmtPct(c.attOfReg)}</td>
-      <td className={cls}>{fmtInt(c.bookings)}</td>
-      <td className={cls}>{fmtPct(c.bookOfAtt)}</td>
-      <td className={cls}>{fmtPer1k(c.bookPer1kInv)}</td>
+      {NUMERIC_COLUMNS.map((col) => (
+        <td key={col.key} className={cls}>
+          {col.fmt(c)}
+        </td>
+      ))}
     </tr>
   );
 }
