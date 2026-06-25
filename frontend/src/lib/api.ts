@@ -1550,6 +1550,91 @@ export async function fetchStatisticsWebinar(
   return res.json();
 }
 
+/* ── By-bucket funnel (Segments tab) ─────────────────────────────────────── */
+
+export interface SegmentFunnelWebinar {
+  webinarId: string;
+  number: number;
+  variantLabel: string | null;
+  date: string | null;
+  title: string | null;
+  /** Display label, e.g. "W136 · Account A (2026-05-01)". */
+  label: string;
+}
+
+export interface SegmentFunnelRow {
+  /** null on the synthetic "Other (no bucket)" and Total rows. */
+  bucketId: string | null;
+  bucketName: string | null;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+}
+
+export interface SegmentFunnelResponse {
+  /** All passed webinars — the filter options for the multi-select. */
+  webinars: SegmentFunnelWebinar[];
+  /** The subset requested for aggregation. */
+  includedWebinarIds: string[];
+  /** Selected webinars with no stored snapshot yet (excluded from totals until
+   * a recompute builds them). Non-empty → prompt a recompute. */
+  pendingWebinarIds: string[];
+  /** Named buckets (invites desc) followed by the "Other (no bucket)" row. */
+  segments: SegmentFunnelRow[];
+  totals: SegmentFunnelRow;
+  meta: StatisticsMeta;
+}
+
+/** By-bucket funnel rollup across the selected webinars. Pass webinar UUIDs to
+ * scope; omit for all passed webinars (the default). */
+export async function fetchStatisticsSegments(
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<SegmentFunnelResponse> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(`${API_URL}/statistics/segments?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch segment funnel");
+  return res.json();
+}
+
+/* ── Precomputed snapshot store (recompute trigger + status) ─────────────── */
+
+export interface StatisticsRecomputeStatus {
+  running: boolean;
+  scope: "all" | "partial" | null;
+  started_at: string | null;
+  finished_at: string | null;
+  total: number;
+  done: number;
+  errors: number;
+  last_error: string | null;
+  /** MAX(computed_at) across snapshots — when the stored stats were last built. */
+  last_computed_at: string | null;
+  snapshot_count: number;
+}
+
+export async function fetchStatisticsRecomputeStatus(): Promise<StatisticsRecomputeStatus> {
+  const res = await fetch(`${API_URL}/statistics/recompute/status`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch recompute status");
+  return res.json();
+}
+
+/** Force a full background rebuild of every webinar's stored statistics. */
+export async function recomputeStatistics(): Promise<StatisticsRecomputeStatus> {
+  const res = await fetch(`${API_URL}/statistics/recompute`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to trigger recompute");
+  return res.json();
+}
+
 export interface ContactDrilldownItem {
   ghl_contact_id: string;
   email: string | null;

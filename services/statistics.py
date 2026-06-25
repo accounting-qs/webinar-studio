@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import date as _date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -390,20 +390,39 @@ def invalidate_stats_cache() -> None:
 async def get_statistics_webinar_one(
     source: str,
     webinar_id: str,
+    *,
+    force: bool = False,
 ) -> dict[str, Any] | None:
     """Fully-processed single webinar by webinar_id, or None if missing.
 
     Variant-aware: each A/B variant has its own UUID, so callers can
     address them unambiguously.
 
-    Cached: hits return immediately; misses compute and populate the cache.
+    Read order (unless force): in-memory cache → persisted snapshot → live
+    compute. The snapshot store (populated by services.statistics_snapshot
+    .recompute() after any source change) is the steady-state path — an
+    instant DB read instead of the ~30s contacts↔ghl_contact join. `force`
+    skips both caches and recomputes live; the recompute job uses it to
+    rebuild snapshots from fresh data.
+
     `None` results (unknown webinar_id) are not cached — they're cheap to
     recompute and we don't want a typo to be remembered for 10 minutes.
     """
     cache_key = (source, webinar_id)
-    cached = _stats_cache.get(cache_key)
-    if cached is not None and (time.monotonic() - cached[0]) < _STATS_CACHE_TTL_SECONDS:
-        return cached[1]
+    if not force:
+        cached = _stats_cache.get(cache_key)
+        if cached is not None and (time.monotonic() - cached[0]) < _STATS_CACHE_TTL_SECONDS:
+            return cached[1]
+        # Persisted snapshot — instant, the steady-state path. Populate the
+        # in-memory cache so repeat hits in this worker skip the DB round-trip.
+        try:
+            from services import statistics_snapshot as snap
+            payload = await snap.read_snapshot_payload(source, webinar_id)
+        except Exception:
+            payload = None
+        if payload is not None:
+            _stats_cache[cache_key] = (time.monotonic(), payload)
+            return payload
 
     use_ghl = source != "workbook"
     source_label = "ghl" if use_ghl else "workbook_mock"
@@ -426,3 +445,155 @@ async def get_statistics_webinar_one(
     if result is not None:
         _stats_cache[cache_key] = (time.monotonic(), result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# By-bucket funnel aggregation (Segments tab)
+# ---------------------------------------------------------------------------
+# Raw per-list metric keys summed into each bucket row. Percentages are
+# recomputed from these sums (never averaged) by the caller / frontend.
+_FUNNEL_RAW_KEYS = ("invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings")
+
+
+def _is_passed_webinar(date_str: str | None, status: str | None) -> bool:
+    """Mirror the Statistics page's "passed" filter: webinar date < today, or
+    date == today AND status == 'sent'. Webinar.date serializes as YYYY-MM-DD,
+    so lexicographic compare matches chronological order."""
+    if not date_str:
+        return False
+    today = _date.today().isoformat()
+    if date_str < today:
+        return True
+    if date_str > today:
+        return False
+    return (status or "").lower() == "sent"
+
+
+def _segment_webinar_label(s: dict[str, Any]) -> str:
+    base = f"W{s.get('number')}"
+    vl = s.get("variantLabel")
+    if vl:
+        base += f" · {vl}"
+    d = s.get("date")
+    if d:
+        base += f" ({d})"
+    return base
+
+
+async def get_statistics_segments(
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-webinar list rows into a by-bucket funnel across the
+    selected webinars (default: all passed webinars).
+
+    Each bucket row sums the raw per-list metrics of every assignment of that
+    bucket on every included webinar. Rows with no bucket (Nonjoiners / No
+    List Data / Self-Reg synthetics) roll up into a single "Other (no bucket)"
+    row so the totals line ties out to the real webinar totals. Only the raw
+    counts are returned; the frontend recomputes the funnel percentages from
+    the summed counts (never averaging per-webinar percentages).
+
+    Reuses the cached per-webinar compute (get_statistics_webinar_one) so it
+    shares the per-webinar response cache with the main Statistics page.
+    """
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    # Newest first, sibling variants grouped (matches the main page ordering).
+    passed.sort(key=lambda s: (s.get("date") or "", s.get("variantLabel") or ""), reverse=True)
+
+    webinar_options = [
+        {
+            "webinarId": s.get("webinarId"),
+            "number": s.get("number"),
+            "variantLabel": s.get("variantLabel"),
+            "date": s.get("date"),
+            "title": s.get("title"),
+            "label": _segment_webinar_label(s),
+        }
+        for s in passed
+        if s.get("webinarId")
+    ]
+
+    all_ids = [o["webinarId"] for o in webinar_options]
+    if webinar_ids:
+        wanted = set(webinar_ids)
+        target_ids = [i for i in all_ids if i in wanted]
+    else:
+        target_ids = all_ids
+
+    # bucket_id (None = "Other") -> running raw sums.
+    agg: dict[str | None, dict[str, Any]] = {}
+
+    def _accumulate(bucket_id: str | None, bucket_name: str | None, metrics: dict[str, Any]) -> None:
+        slot = agg.get(bucket_id)
+        if slot is None:
+            slot = {"bucketId": bucket_id, "bucketName": bucket_name}
+            slot.update({k: 0.0 for k in _FUNNEL_RAW_KEYS})
+            agg[bucket_id] = slot
+        elif bucket_name and not slot.get("bucketName"):
+            slot["bucketName"] = bucket_name
+        for k in _FUNNEL_RAW_KEYS:
+            v = metrics.get(k)
+            if v is not None:
+                slot[k] += float(v)
+
+    # Aggregate from the snapshot store only — one query for all payloads. We
+    # deliberately do NOT live-compute missing webinars here: that would be the
+    # ~30s × N single-request hang this store exists to avoid (and would trip
+    # the edge timeout). Any target webinar without a snapshot yet is reported
+    # as "pending" so the UI can prompt a recompute instead of silently
+    # undercounting the totals.
+    try:
+        from services import statistics_snapshot as snap
+        payloads = await snap.read_all_payloads(source)
+    except Exception:
+        payloads = {}
+
+    pending_ids: list[str] = []
+    for wid in target_ids:
+        webinar = payloads.get(wid)
+        if not webinar:
+            pending_ids.append(wid)
+            continue
+        for row in webinar.get("rows", []):
+            _accumulate(row.get("bucketId"), row.get("bucketName"), row.get("metrics") or {})
+
+    def _shape(slot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "bucketId": slot["bucketId"],
+            "bucketName": slot.get("bucketName"),
+            "invites": int(slot["invited"] or 0),
+            "regs": int(slot["totalRegs"] or 0),
+            "attendees10m": int(slot["total10MinPlus"] or 0),
+            "bookings": int(slot["totalBookings"] or 0),
+        }
+
+    # Named buckets first (by invites desc), then the "Other (no bucket)" row.
+    named = sorted(
+        (v for k, v in agg.items() if k is not None),
+        key=lambda r: (r.get("invited") or 0.0),
+        reverse=True,
+    )
+    segments = [_shape(v) for v in named]
+    other = agg.get(None)
+    if other is not None:
+        other["bucketName"] = other.get("bucketName") or "Other (no bucket)"
+        segments.append(_shape(other))
+
+    totals = {
+        "bucketId": None,
+        "bucketName": "Total",
+        "invites": sum(s["invites"] for s in segments),
+        "regs": sum(s["regs"] for s in segments),
+        "attendees10m": sum(s["attendees10m"] for s in segments),
+        "bookings": sum(s["bookings"] for s in segments),
+    }
+
+    return {
+        "webinars": webinar_options,
+        "includedWebinarIds": target_ids,
+        "pendingWebinarIds": pending_ids,
+        "segments": segments,
+        "totals": totals,
+    }

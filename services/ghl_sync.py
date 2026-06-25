@@ -560,9 +560,13 @@ async def run_sync(sync_type: SyncType, trigger: SyncTrigger = "scheduled") -> s
             )
             await _heartbeat(state)
 
-            # New data → existing cached statistics responses are stale.
+            # New data → cached statistics responses are stale. Drop the
+            # in-memory cache, then rebuild every webinar's persisted snapshot
+            # in the background so the next dashboard open is instant.
             from services.statistics import invalidate_stats_cache
+            from services.statistics_snapshot import schedule_recompute
             invalidate_stats_cache()
+            schedule_recompute()
 
             return state.run_id
 
@@ -710,9 +714,13 @@ async def run_webinar_sync(
                 )
                 await _heartbeat(state)
 
-            # New data → existing cached statistics responses are stale.
+            # New data → cached statistics responses are stale. Drop the
+            # in-memory cache, then rebuild this webinar's persisted snapshot
+            # (all variants of the number) in the background.
             from services.statistics import invalidate_stats_cache
+            from services.statistics_snapshot import schedule_recompute_for_number
             invalidate_stats_cache()
+            schedule_recompute_for_number(webinar_number)
 
             return state.run_id
 

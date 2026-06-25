@@ -615,6 +615,91 @@ async def list_statistics_webinar_summaries(source: str = "auto"):
     return {"webinars": webinars, "meta": meta}
 
 
+# ---------------------------------------------------------------------------
+# By-bucket funnel (Segments tab)
+# ---------------------------------------------------------------------------
+
+class SegmentFunnelWebinar(BaseModel):
+    """A passed webinar, offered as a filter option on the Segments tab."""
+    webinarId: str
+    number: int
+    variantLabel: str | None = None
+    date: str | None = None
+    title: str | None = None
+    label: str
+
+
+class SegmentFunnelRow(BaseModel):
+    """One bucket's rolled-up raw funnel counts across the selected webinars.
+    Percentages (Reg%, Att% of inv / of reg, Book% of att, Book/1k inv) are
+    derived on the frontend from these counts so they reflect summed totals,
+    not averaged per-webinar rates."""
+    bucketId: str | None = None  # None for the "Other (no bucket)" / Total rows
+    bucketName: str | None = None
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+
+
+class SegmentFunnelResponse(BaseModel):
+    webinars: list[SegmentFunnelWebinar]  # all passed webinars (filter options)
+    includedWebinarIds: list[str]  # the subset requested for aggregation
+    # Selected webinars with no snapshot yet — excluded from the totals until a
+    # recompute builds them. Surfaced so the UI can prompt "Recompute now".
+    pendingWebinarIds: list[str] = []
+    segments: list[SegmentFunnelRow]  # named buckets (invites desc) + Other
+    totals: SegmentFunnelRow
+    meta: StatisticsMetaResponse
+
+
+@router.get("/segments", response_model=SegmentFunnelResponse)
+async def get_statistics_segments(source: str = "auto", webinars: str | None = None):
+    """By-bucket funnel overview. `webinars` is a comma-separated list of
+    Webinar UUIDs to include; omit (or pass empty) to include all passed
+    webinars. Heavy on a cold cache — shares the per-webinar response cache
+    with the Statistics page, so it's instant once that cache is warm."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_segments(source=source, webinar_ids=ids or None)
+    meta = await _resolve_meta(source)
+    return {**data, "meta": meta}
+
+
+# ---------------------------------------------------------------------------
+# Precomputed snapshot store — manual recompute trigger + status
+# ---------------------------------------------------------------------------
+
+class RecomputeStatusResponse(BaseModel):
+    running: bool
+    scope: str | None = None  # "all" | "partial"
+    started_at: str | None = None
+    finished_at: str | None = None
+    total: int = 0
+    done: int = 0
+    errors: int = 0
+    last_error: str | None = None
+    last_computed_at: str | None = None  # MAX(computed_at) across snapshots
+    snapshot_count: int = 0
+
+
+@router.post("/recompute", response_model=RecomputeStatusResponse)
+async def trigger_recompute(source: str = "auto"):
+    """Force a full background rebuild of every webinar's statistics snapshot.
+    Returns immediately with current status; poll /recompute/status to watch
+    progress. Coalesced — a second call while one is running is a no-op."""
+    from services import statistics_snapshot as snap
+    snap.schedule_recompute(source=source)
+    return await snap.get_status(source)
+
+
+@router.get("/recompute/status", response_model=RecomputeStatusResponse)
+async def recompute_status(source: str = "auto"):
+    """Current recompute progress + when the snapshots were last rebuilt."""
+    from services import statistics_snapshot as snap
+    return await snap.get_status(source)
+
+
 @router.get("/webinars/{webinar_id}", response_model=ApiStatisticsWebinar)
 async def get_statistics_webinar(webinar_id: str, source: str = "auto"):
     """Fully-processed single webinar by webinar_id (the row's UUID, or

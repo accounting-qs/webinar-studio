@@ -189,6 +189,15 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
 
             state.contacts_synced = count
             await _heartbeat(state)
+
+            # Fresh subscriber data changes registration/attendance numbers →
+            # rebuild the persisted statistics snapshot for the linked webinar(s)
+            # in the background so the dashboard reflects it without a recompute.
+            from services.statistics import invalidate_stats_cache
+            from services.statistics_snapshot import schedule_recompute_for_broadcast
+            invalidate_stats_cache()
+            schedule_recompute_for_broadcast(broadcast_id)
+
             return state.run_id
 
 

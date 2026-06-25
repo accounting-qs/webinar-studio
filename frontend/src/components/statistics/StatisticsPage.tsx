@@ -15,6 +15,7 @@ import {
   type StatisticsMetrics,
 } from "@/lib/api";
 import { WebinarEditModal, type EditableWebinar } from "../planning/WebinarEditModal";
+import { RecomputeControl } from "./RecomputeControl";
 import {
   GROUP_BOUNDARY_CLASSES,
   METRIC_COLUMNS,
@@ -1003,6 +1004,9 @@ export function StatisticsPage() {
   const [wgSelected, setWgSelected] = useState<string>("");
   const [wgSyncing, setWgSyncing] = useState(false);
   const [wgMessage, setWgMessage] = useState<string | null>(null);
+  // Bumped by the Recompute control to re-run the progressive load after a
+  // snapshot rebuild finishes, so the table shows the fresh stored numbers.
+  const [reloadKey, setReloadKey] = useState(0);
 
   async function handleWgSync() {
     if (!wgSelected) return;
@@ -1146,7 +1150,7 @@ export function StatisticsPage() {
     }
     load();
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadKey]);
 
   /* ── Planning webinars (for the Edit modal pre-fill + Previous dropdown) ─ */
   useEffect(() => {
@@ -1313,6 +1317,7 @@ export function StatisticsPage() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <RecomputeControl onDone={() => setReloadKey((k) => k + 1)} />
             {webinars.length > 0 && (
               <div className="flex items-center gap-2">
                 <select

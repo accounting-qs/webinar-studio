@@ -139,7 +139,9 @@ async def update_webinar(
     # the dashboard reflects it immediately instead of after the 10-min TTL.
     if {"nonjoiner_source_webinar_id", "broadcast_id", "number", "variant_label", "date"} & fields.keys():
         from services.statistics import invalidate_stats_cache
+        from services.statistics_snapshot import schedule_recompute_for_webinar
         invalidate_stats_cache()
+        schedule_recompute_for_webinar(webinar_id)
     return webinar_dict(webinar)
 
 

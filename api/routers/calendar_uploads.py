@@ -1465,6 +1465,16 @@ async def _process_calendar_csv(
 
         print(f"[CAL_IMPORT] Done: {upload_id} — {processed} rows, {matched} matched, {unmatched} no-list")
 
+        # Calendar invites feed Yes/Maybe/attendance attribution → rebuild this
+        # webinar's persisted statistics snapshot in the background.
+        try:
+            from services.statistics import invalidate_stats_cache
+            from services.statistics_snapshot import schedule_recompute_for_webinar
+            invalidate_stats_cache()
+            schedule_recompute_for_webinar(webinar_id)
+        except Exception as exc:
+            print(f"[CAL_IMPORT] recompute schedule failed: {exc}")
+
     except Exception as e:
         print(f"[CAL_IMPORT] FAILED: {upload_id} at row {processed} — {e}")
         traceback.print_exc()

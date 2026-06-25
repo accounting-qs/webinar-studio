@@ -2,11 +2,12 @@
 
 import { useState } from "react";
 import { StatisticsPage } from "./StatisticsPage";
+import { SegmentsTab } from "./SegmentsTab";
 import { CalendarUploadsTab } from "./CalendarUploadsTab";
 import { AccountHealthTab } from "./AccountHealthTab";
 import { DayOfWeekTab } from "./DayOfWeekTab";
 
-type Tab = "statistics" | "calendar-uploads" | "account-health" | "send-day";
+type Tab = "statistics" | "segments" | "calendar-uploads" | "account-health" | "send-day";
 
 export function StatisticsTabs() {
   const [tab, setTab] = useState<Tab>("statistics");
@@ -17,6 +18,9 @@ export function StatisticsTabs() {
         <div className="flex gap-1">
           <TabButton active={tab === "statistics"} onClick={() => setTab("statistics")}>
             Statistics
+          </TabButton>
+          <TabButton active={tab === "segments"} onClick={() => setTab("segments")}>
+            Segments
           </TabButton>
           <TabButton active={tab === "calendar-uploads"} onClick={() => setTab("calendar-uploads")}>
             Calendar Uploads
@@ -32,6 +36,8 @@ export function StatisticsTabs() {
       <div className="flex-1 min-h-0 overflow-auto">
         {tab === "statistics" ? (
           <StatisticsPage />
+        ) : tab === "segments" ? (
+          <SegmentsTab />
         ) : tab === "calendar-uploads" ? (
           <CalendarUploadsTab />
         ) : tab === "account-health" ? (
