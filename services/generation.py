@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import AsyncIterator
 
 import anthropic
@@ -68,6 +69,96 @@ When the sections below conflict, the higher-ranked one always wins — no excep
 2. Client Case Studies / the provided brief — the only source of real client numbers, used verbatim.
 3. Format Rules and Business Context.
 4. Real Examples — the LOWEST authority. Use them for STRUCTURE, FORMAT, RHYTHM, and VOICE only. Never copy a specific value out of an example: no numbers, percentages, metrics, dollar amounts, names, dates, or claims. Treat every value shown in an example as a placeholder, not a fact to reuse — all real values come from the Principles and Case Studies above."""
+
+
+# ── Deterministic deliverability validator ──────────────────────────────────
+# Soft principles in the prompt don't reliably enforce; this is a hard gate that
+# checks generated copy and triggers a targeted repair pass on any violation.
+_BANNED_JARGON = ("pipeline", "funnel", "acquisition engine", "demand on repeat", "qualified sales calls")
+_RE_REVENUE = re.compile(r"\$\s?\d|\bARR\b|\b\d+\s*-?\s*figure\b", re.I)
+_RE_NEG_COMPARISON = re.compile(r"\b(?:without|no)\s+(?:cold outreach|cold call[s]?|paid ads|outbound|retainer[s]?)\b", re.I)
+_RE_NOT_X_NOT_Y = re.compile(r"\bnot\s+[\w' /-]+,\s*not\s+", re.I)
+_RE_REVEAL = re.compile(r"^\s*(?:revealed|exposed|the secret)\b[:\-]?", re.I)
+_RE_THE_USE_TO = re.compile(r"\bthe\b[\w ]+\buse[s]?\s+to\b", re.I)
+
+
+def _validate_copy(text: str, copy_type: str) -> list[str]:
+    """Deterministic deliverability gate mirroring the calendar-invite principles.
+    Returns a list of violation messages (empty list = clean)."""
+    violations: list[str] = []
+    low = text.lower()
+    for kw in _BANNED_JARGON:
+        if kw in low:
+            violations.append(f'banned jargon "{kw}"')
+    if copy_type == "description":
+        if _RE_REVENUE.search(text):
+            violations.append('revenue/$ figure — use activity metrics (calls/month, attendees/month, conversion %)')
+        m = _RE_NEG_COMPARISON.search(text) or _RE_NOT_X_NOT_Y.search(text)
+        if m:
+            violations.append(f'negative-comparison phrasing "{m.group(0).strip()}"')
+    elif copy_type == "title":
+        n = len(text)
+        if not (40 <= n <= 60):
+            violations.append(f"length {n} chars (must be 40-60)")
+        if _RE_REVEAL.search(text):
+            violations.append("curiosity/reveal opener")
+        if not re.match(r"^\s*how\b", text, re.I):
+            violations.append('not "How ..." framing')
+        if _RE_THE_USE_TO.search(text):
+            violations.append('banned "The ... Use to" construction')
+    return violations
+
+
+async def _repair_copy(text: str, copy_type: str, violations: list[str]) -> str:
+    """One targeted repair pass — fix only the flagged violations, keep everything else."""
+    fixes = "\n".join(f"- {v}" for v in violations)
+    prompt = f"""Rewrite this calendar-invite {copy_type} to fix ONLY these deliverability violations. Change nothing else about the meaning, proof, or structure.
+
+VIOLATIONS TO FIX:
+{fixes}
+
+RULES TO SATISFY:
+- Description: never contain a "$" or revenue figure — express proof as activity metrics only (calls booked/month, attendees/month, conversion %). No banned jargon (pipeline, funnel, acquisition engine, demand on repeat, qualified sales calls). No negative-comparison ("without ...", "no retainer", "not X, not Y") — state mechanisms affirmatively.
+- Title: "How [audience] [do activity] using [tool]" framing, 40-60 characters, no curiosity/reveal opener, no "The ... Use to" construction, no emoji.
+
+Return ONLY the rewritten {copy_type} text — no preamble, no quotes, no code fences.
+
+CURRENT {copy_type.upper()}:
+{text}"""
+    msg = await _client.messages.create(
+        model=settings.CLAUDE_MODEL, max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    asyncio.create_task(_log_claude_cost(
+        model=settings.CLAUDE_MODEL,
+        input_tokens=msg.usage.input_tokens, output_tokens=msg.usage.output_tokens,
+        session_id="copy_repair", session_label=f"Copy repair ({copy_type})",
+    ))
+    out = msg.content[0].text.strip()
+    if out.startswith("```"):
+        out = out.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return out.strip().strip('"').strip()
+
+
+async def _validate_and_repair(copies: list[str], copy_type: str) -> list[str]:
+    """Validate each variant; run one repair pass on any with violations, keeping
+    whichever version has fewer violations."""
+    out: list[str] = []
+    for c in copies:
+        viol = _validate_copy(c, copy_type)
+        if viol:
+            logger.warning("[copy_validator] %s has %d violation(s): %s", copy_type, len(viol), viol)
+            try:
+                repaired = await _repair_copy(c, copy_type, viol)
+                if repaired and len(_validate_copy(repaired, copy_type)) < len(viol):
+                    c = repaired
+                    residual = _validate_copy(c, copy_type)
+                    if residual:
+                        logger.warning("[copy_validator] residual %s violation(s) after repair: %s", copy_type, residual)
+            except Exception as e:
+                logger.warning("[copy_validator] repair failed, keeping original: %s", e)
+        out.append(c)
+    return out
 
 
 async def _load_brain_context(
@@ -575,6 +666,7 @@ Rules:
 - Each variant must be meaningfully different in angle/style (outcome, mechanism, segment-tension, etc.)
 - The bucket name describes the unique audience segment — use it to tailor the copy so it speaks directly to that specific niche/vertical
 - All client proof numbers must be verbatim from the provided brief — never fabricate
+- Deliverability (hard): descriptions never contain a "$" or revenue figure — express proof as activity metrics (calls/month, attendees/month, conversion %); no banned jargon (pipeline, funnel, acquisition engine, demand on repeat, qualified sales calls); no negative-comparison ("without ...", "no retainer"). Titles are "How ... using [tool]", 40-60 chars, no curiosity opener, no emoji.
 - {type_instruction}
 """
 
@@ -672,7 +764,8 @@ async def generate_bucket_copies(
     if not isinstance(copies, list) or len(copies) == 0:
         raise ValueError("Model did not return any copies")
 
-    return [str(c) for c in copies[:count]]
+    variants = [str(c) for c in copies[:count]]
+    return await _validate_and_repair(variants, copy_type)
 
 
 async def regenerate_bucket_copy(
