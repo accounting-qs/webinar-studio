@@ -640,11 +640,10 @@ You generate {type_label} for LinkedIn calendar invites that get professionals t
 ## Real Examples (STRUCTURE & VOICE ONLY — match their shape and tone; never copy their numbers, percentages, metrics, names, or claims)
 {examples_block}
 
-## Client Case Studies (use as proof — verbatim quotes and exact metrics only)
-When a case study has Metrics, the before→after numbers are the source of truth:
-do not round, paraphrase, or unit-convert them. When a case study has a
-Verbatim testimonial, you may quote from it word-for-word but never reword it.
-Pain points and Outcomes are short, client-voice fragments useful as openers.
+## Client Case Studies (proof — adapt to the target bucket)
+Pick the single best-matching case study and build the proof story from it.
+- If the client's industry MATCHES the target bucket: use their numbers verbatim (expressed as activity metrics per the guardrails) and you may quote the testimonial word-for-word.
+- If the client's industry does NOT match the bucket (adjacent or different): RECAST the client into the bucket's industry. Present the person under their real full name, but rewrite their firm/occupation/before-state so they read as operating in the target bucket's industry, and use realistic activity numbers for that niche (keep the shape of the transformation — don't inflate). Do NOT surface the client's original industry anywhere, and adapt or drop any testimonial quote that would reveal it. The reader must see someone in their OWN industry.
 
 {_format_case_studies(case_studies)}
 
@@ -665,7 +664,7 @@ Rules:
 - Examples are structural templates only — never reuse their numbers, percentages, or metrics; every value comes from the Principles and the provided brief
 - Each variant must be meaningfully different in angle/style (outcome, mechanism, segment-tension, etc.)
 - The bucket name describes the unique audience segment — use it to tailor the copy so it speaks directly to that specific niche/vertical
-- All client proof numbers must be verbatim from the provided brief — never fabricate
+- Client proof numbers: verbatim when the client's industry matches the bucket; when recasting a non-matching client into this bucket, use realistic activity numbers for the niche (never inflate)
 - Deliverability (hard): descriptions never contain a "$" or revenue figure — express proof as activity metrics (calls/month, attendees/month, conversion %); no banned jargon (pipeline, funnel, acquisition engine, demand on repeat, qualified sales calls); no negative-comparison ("without ...", "no retainer"). Titles are "How ... using [tool]", 40-60 chars, no curiosity opener, no emoji.
 - {type_instruction}
 """
@@ -696,6 +695,13 @@ def _build_copy_user_prompt(
     parts.append(
         "\nUse the business context and examples to craft copy that resonates "
         "with this specific audience segment."
+    )
+    parts.append(
+        f"\nProof-story adaptation: the client in the proof story MUST read as operating in \"{bucket_name}\". "
+        f"If the best-matching case study's client is in a different industry, recast their firm as a \"{bucket_name}\" business — "
+        f"keep the person's real full name and the shape of their transformation, but rewrite their industry, occupation, and "
+        f"before-state to fit this bucket, with realistic activity numbers for this niche. Never surface a different industry — "
+        f"the reader must see someone exactly like them."
     )
 
     return "\n".join(parts)
@@ -803,7 +809,8 @@ You are refining a {type_label} based on user feedback.
 ## Copywriting Principles (HIGHEST AUTHORITY — these override everything else, including the Examples)
 {principles_block}
 
-## Client Case Studies (use these as proof — reference real results verbatim)
+## Client Case Studies (proof — adapt to the target bucket)
+Use the best-matching case study. If the client's industry matches the bucket, use their numbers verbatim; if it does NOT match, recast the client into the bucket's industry (keep the real full name, realistic activity numbers for the niche) and never surface their original industry.
 {case_studies_block}
 
 ## Output Format
@@ -817,7 +824,8 @@ Rules:
 - Apply the feedback precisely
 - Copywriting Principles are the highest authority — keep the refined copy fully compliant with them, even over the original text
 - Keep the same general format and structure
-- All client proof numbers must be verbatim — never fabricate
+- Present the proof-story client as operating in "{bucket_name}"; recast a non-matching client into this industry with realistic numbers (never inflate)
+- Deliverability (hard): no "$"/revenue figure in descriptions (use activity metrics); no banned jargon (pipeline, funnel, acquisition engine, demand on repeat, qualified sales calls); no negative-comparison ("without ...", "no retainer"). Titles are "How ... using [tool]", 40-60 chars, no curiosity opener
 """
 
     user_msg = f"""Original {copy_type}:
@@ -857,4 +865,5 @@ Generate an improved version that addresses this feedback."""
         logger.error("JSON parse failed for regeneration: %s\nRaw: %s", e, raw[:500])
         raise ValueError(f"Model returned invalid JSON: {e}") from e
 
-    return str(result.get("copy", raw))
+    text = str(result.get("copy", raw))
+    return (await _validate_and_repair([text], copy_type))[0]
