@@ -19,6 +19,9 @@ class OutreachBucket(Base):
     countries: Mapped[Optional[dict]] = mapped_column(JSONB, server_default="[]")
     emp_range: Mapped[Optional[str]] = mapped_column(Text)
     source_file: Mapped[Optional[str]] = mapped_column(Text)
+    # Manual quality label (good/medium/bad) set on the Statistics → Segments
+    # dashboard and shown read-only on the Planning bucket picker. NULL = unmarked.
+    quality: Mapped[Optional[str]] = mapped_column(String(20))
     merged_into_bucket_id: Mapped[Optional[str]] = mapped_column(
         UUID(as_uuid=False), ForeignKey("outreach_buckets.id", ondelete="SET NULL")
     )
@@ -30,6 +33,7 @@ class OutreachBucket(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name", name="uq_outreach_buckets_user_name"),
+        CheckConstraint("quality IN ('good', 'medium', 'bad')", name="ck_outreach_buckets_quality"),
         Index("ix_outreach_buckets_user_id", "user_id"),
     )
 

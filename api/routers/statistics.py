@@ -636,6 +636,9 @@ class SegmentFunnelRow(BaseModel):
     not averaged per-webinar rates."""
     bucketId: str | None = None  # None for the "Other (no bucket)" / Total rows
     bucketName: str | None = None
+    # Manual quality label: "good" | "medium" | "bad". None on the Other/Total
+    # rows and on any bucket the operator hasn't marked yet.
+    quality: str | None = None
     invites: int
     regs: int
     attendees10m: int

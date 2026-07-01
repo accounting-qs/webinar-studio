@@ -85,6 +85,10 @@ export async function generateCalendarBlocker(
 
 /* ── Outreach: Types ───────────────────────────────────────────────────── */
 
+/** Manual segment-quality label, set on the Statistics → Segments dashboard and
+ * shown read-only on the Planning bucket picker. */
+export type BucketQuality = "good" | "medium" | "bad";
+
 export interface ApiBucket {
   id: string;
   name: string;
@@ -104,6 +108,9 @@ export interface ApiBucket {
   has_primary_description: boolean;
   title_primary_picked: boolean;
   desc_primary_picked: boolean;
+  /** Manual quality mark; null/absent when unmarked. Always present on server
+   * responses; optional so client-built placeholder buckets can omit it. */
+  quality?: BucketQuality | null;
   created_at: string | null;
   // included when ?include=copies
   titles?: ApiCopy[];
@@ -259,7 +266,7 @@ export async function createBucket(data: {
 
 export async function updateBucket(
   bucketId: string,
-  data: Partial<{ name: string; industry: string; total_contacts: number; remaining_contacts: number; countries: string[]; emp_range: string }>
+  data: Partial<{ name: string; industry: string; total_contacts: number; remaining_contacts: number; countries: string[]; emp_range: string; quality: BucketQuality | null }>
 ): Promise<ApiBucket> {
   const res = await fetch(`${API_URL}/outreach/buckets/${bucketId}`, {
     method: "PUT",
@@ -271,6 +278,15 @@ export async function updateBucket(
     throw new Error(err.detail ?? "Failed to update bucket");
   }
   return res.json();
+}
+
+/** Set (or clear, with null) a bucket's manual quality mark. Thin wrapper over
+ * updateBucket used by the Statistics → Segments dashboard. */
+export async function updateBucketQuality(
+  bucketId: string,
+  quality: BucketQuality | null,
+): Promise<ApiBucket> {
+  return updateBucket(bucketId, { quality });
 }
 
 /* ── Outreach: Copies ──────────────────────────────────────────────────── */
@@ -1598,6 +1614,8 @@ export interface SegmentFunnelRow {
   /** null on the synthetic "Other (no bucket)" and Total rows. */
   bucketId: string | null;
   bucketName: string | null;
+  /** Manual quality mark; null on Other/Total rows and unmarked buckets. */
+  quality: BucketQuality | null;
   invites: number;
   regs: number;
   attendees10m: number;

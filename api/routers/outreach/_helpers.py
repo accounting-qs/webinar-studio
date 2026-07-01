@@ -119,6 +119,7 @@ def bucket_dict(
         "countries": b.countries or [],
         "emp_range": b.emp_range,
         "source_file": b.source_file,
+        "quality": b.quality,
         "copies_count": {"titles": len(titles), "descriptions": len(descs)},
         "has_primary_title": any(c.is_primary for c in titles),
         "has_primary_description": any(c.is_primary for c in descs),

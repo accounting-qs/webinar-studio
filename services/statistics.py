@@ -559,10 +559,29 @@ async def get_statistics_segments(
         for row in webinar.get("rows", []):
             _accumulate(row.get("bucketId"), row.get("bucketName"), row.get("metrics") or {})
 
+    # Manual quality labels (good/medium/bad) for the named buckets present, so
+    # the Segments dashboard can display + edit them. Cheap point lookup by id;
+    # the ids come from the user's own snapshots, so no extra user scoping is
+    # needed. None for the "Other"/Total rows and any unmarked bucket.
+    quality_by_bucket: dict[str, str | None] = {}
+    bucket_ids = [k for k in agg if k is not None]
+    if bucket_ids:
+        from sqlalchemy import select
+        from db.session import AsyncSessionLocal
+        from db.models import OutreachBucket
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(OutreachBucket.id, OutreachBucket.quality).where(
+                    OutreachBucket.id.in_(bucket_ids)
+                )
+            )
+            quality_by_bucket = {row[0]: row[1] for row in res.all()}
+
     def _shape(slot: dict[str, Any]) -> dict[str, Any]:
         return {
             "bucketId": slot["bucketId"],
             "bucketName": slot.get("bucketName"),
+            "quality": quality_by_bucket.get(slot["bucketId"]),
             "invites": int(slot["invited"] or 0),
             "regs": int(slot["totalRegs"] or 0),
             "attendees10m": int(slot["total10MinPlus"] or 0),

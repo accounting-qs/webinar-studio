@@ -4,7 +4,7 @@ Shared across all outreach sub-routers.
 """
 
 import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -26,6 +26,9 @@ class BucketUpdate(BaseModel):
     remaining_contacts: int | None = None
     countries: list[str] | None = None
     emp_range: str | None = None
+    # Manual segment-quality label. Pass null to clear the mark. Validated here
+    # and by the ck_outreach_buckets_quality DB constraint.
+    quality: Optional[Literal["good", "medium", "bad"]] = None
 
 
 # ── Copies ─────────────────────────────────────────────────────────────────

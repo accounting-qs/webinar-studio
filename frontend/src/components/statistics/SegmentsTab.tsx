@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchStatisticsSegments,
+  updateBucketQuality,
+  type BucketQuality,
   type SegmentFunnelResponse,
   type SegmentFunnelRow,
   type SegmentFunnelWebinar,
@@ -119,6 +121,31 @@ export function SegmentsTab() {
     load(isAll ? null : Array.from(selected), true);
   }, [selected, allIds.length, load]);
 
+  // Set/clear a bucket's quality mark. Optimistically patch the row in place so
+  // the change is instant, then persist; on failure surface the error and
+  // reload to resync with the server.
+  const setSegmentQuality = useCallback(
+    async (bucketId: string, quality: BucketQuality | null) => {
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              segments: prev.segments.map((s) =>
+                s.bucketId === bucketId ? { ...s, quality } : s,
+              ),
+            }
+          : prev,
+      );
+      try {
+        await updateBucketQuality(bucketId, quality);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        refresh();
+      }
+    },
+    [refresh],
+  );
+
   if (loading) {
     return <div className="px-6 py-5 text-xs text-zinc-500">Loading…</div>;
   }
@@ -184,6 +211,7 @@ export function SegmentsTab() {
             segments={data.segments}
             totals={data.totals}
             includedCount={data.includedWebinarIds.length - data.pendingWebinarIds.length}
+            onSetQuality={setSegmentQuality}
           />
         </div>
       )}
@@ -244,10 +272,12 @@ function FunnelTable({
   segments,
   totals,
   includedCount,
+  onSetQuality,
 }: {
   segments: SegmentFunnelRow[];
   totals: SegmentFunnelRow;
   includedCount: number;
+  onSetQuality: (bucketId: string, quality: BucketQuality | null) => void;
 }) {
   // Default to invites desc — matches the server's initial ordering.
   const [sortKey, setSortKey] = useState<SortKey>("invites");
@@ -356,7 +386,7 @@ function FunnelTable({
           </thead>
           <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
             {sortedNamed.map((s) => (
-              <SegmentRow key={s.bucketId} row={s} maxes={maxes} isOther={false} />
+              <SegmentRow key={s.bucketId} row={s} maxes={maxes} isOther={false} onSetQuality={onSetQuality} />
             ))}
             {otherRows.map((s, i) => (
               <SegmentRow key={`other-${i}`} row={s} maxes={maxes} isOther />
@@ -377,14 +407,50 @@ function leaderCls(value: number | null, max: number): string {
     : "text-zinc-700 dark:text-zinc-300";
 }
 
+const QUALITY_META: Record<BucketQuality, { label: string; cls: string }> = {
+  good: { label: "Good", cls: "text-emerald-600 dark:text-emerald-400 border-emerald-500/40" },
+  medium: { label: "Medium", cls: "text-amber-600 dark:text-amber-400 border-amber-500/40" },
+  bad: { label: "Bad", cls: "text-red-600 dark:text-red-400 border-red-500/40" },
+};
+
+/** Compact colored select to mark a segment good / medium / bad (or clear). The
+ * chosen value tints the control; the mark persists on the bucket and shows up
+ * on the Planning page's bucket picker. */
+function QualitySelect({
+  value,
+  onChange,
+}: {
+  value: BucketQuality | null;
+  onChange: (q: BucketQuality | null) => void;
+}) {
+  const meta = value ? QUALITY_META[value] : null;
+  return (
+    <select
+      value={value ?? ""}
+      onChange={(e) => onChange((e.target.value || null) as BucketQuality | null)}
+      title="Mark segment quality"
+      className={`shrink-0 rounded border bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[11px] font-semibold cursor-pointer focus:outline-none focus:ring-1 focus:ring-violet-500 ${
+        meta ? meta.cls : "text-zinc-400 border-zinc-300 dark:border-zinc-700"
+      }`}
+    >
+      <option value="">— Mark —</option>
+      <option value="good">Good</option>
+      <option value="medium">Medium</option>
+      <option value="bad">Bad</option>
+    </select>
+  );
+}
+
 function SegmentRow({
   row,
   maxes,
   isOther,
+  onSetQuality,
 }: {
   row: SegmentFunnelRow;
   maxes: Record<CellKey, number>;
   isOther: boolean;
+  onSetQuality?: (bucketId: string, quality: BucketQuality | null) => void;
 }) {
   const c = deriveCells(row);
   return (
@@ -397,7 +463,15 @@ function SegmentRow({
         }`}
         title={row.bucketName ?? ""}
       >
-        {row.bucketName ?? "—"}
+        <div className="flex items-center gap-2">
+          <span className="truncate">{row.bucketName ?? "—"}</span>
+          {!isOther && row.bucketId && onSetQuality && (
+            <QualitySelect
+              value={row.quality}
+              onChange={(q) => onSetQuality(row.bucketId!, q)}
+            />
+          )}
+        </div>
       </td>
       {NUMERIC_COLUMNS.map((col) => (
         <td key={col.key} className={`${COL} ${leaderCls(c[col.key], maxes[col.key])}`}>

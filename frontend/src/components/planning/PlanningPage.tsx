@@ -336,6 +336,8 @@ interface DropdownOption {
   label: string;
   /** Optional small tag rendered next to the label (e.g. "Copy ✓"). */
   badge?: string;
+  /** Optional leading status dot (a bg-* color class), e.g. segment quality. */
+  dot?: string;
 }
 
 function OptionBadge({ text }: { text: string }) {
@@ -343,6 +345,26 @@ function OptionBadge({ text }: { text: string }) {
     <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
       {text}
     </span>
+  );
+}
+
+/** Segment-quality → dot color. Marks are set on the Statistics → Segments
+ * dashboard and shown read-only here. */
+const QUALITY_DOT: Record<string, string> = {
+  good: "bg-emerald-500",
+  medium: "bg-amber-500",
+  bad: "bg-red-500",
+};
+
+/** Small colored dot for a bucket's quality mark (null/unmarked → nothing). */
+function QualityDot({ quality }: { quality?: string | null }) {
+  const cls = quality ? QUALITY_DOT[quality] : undefined;
+  if (!cls) return null;
+  return (
+    <span
+      title={`Segment quality: ${quality}`}
+      className={`inline-block w-2 h-2 rounded-full shrink-0 ${cls}`}
+    />
   );
 }
 
@@ -395,6 +417,7 @@ function Dropdown({
         className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-left flex items-center justify-between gap-2 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
       >
         <span className="flex items-center gap-1.5 min-w-0">
+          {selected?.dot && <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${selected.dot}`} />}
           <span className={selected ? "text-zinc-800 dark:text-zinc-200 truncate" : "text-zinc-500 truncate"}>
             {selected ? selected.label : placeholder}
           </span>
@@ -435,7 +458,10 @@ function Dropdown({
                       : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60"
                   }`}
                 >
-                  <span className="truncate">{o.label}</span>
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    {o.dot && <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${o.dot}`} />}
+                    <span className="truncate">{o.label}</span>
+                  </span>
                   {o.badge && <OptionBadge text={o.badge} />}
                 </button>
               ))
@@ -1957,6 +1983,7 @@ export function PlanningPage() {
                                   value: b.id,
                                   label: `${b.name} (${b.remaining_contacts.toLocaleString()} remaining)`,
                                   badge: b.copies_count.titles > 0 && b.copies_count.descriptions > 0 ? "Copy ✓" : undefined,
+                                  dot: b.quality ? QUALITY_DOT[b.quality] : undefined,
                                 }))}
                               />
                             </div>
@@ -2138,7 +2165,15 @@ export function PlanningPage() {
                                         setAssignVolume(vol);
                                       }}
                                         className={`cursor-pointer transition-colors ${assignBucket === b.id ? "bg-violet-500/10" : "hover:bg-zinc-200 dark:hover:bg-zinc-800/30"}`}>
-                                        <td className="px-3 py-1.5 text-zinc-800 dark:text-zinc-300 font-medium">{b.name}</td>
+                                        <td className="px-3 py-1.5 text-zinc-800 dark:text-zinc-300 font-medium">
+                                          <span className="flex items-center gap-1.5 min-w-0">
+                                            <QualityDot quality={b.quality} />
+                                            <span className="truncate">{b.name}</span>
+                                            {b.copies_count.titles > 0 && b.copies_count.descriptions > 0 && (
+                                              <OptionBadge text="Copy ✓" />
+                                            )}
+                                          </span>
+                                        </td>
                                         <td className="px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400">{b.total_contacts.toLocaleString()}</td>
                                         <td className="px-3 py-1.5 text-right font-mono text-violet-400">{b.remaining_contacts.toLocaleString()}</td>
                                       </tr>
