@@ -60,6 +60,16 @@ async def _log_claude_cost(
 _client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
+# Shared authority hierarchy injected into every generation prompt. Principles
+# are supreme; examples are structural references only (never a source of values).
+_AUTHORITY_NOTE = """## Authority Order (read this first)
+When the sections below conflict, the higher-ranked one always wins — no exceptions:
+1. Copywriting Principles — the HIGHEST authority. They override the Format Rules, the Business Context, this prompt's own style labels, and especially the Examples. If a principle contradicts anything else, follow the principle.
+2. Client Case Studies / the provided brief — the only source of real client numbers, used verbatim.
+3. Format Rules and Business Context.
+4. Real Examples — the LOWEST authority. Use them for STRUCTURE, FORMAT, RHYTHM, and VOICE only. Never copy a specific value out of an example: no numbers, percentages, metrics, dollar amounts, names, dates, or claims. Treat every value shown in an example as a placeholder, not a fact to reuse — all real values come from the Principles and Case Studies above."""
+
+
 async def _load_brain_context(
     db: AsyncSession,
     user_id: str,
@@ -235,16 +245,18 @@ def _build_system_prompt(
 
 You generate calendar blocker copy (LinkedIn calendar invites): a title and description that get professionals to click YES or MAYBE to attend a webinar.
 
+{_AUTHORITY_NOTE}
+
 ## Business Context
 {universal_content}
 
 ## Format Rules
 {format_content}
 
-## Copywriting Principles
+## Copywriting Principles (HIGHEST AUTHORITY — these override everything else, including the Examples)
 {principles_block}
 
-## Real Examples (study these — match this voice and structure exactly)
+## Real Examples (STRUCTURE & VOICE ONLY — match their shape and tone; never copy their numbers, percentages, metrics, names, or claims)
 {examples_block}
 
 ## Output Format
@@ -254,19 +266,19 @@ Respond with valid JSON only. No markdown, no explanation, no preamble.
   "variants": [
     {{
       "variant": "A",
-      "style": "Curiosity-first (Revealed: style)",
-      "title": "...",
-      "description": "..."
-    }},
-    {{
-      "variant": "B",
       "style": "Outcome-first (Hormozi style)",
       "title": "...",
       "description": "..."
     }},
     {{
-      "variant": "C",
+      "variant": "B",
       "style": "Mechanism-first (Kennedy style)",
+      "title": "...",
+      "description": "..."
+    }},
+    {{
+      "variant": "C",
+      "style": "Audience segment-tension",
       "title": "...",
       "description": "..."
     }}
@@ -275,6 +287,8 @@ Respond with valid JSON only. No markdown, no explanation, no preamble.
 
 Rules:
 - Generate exactly 3 variants (A, B, C) as specified above
+- Copywriting Principles are the highest authority — if a style label above or an example conflicts with a principle, follow the principle
+- Examples are structural templates only — never reuse their numbers, percentages, or metrics; every value comes from the Principles and the provided brief
 - All client proof numbers must be verbatim from the provided brief — never fabricate
 - Each description must follow the 9-part structure from the format rules
 - Titles must pass the gut check: target segment reads it and thinks "oh shit, that's for me"
@@ -521,16 +535,18 @@ def _build_copy_system_prompt(
 
 You generate {type_label} for LinkedIn calendar invites that get professionals to attend a webinar.
 
+{_AUTHORITY_NOTE}
+
 ## Business Context
 {universal_content}
 
 ## Format Rules
 {format_content}
 
-## Copywriting Principles
+## Copywriting Principles (HIGHEST AUTHORITY — these override everything else, including the Examples)
 {principles_block}
 
-## Real Examples (study these — match this voice and structure exactly)
+## Real Examples (STRUCTURE & VOICE ONLY — match their shape and tone; never copy their numbers, percentages, metrics, names, or claims)
 {examples_block}
 
 ## Client Case Studies (use as proof — verbatim quotes and exact metrics only)
@@ -554,7 +570,9 @@ Respond with valid JSON only. No markdown, no explanation, no preamble.
 
 Rules:
 - Generate exactly {count} unique {copy_type} variants
-- Each variant must be meaningfully different in angle/style (curiosity, outcome, mechanism, etc.)
+- Copywriting Principles are the highest authority — if an example or angle conflicts with a principle, follow the principle
+- Examples are structural templates only — never reuse their numbers, percentages, or metrics; every value comes from the Principles and the provided brief
+- Each variant must be meaningfully different in angle/style (outcome, mechanism, segment-tension, etc.)
 - The bucket name describes the unique audience segment — use it to tailor the copy so it speaks directly to that specific niche/vertical
 - All client proof numbers must be verbatim from the provided brief — never fabricate
 - {type_instruction}
@@ -689,7 +707,7 @@ You are refining a {type_label} based on user feedback.
 ## Format Rules
 {format_rules}
 
-## Copywriting Principles
+## Copywriting Principles (HIGHEST AUTHORITY — these override everything else, including the Examples)
 {principles_block}
 
 ## Client Case Studies (use these as proof — reference real results verbatim)
@@ -704,6 +722,7 @@ Respond with valid JSON only. No markdown, no explanation.
 
 Rules:
 - Apply the feedback precisely
+- Copywriting Principles are the highest authority — keep the refined copy fully compliant with them, even over the original text
 - Keep the same general format and structure
 - All client proof numbers must be verbatim — never fabricate
 """
