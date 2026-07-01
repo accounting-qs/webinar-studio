@@ -15,10 +15,11 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
 from db.models import CopywritingPrinciple
-# Reuse the single Anthropic client + cost logger already used by generation.
-from services.generation import _client, _log_claude_cost
+# Anthropic key + model come from the Connectors config (same source the
+# Statistics chat assistant uses), not the hardcoded env vars.
+from services.chat_agent import get_anthropic_client, resolve_model_id
+from services.generation import _log_claude_cost
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,13 @@ async def propose_principle_changes(
     db: AsyncSession,
     user_id: str,
     instruction: str,
+    model_key: str | None = None,
 ) -> dict:
     """Ask Claude for a reconciled set of operations. Writes nothing.
+
+    Uses the Anthropic key + model configured on the Connectors page. `model_key`
+    is one of chat_agent.CHAT_MODELS ("sonnet"/"opus"); None falls back to the
+    connector default (Sonnet 4.6).
 
     Returns {"summary": str, "operations": [ {op, principle_id?, current_text?,
     new_text?, knowledge_type?, category?, reason} ]}.
@@ -128,8 +134,11 @@ async def propose_principle_changes(
         "Return the operations via the propose_brain_changes tool."
     )
 
-    message = await _client.messages.create(
-        model=settings.CLAUDE_MODEL,
+    client = await get_anthropic_client(db)
+    model_id = resolve_model_id(model_key)
+
+    message = await client.messages.create(
+        model=model_id,
         max_tokens=4096,
         system=_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
@@ -138,7 +147,7 @@ async def propose_principle_changes(
     )
 
     asyncio.create_task(_log_claude_cost(
-        model=settings.CLAUDE_MODEL,
+        model=model_id,
         input_tokens=message.usage.input_tokens,
         output_tokens=message.usage.output_tokens,
         session_id=f"{user_id}:brain_reconcile",
