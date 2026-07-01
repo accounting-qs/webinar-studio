@@ -404,17 +404,15 @@ export function VariationsModal({
                         >
                           {copiedId === v.id ? "Copied!" : "Copy"}
                         </button>
-                        {variants.length > 1 && (
-                          <button
-                            onClick={() => {
-                              if (confirm(`Delete this ${activeTab} variant?`))
-                                onDeleteVariant(bucket.id, activeTab, v.id);
-                            }}
-                            className="text-[10px] font-medium px-2 py-1 rounded-md text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-                          >
-                            Delete
-                          </button>
-                        )}
+                        <button
+                          onClick={() => {
+                            if (confirm(`Delete this ${activeTab} variant?`))
+                              onDeleteVariant(bucket.id, activeTab, v.id);
+                          }}
+                          className="text-[10px] font-medium px-2 py-1 rounded-md text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                        >
+                          Delete
+                        </button>
                       </div>
                     </div>
 
