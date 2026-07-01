@@ -198,9 +198,9 @@ export function SegmentsTab() {
           No passed webinars with statistics yet.
         </div>
       ) : (
-        <div className="flex-1 min-h-0 overflow-auto px-6 pb-6">
+        <div className="flex-1 min-h-0 flex flex-col px-6 pb-6">
           {data.pendingWebinarIds.length > 0 && (
-            <div className="mt-2 mb-3 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400 text-xs">
+            <div className="shrink-0 mt-2 mb-3 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400 text-xs">
               {data.pendingWebinarIds.length} of {data.includedWebinarIds.length}{" "}
               selected webinar{data.includedWebinarIds.length === 1 ? "" : "s"} not computed yet
               {" "}— their numbers are excluded from the totals below. Click{" "}
@@ -301,17 +301,24 @@ function FunnelTable({
     [segments],
   );
 
-  const maxes = useMemo(() => {
-    const m = {} as Record<CellKey, number>;
+  // Per-column min/max across the named bucket rows — drives both the
+  // column-leader emphasis and the red→green heatmap. "Other"/Total are
+  // excluded so a catch-all bucket doesn't skew the scale.
+  const colStats = useMemo(() => {
+    const s = {} as Record<CellKey, { min: number; max: number }>;
     for (const col of NUMERIC_COLUMNS) {
-      let best = -Infinity;
+      let min = Infinity;
+      let max = -Infinity;
       for (const c of namedCells) {
         const v = c[col.key];
-        if (v !== null && v > best) best = v;
+        if (v !== null) {
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
       }
-      m[col.key] = best;
+      s[col.key] = { min, max };
     }
-    return m;
+    return s;
   }, [namedCells]);
 
   // Sort the named bucket rows by the active column; the "Other (no bucket)" row
@@ -351,52 +358,54 @@ function FunnelTable({
     );
   }
 
+  // Sticky header: the bordered box below is the vertical scroll container, and
+  // each <th> pins to its top so the column labels stay visible while the rows
+  // scroll inside the table (not the page). Solid bg + inset bottom-border keep
+  // the header opaque and divided as rows pass under it.
   const headBase =
-    "px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800";
+    "sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
 
   return (
-    <div className="mt-2 border border-zinc-200 dark:border-zinc-800 rounded-lg overflow-hidden">
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs border-collapse">
-          <thead className="bg-zinc-50 dark:bg-zinc-900 text-[11px] uppercase tracking-wider">
-            <tr>
+    <div className="mt-2 flex-1 min-h-0 overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
+      <table className="w-full text-xs border-collapse">
+        <thead className="text-[11px] uppercase tracking-wider">
+          <tr>
+            <th
+              onClick={() => handleSort("segment")}
+              className={`${headBase} text-left min-w-[220px]`}
+            >
+              <span className="inline-flex items-center gap-1">
+                Segment
+                <SortArrow active={sortKey === "segment"} dir={sortDir} />
+              </span>
+            </th>
+            {NUMERIC_COLUMNS.map((col) => (
               <th
-                onClick={() => handleSort("segment")}
-                className={`${headBase} text-left min-w-[220px]`}
+                key={col.key}
+                onClick={() => handleSort(col.key)}
+                title={col.title}
+                className={`${headBase} text-right`}
               >
-                <span className="inline-flex items-center gap-1">
-                  Segment
-                  <SortArrow active={sortKey === "segment"} dir={sortDir} />
+                <span className="inline-flex items-center justify-end gap-1">
+                  {col.label}
+                  <SortArrow active={sortKey === col.key} dir={sortDir} />
                 </span>
               </th>
-              {NUMERIC_COLUMNS.map((col) => (
-                <th
-                  key={col.key}
-                  onClick={() => handleSort(col.key)}
-                  title={col.title}
-                  className={`${headBase} text-right`}
-                >
-                  <span className="inline-flex items-center justify-end gap-1">
-                    {col.label}
-                    <SortArrow active={sortKey === col.key} dir={sortDir} />
-                  </span>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
-            {sortedNamed.map((s) => (
-              <SegmentRow key={s.bucketId} row={s} maxes={maxes} isOther={false} onSetQuality={onSetQuality} />
             ))}
-            {otherRows.map((s, i) => (
-              <SegmentRow key={`other-${i}`} row={s} maxes={maxes} isOther />
-            ))}
-          </tbody>
-          <tfoot>
-            <TotalsRow totals={totals} includedCount={includedCount} />
-          </tfoot>
-        </table>
-      </div>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
+          {sortedNamed.map((s) => (
+            <SegmentRow key={s.bucketId} row={s} colStats={colStats} isOther={false} onSetQuality={onSetQuality} />
+          ))}
+          {otherRows.map((s, i) => (
+            <SegmentRow key={`other-${i}`} row={s} colStats={colStats} isOther />
+          ))}
+        </tbody>
+        <tfoot>
+          <TotalsRow totals={totals} includedCount={includedCount} />
+        </tfoot>
+      </table>
     </div>
   );
 }
@@ -405,6 +414,32 @@ function leaderCls(value: number | null, max: number): string {
   return value !== null && value === max && Number.isFinite(max)
     ? "font-bold text-zinc-900 dark:text-zinc-100"
     : "text-zinc-700 dark:text-zinc-300";
+}
+
+/** Red→amber→green heat background for a cell, positioned by where its value
+ * falls in the column's [min,max] (higher = greener, for every metric). Returns
+ * a translucent rgba so it reads on both light and dark rows, or undefined when
+ * there's nothing to scale (null value, or a single distinct value). */
+function heatBg(value: number | null, min: number, max: number): string | undefined {
+  if (value === null || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+    return undefined;
+  }
+  const t = (value - min) / (max - min); // 0 = worst (red), 1 = best (green)
+  const stops: [number, number, number][] = [
+    [239, 68, 68], // red-500
+    [245, 158, 11], // amber-500
+    [34, 197, 94], // green-500
+  ];
+  const i = t < 0.5 ? 0 : 1;
+  const lt = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+  const a = stops[i];
+  const b = stops[i + 1];
+  const r = Math.round(a[0] + (b[0] - a[0]) * lt);
+  const g = Math.round(a[1] + (b[1] - a[1]) * lt);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * lt);
+  // Fainter near the middle, stronger at the best/worst extremes.
+  const alpha = 0.16 + 0.24 * Math.abs(2 * t - 1);
+  return `rgba(${r}, ${g}, ${bl}, ${alpha.toFixed(3)})`;
 }
 
 const QUALITY_META: Record<BucketQuality, { label: string; cls: string }> = {
@@ -443,12 +478,12 @@ function QualitySelect({
 
 function SegmentRow({
   row,
-  maxes,
+  colStats,
   isOther,
   onSetQuality,
 }: {
   row: SegmentFunnelRow;
-  maxes: Record<CellKey, number>;
+  colStats: Record<CellKey, { min: number; max: number }>;
   isOther: boolean;
   onSetQuality?: (bucketId: string, quality: BucketQuality | null) => void;
 }) {
@@ -473,11 +508,22 @@ function SegmentRow({
           )}
         </div>
       </td>
-      {NUMERIC_COLUMNS.map((col) => (
-        <td key={col.key} className={`${COL} ${leaderCls(c[col.key], maxes[col.key])}`}>
-          {col.fmt(c)}
-        </td>
-      ))}
+      {NUMERIC_COLUMNS.map((col) => {
+        const v = c[col.key];
+        const { min, max } = colStats[col.key];
+        // Heat only the named segment rows; the "Other (no bucket)" catch-all
+        // isn't part of the comparison set.
+        const bg = isOther ? undefined : heatBg(v, min, max);
+        return (
+          <td
+            key={col.key}
+            style={bg ? { backgroundColor: bg } : undefined}
+            className={`${COL} ${leaderCls(v, max)}`}
+          >
+            {col.fmt(c)}
+          </td>
+        );
+      })}
     </tr>
   );
 }
