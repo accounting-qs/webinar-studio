@@ -1101,6 +1101,38 @@ export async function deletePrinciple(id: string): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete principle");
 }
 
+// Reconcile — turn a natural-language instruction into proposed changes
+export interface ApiReconcileOperation {
+  op: "add" | "edit" | "delete";
+  principle_id?: string | null;
+  current_text?: string | null;
+  new_text?: string | null;
+  knowledge_type?: string | null;
+  category?: string | null;
+  reason?: string | null;
+}
+
+export interface ApiReconcileProposal {
+  summary: string;
+  operations: ApiReconcileOperation[];
+}
+
+export async function proposePrincipleChanges(instruction: string): Promise<ApiReconcileProposal> {
+  const res = await fetch(`${API_URL}/outreach/brain/principles/reconcile`, {
+    method: "POST", headers: jsonHeaders(), body: JSON.stringify({ instruction }),
+  });
+  if (!res.ok) throw new Error("Failed to get proposed changes");
+  return res.json();
+}
+
+export async function applyPrincipleChanges(operations: ApiReconcileOperation[]): Promise<ApiPrinciple[]> {
+  const res = await fetch(`${API_URL}/outreach/brain/principles/reconcile/apply`, {
+    method: "POST", headers: jsonHeaders(), body: JSON.stringify({ operations }),
+  });
+  if (!res.ok) throw new Error("Failed to apply changes");
+  return res.json();
+}
+
 // Case Studies
 export async function fetchCaseStudies(): Promise<ApiCaseStudy[]> {
   const res = await fetch(`${API_URL}/outreach/brain/case-studies`, { headers: authHeaders() });

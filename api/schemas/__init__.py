@@ -190,3 +190,18 @@ class CaseStudyImportRequest(BaseModel):
 
 class BrainContentUpdate(BaseModel):
     brain_content: str
+
+class PrincipleReconcileRequest(BaseModel):
+    instruction: str
+
+class PrincipleReconcileOperation(BaseModel):
+    op: str  # add | edit | delete
+    principle_id: str | None = None
+    current_text: str | None = None
+    new_text: str | None = None
+    knowledge_type: str | None = None
+    category: str | None = None
+    reason: str | None = None
+
+class PrincipleReconcileApply(BaseModel):
+    operations: list[PrincipleReconcileOperation] = []

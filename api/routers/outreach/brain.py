@@ -11,14 +11,18 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID
 from api.schemas import (
     PrincipleCreate, PrincipleUpdate,
+    PrincipleReconcileRequest, PrincipleReconcileApply,
     CaseStudyCreate, CaseStudyUpdate, CaseStudyImportRequest,
     BrainContentUpdate,
 )
 from db.models import CopywritingPrinciple, CaseStudy, UniversalBrain, FormatBrain
 from db.session import get_db
+from services.brain_reconcile import propose_principle_changes
 from services.case_study_import import (
     CaseStudyImportError, import_case_study_from_url,
 )
+
+VALID_KNOWLEDGE_TYPES = ("brand", "copy_general", "copy_format", "learned")
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,90 @@ async def delete_principle(
         raise HTTPException(404, "Principle not found")
     p.deleted_at = datetime.now(timezone.utc)
     await db.flush()
+
+
+@router.post("/brain/principles/reconcile")
+async def reconcile_principles(
+    body: PrincipleReconcileRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Given a natural-language instruction, return a proposed set of add/edit/delete
+    operations reconciled against the whole principle library. Writes nothing."""
+    instruction = (body.instruction or "").strip()
+    if not instruction:
+        raise HTTPException(400, "instruction is required")
+    try:
+        return await propose_principle_changes(db, LLOYD_USER_ID, instruction)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.post("/brain/principles/reconcile/apply")
+async def apply_reconcile(
+    body: PrincipleReconcileApply,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Apply an approved set of reconcile operations in one transaction."""
+    from datetime import datetime, timezone
+
+    max_order = await db.scalar(
+        select(CopywritingPrinciple.display_order).where(
+            CopywritingPrinciple.user_id == LLOYD_USER_ID,
+            CopywritingPrinciple.deleted_at.is_(None),
+        ).order_by(CopywritingPrinciple.display_order.desc()).limit(1)
+    )
+    next_order = (max_order or 0) + 1
+
+    for op in body.operations:
+        kind = op.op
+        if kind == "add":
+            text = (op.new_text or "").strip()
+            if not text:
+                continue
+            kt = op.knowledge_type if op.knowledge_type in VALID_KNOWLEDGE_TYPES else "copy_general"
+            db.add(CopywritingPrinciple(
+                user_id=LLOYD_USER_ID,
+                principle_text=text,
+                knowledge_type=kt,
+                category=op.category,
+                source="authored",
+                display_order=next_order,
+                is_active=True,
+            ))
+            next_order += 1
+        elif kind in ("edit", "delete"):
+            if not op.principle_id:
+                continue
+            p = await db.scalar(
+                select(CopywritingPrinciple).where(
+                    CopywritingPrinciple.id == op.principle_id,
+                    CopywritingPrinciple.user_id == LLOYD_USER_ID,
+                    CopywritingPrinciple.deleted_at.is_(None),
+                )
+            )
+            if not p:
+                continue
+            if kind == "edit":
+                text = (op.new_text or "").strip()
+                if text:
+                    p.principle_text = text
+                if op.category is not None:
+                    p.category = op.category
+            else:  # delete
+                p.deleted_at = datetime.now(timezone.utc)
+                p.is_active = False
+
+    await db.flush()
+
+    result = await db.execute(
+        select(CopywritingPrinciple).where(
+            CopywritingPrinciple.user_id == LLOYD_USER_ID,
+            CopywritingPrinciple.deleted_at.is_(None),
+        ).order_by(CopywritingPrinciple.display_order, CopywritingPrinciple.created_at)
+    )
+    return [_principle_dict(p) for p in result.scalars().all()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

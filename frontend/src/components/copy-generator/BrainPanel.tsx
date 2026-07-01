@@ -3,10 +3,12 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   fetchPrinciples, createPrinciple, updatePrinciple, deletePrinciple,
+  proposePrincipleChanges, applyPrincipleChanges,
   fetchCaseStudies, createCaseStudy as apiCreateCaseStudy, updateCaseStudy as apiUpdateCaseStudy, deleteCaseStudy as apiDeleteCaseStudy,
   importCaseStudyFromUrl, reextractCaseStudy,
   fetchBrainContent, updateUniversalBrain, updateFormatBrain,
   type ApiPrinciple, type ApiCaseStudy, type ApiBrainContent,
+  type ApiReconcileProposal,
 } from "@/lib/api";
 
 /* ─── Spinner ─────────────────────────────────────────────────────────── */
@@ -31,6 +33,13 @@ function Field({ label, value }: { label: string; value: string }) {
 
 /* ─── Principles Tab ──────────────────────────────────────────────────── */
 
+const OP_BADGE: Record<string, string> = {
+  add: "bg-emerald-100 dark:bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+  edit: "bg-amber-100 dark:bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  delete: "bg-red-100 dark:bg-red-500/15 text-red-600 dark:text-red-400",
+};
+const OP_LABEL: Record<string, string> = { add: "Add", edit: "Edit", delete: "Delete" };
+
 function PrinciplesTab() {
   const [principles, setPrinciples] = useState<ApiPrinciple[]>([]);
   const [loading, setLoading] = useState(true);
@@ -39,8 +48,58 @@ function PrinciplesTab() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
 
+  // AI reconcile (chat-to-update) state
+  const [chatInput, setChatInput] = useState("");
+  const [proposing, setProposing] = useState(false);
+  const [proposal, setProposal] = useState<ApiReconcileProposal | null>(null);
+  const [accepted, setAccepted] = useState<boolean[]>([]);
+  const [applying, setApplying] = useState(false);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+
   useEffect(() => {
     fetchPrinciples().then(setPrinciples).catch(console.error).finally(() => setLoading(false));
+  }, []);
+
+  const handlePropose = useCallback(async () => {
+    const instruction = chatInput.trim();
+    if (!instruction) return;
+    setProposing(true);
+    setReconcileError(null);
+    setProposal(null);
+    try {
+      const p = await proposePrincipleChanges(instruction);
+      setProposal(p);
+      setAccepted(p.operations.map(() => true));
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed to get proposed changes");
+    } finally {
+      setProposing(false);
+    }
+  }, [chatInput]);
+
+  const handleApplyProposal = useCallback(async () => {
+    if (!proposal) return;
+    const ops = proposal.operations.filter((_, i) => accepted[i]);
+    if (ops.length === 0) { setProposal(null); setChatInput(""); return; }
+    setApplying(true);
+    setReconcileError(null);
+    try {
+      const updated = await applyPrincipleChanges(ops);
+      setPrinciples(updated);
+      setProposal(null);
+      setAccepted([]);
+      setChatInput("");
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed to apply changes");
+    } finally {
+      setApplying(false);
+    }
+  }, [proposal, accepted]);
+
+  const handleDiscardProposal = useCallback(() => {
+    setProposal(null);
+    setAccepted([]);
+    setReconcileError(null);
   }, []);
 
   const handleAdd = useCallback(async () => {
@@ -86,6 +145,100 @@ function PrinciplesTab() {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-xs text-zinc-500">{active.length} active, {inactive.length} inactive</span>
+      </div>
+
+      {/* AI: chat to update the brain */}
+      <div className="rounded-xl border border-violet-200 dark:border-violet-500/25 bg-violet-50/30 dark:bg-violet-500/5 p-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <svg className="w-4 h-4 text-violet-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+          </svg>
+          <h3 className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">Update with AI</h3>
+          <span className="text-[10px] text-zinc-500">
+            Describe a change — the AI reviews every principle and proposes edits. Nothing changes until you approve.
+          </span>
+        </div>
+
+        <textarea
+          value={chatInput}
+          onChange={(e) => setChatInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !proposing) handlePropose(); }}
+          placeholder="e.g. 'Stop using dollar amounts in calendar invites' or 'Always name the webinar host in the description'"
+          rows={2}
+          className="w-full bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 focus:outline-none focus:ring-1 focus:ring-violet-500 resize-vertical leading-relaxed"
+        />
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handlePropose}
+            disabled={!chatInput.trim() || proposing}
+            className="px-4 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+          >
+            {proposing && <Spinner />} Review changes
+          </button>
+          <span className="text-[10px] text-zinc-400">⌘/Ctrl + Enter</span>
+          {reconcileError && <span className="text-[11px] text-red-500">{reconcileError}</span>}
+        </div>
+
+        {/* Proposed changes — review & approve */}
+        {proposal && (
+          <div className="space-y-2 pt-1 border-t border-violet-200/60 dark:border-violet-500/20">
+            {proposal.summary && (
+              <p className="text-xs text-zinc-600 dark:text-zinc-300 pt-2">{proposal.summary}</p>
+            )}
+            {proposal.operations.length === 0 ? (
+              <p className="text-xs text-zinc-500">No changes needed — this is already covered by the existing principles.</p>
+            ) : (
+              <>
+                <div className="space-y-1.5">
+                  {proposal.operations.map((op, i) => (
+                    <div
+                      key={i}
+                      className={`rounded-lg border p-2.5 transition-opacity ${
+                        accepted[i]
+                          ? "border-zinc-200 dark:border-zinc-700/50 bg-white dark:bg-zinc-900/60"
+                          : "border-zinc-100 dark:border-zinc-800/30 opacity-45"
+                      }`}
+                    >
+                      <div className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          checked={accepted[i] ?? false}
+                          onChange={() => setAccepted(a => a.map((v, idx) => idx === i ? !v : v))}
+                          className="mt-0.5 accent-violet-600 shrink-0"
+                        />
+                        <div className="flex-1 min-w-0 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${OP_BADGE[op.op] ?? ""}`}>
+                              {OP_LABEL[op.op] ?? op.op}
+                            </span>
+                            {op.reason && <span className="text-[11px] text-zinc-500">{op.reason}</span>}
+                          </div>
+                          {(op.op === "edit" || op.op === "delete") && op.current_text && (
+                            <p className="text-xs text-zinc-500 line-through decoration-red-400/60 leading-relaxed">{op.current_text}</p>
+                          )}
+                          {(op.op === "edit" || op.op === "add") && op.new_text && (
+                            <p className="text-xs text-zinc-800 dark:text-zinc-200 leading-relaxed">{op.new_text}</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    onClick={handleApplyProposal}
+                    disabled={applying || accepted.every(a => !a)}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                  >
+                    {applying && <Spinner />} Apply {accepted.filter(Boolean).length} change{accepted.filter(Boolean).length === 1 ? "" : "s"}
+                  </button>
+                  <button onClick={handleDiscardProposal} className="px-3 py-2 text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300">Discard</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Add new */}
