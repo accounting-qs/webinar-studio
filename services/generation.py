@@ -102,8 +102,6 @@ def _validate_copy(text: str, copy_type: str) -> list[str]:
             violations.append(f"length {n} chars (must be 40-60)")
         if _RE_REVEAL.search(text):
             violations.append("curiosity/reveal opener")
-        if not re.match(r"^\s*how\b", text, re.I):
-            violations.append('not "How ..." framing')
         if _RE_THE_USE_TO.search(text):
             violations.append('banned "The ... Use to" construction')
     return violations
@@ -159,6 +157,72 @@ async def _validate_and_repair(copies: list[str], copy_type: str) -> list[str]:
                 logger.warning("[copy_validator] repair failed, keeping original: %s", e)
         out.append(c)
     return out
+
+
+def _first_word(t: str) -> str:
+    return (t.strip().split() or [""])[0].lower().strip(":,")
+
+
+async def _repair_title_structure(text: str, avoid_word: str) -> str | None:
+    """Rewrite a title with a different opening structure to break variant sameness.
+    Returns the raw rewrite (length/bans are enforced by the caller)."""
+    prompt = (
+        f'Rewrite this calendar-invite title with a COMPLETELY DIFFERENT opening. It currently starts with '
+        f'"{avoid_word}" — the new version must NOT start with "{avoid_word}". Use an outcome-first statement '
+        f'(lead with the result) or a segment-tension/question opener. Keep it under 60 characters, name the audience '
+        f'segment and the tool (AI Webinars), no curiosity/reveal opener, no "The ... Use to" construction, no emoji. '
+        f'Return ONLY the rewritten title.\n\nTITLE: {text}'
+    )
+    msg = await _client.messages.create(
+        model=settings.CLAUDE_MODEL, max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    out = msg.content[0].text.strip().strip('"').strip()
+    return out or None
+
+
+async def _diversify_titles(titles: list[str]) -> list[str]:
+    """Ensure title variants don't all share the same opening word (e.g. all 'How ...').
+    Repairs later duplicates into a different opening; retries, then enforces length/bans."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in titles:
+        first = _first_word(t)
+        attempts = 0
+        while first in seen and attempts < 2:
+            attempts += 1
+            try:
+                repaired = await _repair_title_structure(t, first)
+            except Exception as e:
+                logger.warning("[title_diversify] repair failed: %s", e)
+                break
+            if not repaired:
+                break
+            repaired = (await _validate_and_repair([repaired], "title"))[0]
+            t = repaired
+            first = _first_word(t)
+        seen.add(first)
+        out.append(t)
+    return out
+
+
+async def _gate_variants(result: dict) -> dict:
+    """Run the deliverability validator/repair over each A/B/C variant's title +
+    description, then diversify the titles (used by the segment-based generator)."""
+    variants = result.get("variants") if isinstance(result, dict) else None
+    if isinstance(variants, list):
+        dict_variants = [v for v in variants if isinstance(v, dict)]
+        for v in dict_variants:
+            if v.get("title"):
+                v["title"] = (await _validate_and_repair([str(v["title"])], "title"))[0]
+            if v.get("description"):
+                v["description"] = (await _validate_and_repair([str(v["description"])], "description"))[0]
+        titled = [v for v in dict_variants if v.get("title")]
+        if len(titled) >= 2:
+            div = await _diversify_titles([str(v["title"]) for v in titled])
+            for v, nt in zip(titled, div):
+                v["title"] = nt
+    return result
 
 
 async def _load_brain_context(
@@ -381,6 +445,8 @@ Rules:
 - Copywriting Principles are the highest authority — if a style label above or an example conflicts with a principle, follow the principle
 - Examples are structural templates only — never reuse their numbers, percentages, or metrics; every value comes from the Principles and the provided brief
 - All client proof numbers must be verbatim from the provided brief — never fabricate
+- If the proof-story client's industry doesn't match the target segment, recast them into the segment's industry (keep the real name, realistic numbers) — never surface a different industry
+- Deliverability (hard): descriptions never contain a "$" or revenue figure — use activity metrics (calls/month, attendees/month, conversion %); no banned jargon (pipeline, funnel, acquisition engine, demand on repeat, qualified sales calls); no negative-comparison ("without ...", "no retainer"). Titles are "How ... using [tool]", 40-60 chars, no curiosity opener, no emoji.
 - Each description must follow the 9-part structure from the format rules
 - Titles must pass the gut check: target segment reads it and thinks "oh shit, that's for me"
 """
@@ -462,7 +528,7 @@ async def generate_calendar_blocker(
         logger.error("JSON parse failed: %s\nRaw: %s", e, raw[:500])
         raise ValueError(f"Model returned invalid JSON: {e}") from e
 
-    return result
+    return await _gate_variants(result)
 
 
 async def stream_calendar_blocker(
@@ -512,6 +578,7 @@ async def stream_calendar_blocker(
 
     try:
         result = json.loads(raw)
+        result = await _gate_variants(result)
         yield f"data: {json.dumps({'type': 'done', 'result': result})}\n\n"
     except json.JSONDecodeError as e:
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -771,7 +838,10 @@ async def generate_bucket_copies(
         raise ValueError("Model did not return any copies")
 
     variants = [str(c) for c in copies[:count]]
-    return await _validate_and_repair(variants, copy_type)
+    gated = await _validate_and_repair(variants, copy_type)
+    if copy_type == "title":
+        gated = await _diversify_titles(gated)
+    return gated
 
 
 async def regenerate_bucket_copy(
