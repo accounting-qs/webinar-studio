@@ -314,6 +314,10 @@ def _process_raw_webinar(w: dict[str, Any], source_label: str) -> dict[str, Any]
             }
             for i, r in enumerate(processed_rows)
         ],
+        # Per (data-source, vintage) funnel cells for the By List Source tab.
+        # Raw counts, passed through untouched — the frontend derives rates from
+        # the sums (same convention as the Segments tab).
+        "sourceRows": w.get("sourceRows", []),
     }
 
 
@@ -614,5 +618,154 @@ async def get_statistics_segments(
         "includedWebinarIds": target_ids,
         "pendingWebinarIds": pending_ids,
         "segments": segments,
+        "totals": totals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# By-source funnel aggregation (By List Source tab)
+# ---------------------------------------------------------------------------
+# Raw keys carried on each source cell (mirror
+# ghl_statistics_source.SOURCE_FUNNEL_RAW_KEYS). Percentages are derived from
+# these sums downstream (never averaged), same convention as the Segments tab.
+_SOURCE_RAW_KEYS = ("invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings")
+
+
+def _shape_source_funnel(raw: dict[str, Any]) -> dict[str, int]:
+    """Raw metric sums -> the funnel counts the frontend expects. Shares field
+    names with the Segments tab so the same table/heatmap renders both."""
+    return {
+        "invites": int(raw.get("invited") or 0),
+        "regs": int(raw.get("totalRegs") or 0),
+        "attendees10m": int(raw.get("total10MinPlus") or 0),
+        "bookings": int(raw.get("totalBookings") or 0),
+    }
+
+
+def _accumulate_source_rows(agg: dict[str, dict[str, Any]], source_rows: list[dict[str, Any]]) -> None:
+    """Fold a webinar's sourceRows cells into `agg` keyed by source, keeping a
+    nested per-vintage rollup: agg[source] = {raw..., 'vintages': {vintage: raw...}}."""
+    for cell in source_rows or []:
+        src = cell.get("source") or "Unlabeled"
+        vintage = cell.get("vintage") or "(undated)"
+        metrics = cell.get("metrics") or {}
+        slot = agg.get(src)
+        if slot is None:
+            slot = {k: 0.0 for k in _SOURCE_RAW_KEYS}
+            slot["vintages"] = {}
+            agg[src] = slot
+        vslot = slot["vintages"].get(vintage)
+        if vslot is None:
+            vslot = {k: 0.0 for k in _SOURCE_RAW_KEYS}
+            slot["vintages"][vintage] = vslot
+        for k in _SOURCE_RAW_KEYS:
+            v = metrics.get(k)
+            if v is not None:
+                slot[k] += float(v)
+                vslot[k] += float(v)
+
+
+def _shape_source_agg(agg: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn the {source: {...}} accumulator into source rows (invites desc),
+    each with nested vintage rows (invites desc)."""
+    rows: list[dict[str, Any]] = []
+    for src, slot in agg.items():
+        vintages = [
+            {"vintage": vintage, **_shape_source_funnel(vraw)}
+            for vintage, vraw in slot["vintages"].items()
+        ]
+        vintages.sort(key=lambda r: r["invites"], reverse=True)
+        rows.append({"source": src, **_shape_source_funnel(slot), "vintages": vintages})
+    rows.sort(key=lambda r: r["invites"], reverse=True)
+    return rows
+
+
+async def get_statistics_by_source(
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-webinar sourceRows into a by-data-source funnel — the data
+    behind the "By List Source" tab.
+
+    Returns a cross-webinar aggregate (`bySource`, each row carrying nested
+    `vintages`) plus a `perWebinar` breakdown (same shape per webinar), over the
+    selected webinars (default: all passed). Reads snapshots only — no live
+    compute — exactly like get_statistics_segments; webinars without a snapshot
+    yet are reported as `pendingWebinarIds`. Only raw counts are returned; the
+    frontend derives the funnel percentages from the summed counts.
+    """
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    passed.sort(key=lambda s: (s.get("date") or "", s.get("variantLabel") or ""), reverse=True)
+
+    webinar_options = [
+        {
+            "webinarId": s.get("webinarId"),
+            "number": s.get("number"),
+            "variantLabel": s.get("variantLabel"),
+            "date": s.get("date"),
+            "title": s.get("title"),
+            "label": _segment_webinar_label(s),
+        }
+        for s in passed
+        if s.get("webinarId")
+    ]
+
+    all_ids = [o["webinarId"] for o in webinar_options]
+    if webinar_ids:
+        wanted = set(webinar_ids)
+        target_ids = [i for i in all_ids if i in wanted]
+    else:
+        target_ids = all_ids
+
+    try:
+        from services import statistics_snapshot as snap
+        payloads = await snap.read_all_payloads(source)
+    except Exception:
+        payloads = {}
+
+    option_by_id = {o["webinarId"]: o for o in webinar_options}
+    overall: dict[str, dict[str, Any]] = {}
+    per_webinar: list[dict[str, Any]] = []
+    pending_ids: list[str] = []
+    for wid in target_ids:
+        webinar = payloads.get(wid)
+        if not webinar:
+            pending_ids.append(wid)
+            continue
+        src_rows = webinar.get("sourceRows")
+        if src_rows is None:
+            # Snapshot predates the By List Source feature — it has no sourceRows
+            # until a recompute rebuilds it. Treat as pending so the UI prompts a
+            # rebuild instead of silently showing empty tables.
+            pending_ids.append(wid)
+            continue
+        _accumulate_source_rows(overall, src_rows)
+        one: dict[str, dict[str, Any]] = {}
+        _accumulate_source_rows(one, src_rows)
+        opt = option_by_id.get(wid, {})
+        per_webinar.append({
+            "webinarId": wid,
+            "number": opt.get("number"),
+            "variantLabel": opt.get("variantLabel"),
+            "date": opt.get("date"),
+            "label": opt.get("label"),
+            "bySource": _shape_source_agg(one),
+        })
+
+    by_source = _shape_source_agg(overall)
+    totals = {
+        "source": "Total",
+        "invites": sum(r["invites"] for r in by_source),
+        "regs": sum(r["regs"] for r in by_source),
+        "attendees10m": sum(r["attendees10m"] for r in by_source),
+        "bookings": sum(r["bookings"] for r in by_source),
+    }
+    return {
+        "webinars": webinar_options,
+        "includedWebinarIds": target_ids,
+        "pendingWebinarIds": pending_ids,
+        "bySource": by_source,
+        "perWebinar": per_webinar,
         "totals": totals,
     }

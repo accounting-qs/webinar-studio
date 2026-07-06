@@ -202,6 +202,86 @@ def _webinar_series_regex(webinar_number: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lead-source parsing (for the "By List Source" statistics tab)
+# ---------------------------------------------------------------------------
+# Raw metric keys summed per (source, vintage) cell. Kept identical to the
+# Segments tab's _FUNNEL_RAW_KEYS so the aggregate + frontend reuse the same
+# funnel-derivation logic (percentages derived from these sums, never averaged).
+SOURCE_FUNNEL_RAW_KEYS = (
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+)
+
+# lead_list_name usually leads with the data provider, e.g.
+# "Ampleleads, Apr 1 2026, Agencies, 0-10 employees, US". Match case-insensitively
+# on a substring so casing/typos ("Ampleleads"/"AmpleLeads") collapse together.
+_SOURCE_ALIASES: tuple[tuple[str, str], ...] = (
+    ("ampleleads", "AmpleLeads"),
+    ("findylead", "FindyLeads"),
+    ("doctor lead", "Doctor Lead"),
+    ("zoominfo", "ZoomInfo"),
+    ("apollo", "Apollo"),
+)
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7,
+    "aug": 8, "sept": 9, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_MONTH_RE = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)", re.I)
+_YEAR_RE = re.compile(r"(20\d{2})")
+_FL_PREFIX_RE = re.compile(r"^\s*fl[\s,]", re.I)
+
+
+def _lead_source_from_list_name(name: str | None) -> str:
+    """Map a free-text contacts.lead_list_name to a canonical data-source label.
+
+    e.g. "Ampleleads, Apr 1 2026, Agencies, ..." -> "AmpleLeads";
+         "findyLeads, Nov 24, ..." / "FL, Oct 14, ..." -> "FindyLeads".
+    Unknown providers fall back to their first comma-token; date-led labels
+    (no provider prefix) become "Other"; blank -> "Unlabeled".
+    """
+    if not name or not name.strip():
+        return "Unlabeled"
+    low = name.lower()
+    for needle, label in _SOURCE_ALIASES:
+        if needle in low:
+            return label
+    if _FL_PREFIX_RE.match(name):
+        return "FindyLeads"
+    first = name.split(",")[0].strip()
+    # If the label leads with a date/number rather than a provider, treat it as
+    # unlabeled rather than inventing a source from a date token.
+    if first and not first[0].isdigit() and not _MONTH_RE.match(first):
+        return first[:24]
+    return "Other"
+
+
+def _lead_vintage_from_list_name(name: str | None, webinar_date) -> str:
+    """Best-effort list vintage as "YYYY-MM" parsed from lead_list_name.
+
+    Labels are inconsistent: some carry a 4-digit year ("Apr 1 2026",
+    "Sept 8 2025"), many omit it ("Nov 24", "Mar 11" — here the trailing number
+    is a day, not a year). When the year is absent we infer the most-recent-past
+    occurrence of that month relative to the webinar date: e.g. "Nov 24" on a
+    Jun-2026 webinar -> 2025-11. Returns "(undated)" when no month is present.
+    Heuristic by necessity — adjust here if the labeling convention changes.
+    """
+    if not name:
+        return "(undated)"
+    mm = _MONTH_RE.search(name)
+    ym = _YEAR_RE.search(name)
+    if not mm:
+        return f"{ym.group(1)}-01" if ym else "(undated)"
+    month = _MONTHS[mm.group(1).lower()]
+    if ym:
+        year = int(ym.group(1))
+    else:
+        wy = webinar_date.year if webinar_date else datetime.now(timezone.utc).year
+        wm = webinar_date.month if webinar_date else 12
+        year = wy if month <= wm else wy - 1
+    return f"{year}-{month:02d}"
+
+
+# ---------------------------------------------------------------------------
 # Aggregation query helpers
 # ---------------------------------------------------------------------------
 
@@ -637,6 +717,10 @@ class GoHighLevelStatisticsSource:
 
             rows.extend(synthetic)
 
+            # Per (data-source, vintage) funnel cells — powers the By List
+            # Source tab. Additive: rides the cached snapshot payload.
+            source_rows = await self._compute_per_source_cells(db, w)
+
         return {
             "number": w.number,
             "variantLabel": w.variant_label,
@@ -645,6 +729,7 @@ class GoHighLevelStatisticsSource:
             "title": w.main_title,
             "workbookRow": 0,
             "rows": rows,
+            "sourceRows": source_rows,
             "summary": summary,
             "status": w.status,
             # Operators read this on the stats page to know whether
@@ -1537,6 +1622,113 @@ class GoHighLevelStatisticsSource:
                 m.setdefault(k, 0)
 
         return out
+
+
+    async def _compute_per_source_cells(
+        self, db: AsyncSession, w: Webinar,
+    ) -> list[dict[str, Any]]:
+        """Per (data-source, vintage) funnel cells for a webinar's cold lists —
+        the data behind the "By List Source" tab.
+
+        Mirrors _compute_per_list_metrics' definitions of registered
+        (webinargeek_subscribers presence), attended (watched_live OR
+        minutes_viewing>0 / >=10) and booked (opp.webinar_source_number OR
+        ghl_contact.booked_call_webinar_series = N), but groups by
+        contacts.lead_list_name instead of assignment_id, then rolls the raw
+        list names up to (source, vintage) via the parser helpers. Nonjoiners /
+        no-list-data assignments are excluded — this tab is about cold sourcing.
+        invited = distinct cold contacts of that list (actual leads mailed, not
+        the planned volume the per-list rows use).
+        """
+        from sqlalchemy import text as sa_text
+
+        wid = w.id
+        N = w.number
+        bid = w.broadcast_id
+        cold = (
+            "COALESCE(wla.is_nonjoiners, false) = false "
+            "AND COALESCE(wla.is_no_list_data, false) = false"
+        )
+        lln_expr = "COALESCE(NULLIF(c.lead_list_name, ''), '(no label)')"
+
+        # {lead_list_name: {raw metric: count}} — merged across the batches.
+        raw: dict[str, dict[str, int]] = {}
+
+        # invited: distinct cold contacts per list name.
+        inv_sql = f"""
+            SELECT {lln_expr} AS lln, COUNT(DISTINCT LOWER(c.email)) AS invited
+            FROM contacts c
+            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            GROUP BY 1
+        """
+        r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
+        for row in r.mappings().all():
+            raw.setdefault(row["lln"], {})["invited"] = int(row["invited"] or 0)
+
+        # regs / attended / 10m: WebinarGeek subscriber join (needs a broadcast).
+        if bid:
+            wg_sql = f"""
+                SELECT {lln_expr} AS lln,
+                    COUNT(DISTINCT LOWER(c.email)) AS total_regs,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (
+                        WHERE wgs.watched_live = TRUE OR wgs.minutes_viewing > 0
+                    ) AS total_attended,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (
+                        WHERE (wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)
+                        AND wgs.minutes_viewing >= 10
+                    ) AS total_10m
+                FROM contacts c
+                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                JOIN webinargeek_subscribers wgs
+                    ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
+                WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+                GROUP BY 1
+            """
+            r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
+            for row in r.mappings().all():
+                slot = raw.setdefault(row["lln"], {})
+                slot["totalRegs"] = int(row["total_regs"] or 0)
+                slot["totalAttended"] = int(row["total_attended"] or 0)
+                slot["total10MinPlus"] = int(row["total_10m"] or 0)
+
+        # booked: opportunity join, matched to this webinar series number.
+        bk_sql = f"""
+            SELECT {lln_expr} AS lln,
+                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings
+            FROM contacts c
+            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+              AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
+            GROUP BY 1
+        """
+        r = await db.execute(sa_text(bk_sql).bindparams(wid=wid, N=N))
+        for row in r.mappings().all():
+            raw.setdefault(row["lln"], {})["totalBookings"] = int(row["total_bookings"] or 0)
+
+        # Roll raw list names up to (source, vintage) cells.
+        cells: dict[tuple[str, str], dict[str, Any]] = {}
+        for lln, metrics in raw.items():
+            name = None if lln == "(no label)" else lln
+            source = _lead_source_from_list_name(name)
+            vintage = _lead_vintage_from_list_name(name, w.date)
+            key = (source, vintage)
+            cell = cells.get(key)
+            if cell is None:
+                cell = {
+                    "source": source,
+                    "vintage": vintage,
+                    "metrics": {k: 0 for k in SOURCE_FUNNEL_RAW_KEYS},
+                }
+                cells[key] = cell
+            cm = cell["metrics"]
+            for k in SOURCE_FUNNEL_RAW_KEYS:
+                v = metrics.get(k)
+                if v is not None:
+                    cm[k] += int(v)
+        return list(cells.values())
 
 
     async def _compute_webinar_summary(

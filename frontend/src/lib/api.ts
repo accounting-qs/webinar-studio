@@ -1651,6 +1651,74 @@ export async function fetchStatisticsSegments(
   return res.json();
 }
 
+/* ── By-source funnel (By List Source tab) ───────────────────────────────── */
+
+export interface SourceVintageRow {
+  /** "YYYY-MM", or "(undated)" when the list label carries no month. */
+  vintage: string;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+}
+
+export interface SourceFunnelRow {
+  /** Data source, e.g. "AmpleLeads" / "FindyLeads" / "ZoomInfo" / "Apollo". */
+  source: string;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+  /** Per list-vintage breakdown within this source (invites desc). */
+  vintages: SourceVintageRow[];
+}
+
+export interface SourceFunnelWebinarBreakdown {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  date: string | null;
+  label: string | null;
+  bySource: SourceFunnelRow[];
+}
+
+export interface SourceFunnelTotals {
+  source: string;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+}
+
+export interface SourceFunnelResponse {
+  /** All passed webinars — the filter options for the multi-select. */
+  webinars: SegmentFunnelWebinar[];
+  includedWebinarIds: string[];
+  /** Selected webinars with no stored snapshot yet (excluded from totals). */
+  pendingWebinarIds: string[];
+  /** Cross-webinar aggregate by source (invites desc), each with nested vintages. */
+  bySource: SourceFunnelRow[];
+  /** Per-webinar breakdown (newest first), same by-source shape. */
+  perWebinar: SourceFunnelWebinarBreakdown[];
+  totals: SourceFunnelTotals;
+  meta: StatisticsMeta;
+}
+
+/** By-data-source funnel rollup (+ per-vintage, + per-webinar) across the
+ * selected webinars. Pass webinar UUIDs to scope; omit for all passed. */
+export async function fetchStatisticsListSource(
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<SourceFunnelResponse> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(`${API_URL}/statistics/by-list-source?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch list-source funnel");
+  return res.json();
+}
+
 /* ── Precomputed snapshot store (recompute trigger + status) ─────────────── */
 
 export interface StatisticsRecomputeStatus {

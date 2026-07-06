@@ -3,11 +3,12 @@
 import { useState } from "react";
 import { StatisticsPage } from "./StatisticsPage";
 import { SegmentsTab } from "./SegmentsTab";
+import { ListSourceTab } from "./ListSourceTab";
 import { CalendarUploadsTab } from "./CalendarUploadsTab";
 import { AccountHealthTab } from "./AccountHealthTab";
 import { DayOfWeekTab } from "./DayOfWeekTab";
 
-type Tab = "statistics" | "segments" | "calendar-uploads" | "account-health" | "send-day";
+type Tab = "statistics" | "segments" | "by-list-source" | "calendar-uploads" | "account-health" | "send-day";
 
 export function StatisticsTabs() {
   const [tab, setTab] = useState<Tab>("statistics");
@@ -21,6 +22,9 @@ export function StatisticsTabs() {
           </TabButton>
           <TabButton active={tab === "segments"} onClick={() => setTab("segments")}>
             Segments
+          </TabButton>
+          <TabButton active={tab === "by-list-source"} onClick={() => setTab("by-list-source")}>
+            By List Source
           </TabButton>
           <TabButton active={tab === "calendar-uploads"} onClick={() => setTab("calendar-uploads")}>
             Calendar Uploads
@@ -38,6 +42,8 @@ export function StatisticsTabs() {
           <StatisticsPage />
         ) : tab === "segments" ? (
           <SegmentsTab />
+        ) : tab === "by-list-source" ? (
+          <ListSourceTab />
         ) : tab === "calendar-uploads" ? (
           <CalendarUploadsTab />
         ) : tab === "account-health" ? (

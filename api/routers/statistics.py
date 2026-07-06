@@ -670,6 +670,72 @@ async def get_statistics_segments(source: str = "auto", webinars: str | None = N
 
 
 # ---------------------------------------------------------------------------
+# By-source funnel (By List Source tab)
+# ---------------------------------------------------------------------------
+
+class SourceVintageRow(BaseModel):
+    """One list-vintage (e.g. "2025-11") within a data source. Raw counts —
+    the frontend derives the funnel percentages from these sums."""
+    vintage: str
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+
+
+class SourceFunnelRow(BaseModel):
+    """One data source (AmpleLeads / FindyLeads / ZoomInfo / …) with its
+    per-vintage breakdown."""
+    source: str
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+    vintages: list[SourceVintageRow] = []
+
+
+class SourceFunnelWebinarBreakdown(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    label: str | None = None
+    bySource: list[SourceFunnelRow]
+
+
+class SourceFunnelTotals(BaseModel):
+    source: str = "Total"
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+
+
+class SourceFunnelResponse(BaseModel):
+    webinars: list[SegmentFunnelWebinar]  # all passed webinars (filter options)
+    includedWebinarIds: list[str]
+    pendingWebinarIds: list[str] = []
+    bySource: list[SourceFunnelRow]  # cross-webinar aggregate (invites desc)
+    perWebinar: list[SourceFunnelWebinarBreakdown]  # newest first
+    totals: SourceFunnelTotals
+    meta: StatisticsMetaResponse
+
+
+@router.get("/by-list-source", response_model=SourceFunnelResponse)
+async def get_statistics_by_list_source(source: str = "auto", webinars: str | None = None):
+    """By-data-source funnel (AmpleLeads / FindyLeads / ZoomInfo / …) with a
+    per-vintage drill-down and a per-webinar breakdown. `webinars` is a
+    comma-separated list of Webinar UUIDs to include; omit (or pass empty) to
+    include all passed webinars. Reads the precomputed snapshots only — instant
+    once they're built (POST /statistics/recompute)."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_by_source(source=source, webinar_ids=ids or None)
+    meta = await _resolve_meta(source)
+    return {**data, "meta": meta}
+
+
+# ---------------------------------------------------------------------------
 # Precomputed snapshot store — manual recompute trigger + status
 # ---------------------------------------------------------------------------
 
