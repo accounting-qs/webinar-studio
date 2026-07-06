@@ -333,6 +333,11 @@ function isColGroupBoundary(idx: number): boolean {
 const groupHeadBase =
   "sticky top-0 z-20 h-6 bg-zinc-50 dark:bg-zinc-900 px-2 py-1 text-[9px] font-bold text-zinc-400 whitespace-nowrap select-none";
 
+// Frozen top-left corner: sticks to both top and left so the Segment label
+// stays visible while scrolling right. Higher z than the header row cells.
+const groupHeadCorner =
+  "sticky top-0 left-0 z-30 h-6 bg-zinc-50 dark:bg-zinc-900 px-2 py-1";
+
 function SortArrow({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
     return <span className="text-zinc-400 dark:text-zinc-600 text-[10px]">↕</span>;
@@ -437,6 +442,10 @@ function FunnelTable({
   // top-6 so the label row sticks just below the h-6 group-band row above it.
   const headBase =
     "sticky top-6 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
+  // Frozen Segment-column header cell — sticks left AND top-6, above the
+  // scrolling header cells (z-30) so the "Segment" label stays put on scroll.
+  const headCorner =
+    "sticky top-6 left-0 z-30 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
 
   return (
     <div className="mt-2 flex-1 min-h-0 overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
@@ -444,7 +453,7 @@ function FunnelTable({
         <thead className="text-[11px] uppercase tracking-wider">
           {/* Row 1: section-wrapper group bands */}
           <tr>
-            <th className={groupHeadBase} />
+            <th className={groupHeadCorner} />
             {COLUMN_GROUPS.map((g) => (
               <th
                 key={g.group}
@@ -459,7 +468,7 @@ function FunnelTable({
           <tr>
             <th
               onClick={() => handleSort("segment")}
-              className={`${headBase} text-left min-w-[220px]`}
+              className={`${headCorner} text-left min-w-[220px]`}
             >
               <span className="inline-flex items-center gap-1">
                 Segment
@@ -604,7 +613,7 @@ function SegmentRow({
   return (
     <tr className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
       <td
-        className={`px-3 py-2 text-left ${
+        className={`sticky left-0 z-20 bg-white dark:bg-zinc-950 px-3 py-2 text-left ${
           isOther
             ? "text-zinc-500 italic"
             : "text-zinc-800 dark:text-zinc-200 font-medium"
@@ -657,7 +666,7 @@ function TotalsRow({
   const cls = "px-3 py-2 text-right tabular-nums font-bold text-zinc-900 dark:text-zinc-100 whitespace-nowrap";
   return (
     <tr className="bg-zinc-100 dark:bg-zinc-900 border-t-2 border-zinc-300 dark:border-zinc-700">
-      <td className="px-3 py-2 text-left font-bold text-zinc-900 dark:text-zinc-100">
+      <td className="sticky left-0 z-20 bg-zinc-100 dark:bg-zinc-900 px-3 py-2 text-left font-bold text-zinc-900 dark:text-zinc-100">
         Total
         <span className="ml-2 font-normal text-[11px] text-zinc-500">
           {includedCount} webinar{includedCount === 1 ? "" : "s"}
