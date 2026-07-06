@@ -1620,6 +1620,19 @@ export interface SegmentFunnelRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Sales + quality counts rolled up per bucket. Show% / Close% / Qual% are
+   * derived from these sums in the table (never averaged per-webinar). */
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
 }
 
 export interface SegmentFunnelResponse {

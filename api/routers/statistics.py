@@ -643,6 +643,20 @@ class SegmentFunnelRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Sales + quality counts rolled up per bucket. Show% / Close% / Qual% are
+    # derived on the frontend from these sums (never averaged). Default 0 so any
+    # row that predates these fields still validates.
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
 
 
 class SegmentFunnelResponse(BaseModel):

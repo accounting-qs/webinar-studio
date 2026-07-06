@@ -455,8 +455,17 @@ async def get_statistics_webinar_one(
 # By-bucket funnel aggregation (Segments tab)
 # ---------------------------------------------------------------------------
 # Raw per-list metric keys summed into each bucket row. Percentages are
-# recomputed from these sums (never averaged) by the caller / frontend.
-_FUNNEL_RAW_KEYS = ("invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings")
+# recomputed from these sums (never averaged) by the caller / frontend. The
+# sales + quality counts are already present on every snapshot row's metrics
+# (compute_derived_metrics passes the raw fields through); they're summed here
+# so the Segments dashboard can show Show% / Close% / Qual% and the underlying
+# counts per bucket.
+_FUNNEL_RAW_KEYS = (
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "confirmed", "shows", "noShows", "canceled", "won",
+    "disqualified", "qualified",
+    "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+)
 
 
 def _is_passed_webinar(date_str: str | None, status: str | None) -> bool:
@@ -590,6 +599,17 @@ async def get_statistics_segments(
             "regs": int(slot["totalRegs"] or 0),
             "attendees10m": int(slot["total10MinPlus"] or 0),
             "bookings": int(slot["totalBookings"] or 0),
+            "confirmed": int(slot["confirmed"] or 0),
+            "shows": int(slot["shows"] or 0),
+            "noShows": int(slot["noShows"] or 0),
+            "canceled": int(slot["canceled"] or 0),
+            "won": int(slot["won"] or 0),
+            "disqualified": int(slot["disqualified"] or 0),
+            "qualified": int(slot["qualified"] or 0),
+            "leadQualityGreat": int(slot["leadQualityGreat"] or 0),
+            "leadQualityOk": int(slot["leadQualityOk"] or 0),
+            "leadQualityBarelyPassable": int(slot["leadQualityBarelyPassable"] or 0),
+            "leadQualityBadDq": int(slot["leadQualityBadDq"] or 0),
         }
 
     # Named buckets first (by invites desc), then the "Other (no bucket)" row.
@@ -604,13 +624,16 @@ async def get_statistics_segments(
         other["bucketName"] = other.get("bucketName") or "Other (no bucket)"
         segments.append(_shape(other))
 
+    _total_count_keys = (
+        "invites", "regs", "attendees10m", "bookings",
+        "confirmed", "shows", "noShows", "canceled", "won",
+        "disqualified", "qualified",
+        "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+    )
     totals = {
         "bucketId": None,
         "bucketName": "Total",
-        "invites": sum(s["invites"] for s in segments),
-        "regs": sum(s["regs"] for s in segments),
-        "attendees10m": sum(s["attendees10m"] for s in segments),
-        "bookings": sum(s["bookings"] for s in segments),
+        **{k: sum(s[k] for s in segments) for k in _total_count_keys},
     }
 
     return {

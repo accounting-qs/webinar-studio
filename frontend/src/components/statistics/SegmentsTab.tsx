@@ -51,6 +51,21 @@ type FunnelCells = {
   bookings: number;
   bookOfAtt: number | null;
   bookPer1kInv: number | null;
+  // Sales + quality (counts summed per bucket; rates derived from the sums)
+  confirmed: number;
+  shows: number;
+  showPct: number | null;
+  noShows: number;
+  canceled: number;
+  won: number;
+  closeRate: number | null;
+  disqualified: number;
+  qualified: number;
+  qualRate: number | null;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
 };
 
 function deriveCells(r: SegmentFunnelRow): FunnelCells {
@@ -64,6 +79,20 @@ function deriveCells(r: SegmentFunnelRow): FunnelCells {
     bookings: r.bookings,
     bookOfAtt: safeDiv(r.bookings, r.attendees10m),
     bookPer1kInv: safePer1k(r.bookings, r.invites),
+    confirmed: r.confirmed,
+    shows: r.shows,
+    showPct: safeDiv(r.shows, r.bookings),
+    noShows: r.noShows,
+    canceled: r.canceled,
+    won: r.won,
+    closeRate: safeDiv(r.won, r.shows),
+    disqualified: r.disqualified,
+    qualified: r.qualified,
+    qualRate: safeDiv(r.qualified, r.shows),
+    leadQualityGreat: r.leadQualityGreat,
+    leadQualityOk: r.leadQualityOk,
+    leadQualityBarelyPassable: r.leadQualityBarelyPassable,
+    leadQualityBadDq: r.leadQualityBadDq,
   };
 }
 
@@ -249,6 +278,8 @@ const NUMERIC_COLUMNS: {
   label: string;
   title?: string;
   fmt: (c: FunnelCells) => string;
+  /** Negative-signal metric: heatmap greens the LOW end (fewer = better). */
+  lowerIsBetter?: boolean;
 }[] = [
   { key: "invites", label: "Invites", fmt: (c) => fmtInt(c.invites) },
   { key: "regs", label: "Regs", fmt: (c) => fmtInt(c.regs) },
@@ -259,6 +290,20 @@ const NUMERIC_COLUMNS: {
   { key: "bookings", label: "Bookings", fmt: (c) => fmtInt(c.bookings) },
   { key: "bookOfAtt", label: "Book% (of att)", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
   { key: "bookPer1kInv", label: "Book/1k inv", title: "Bookings per 1,000 invites", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
+  { key: "confirmed", label: "Confirmed", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
+  { key: "shows", label: "Shows", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
+  { key: "showPct", label: "Show%", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
+  { key: "noShows", label: "No Shows", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
+  { key: "canceled", label: "Canceled", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
+  { key: "won", label: "Won", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },
+  { key: "closeRate", label: "Close%", title: "Won ÷ shows", fmt: (c) => fmtPct(c.closeRate) },
+  { key: "disqualified", label: "DQ", title: "Opportunities in the Disqualified stage", fmt: (c) => fmtInt(c.disqualified), lowerIsBetter: true },
+  { key: "qualified", label: "Qualified", title: "Shows with non-DQ lead quality (Great / Ok / Barely Passable)", fmt: (c) => fmtInt(c.qualified) },
+  { key: "qualRate", label: "Qual%", title: "Qualified ÷ shows", fmt: (c) => fmtPct(c.qualRate) },
+  { key: "leadQualityGreat", label: "Great", title: "Lead quality 'Great'", fmt: (c) => fmtInt(c.leadQualityGreat) },
+  { key: "leadQualityOk", label: "Ok", title: "Lead quality 'Ok'", fmt: (c) => fmtInt(c.leadQualityOk) },
+  { key: "leadQualityBarelyPassable", label: "Barely", title: "Lead quality 'Barely Passable'", fmt: (c) => fmtInt(c.leadQualityBarelyPassable) },
+  { key: "leadQualityBadDq", label: "Bad/DQ", title: "Lead quality 'Bad / DQ'", fmt: (c) => fmtInt(c.leadQualityBadDq), lowerIsBetter: true },
 ];
 
 function SortArrow({ active, dir }: { active: boolean; dir: SortDir }) {
@@ -417,14 +462,17 @@ function leaderCls(value: number | null, max: number): string {
 }
 
 /** Red→amber→green heat background for a cell, positioned by where its value
- * falls in the column's [min,max] (higher = greener, for every metric). Returns
- * a translucent rgba so it reads on both light and dark rows, or undefined when
- * there's nothing to scale (null value, or a single distinct value). */
-function heatBg(value: number | null, min: number, max: number): string | undefined {
+ * falls in the column's [min,max] (higher = greener by default). Pass
+ * invert=true for negative-signal columns (No Shows, Canceled, DQ, Bad/DQ) so
+ * the LOW end greens instead. Returns a translucent rgba so it reads on both
+ * light and dark rows, or undefined when there's nothing to scale (null value,
+ * or a single distinct value). */
+function heatBg(value: number | null, min: number, max: number, invert = false): string | undefined {
   if (value === null || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
     return undefined;
   }
-  const t = (value - min) / (max - min); // 0 = worst (red), 1 = best (green)
+  let t = (value - min) / (max - min); // 0 = worst (red), 1 = best (green)
+  if (invert) t = 1 - t; // fewer = better: flip so low values read green
   const stops: [number, number, number][] = [
     [239, 68, 68], // red-500
     [245, 158, 11], // amber-500
@@ -511,14 +559,17 @@ function SegmentRow({
       {NUMERIC_COLUMNS.map((col) => {
         const v = c[col.key];
         const { min, max } = colStats[col.key];
+        // For negative-signal columns the "best" (bold-emphasized) extreme is
+        // the low end, and the heatmap greens the low end too.
+        const best = col.lowerIsBetter ? min : max;
         // Heat only the named segment rows; the "Other (no bucket)" catch-all
         // isn't part of the comparison set.
-        const bg = isOther ? undefined : heatBg(v, min, max);
+        const bg = isOther ? undefined : heatBg(v, min, max, col.lowerIsBetter);
         return (
           <td
             key={col.key}
             style={bg ? { backgroundColor: bg } : undefined}
-            className={`${COL} ${leaderCls(v, max)}`}
+            className={`${COL} ${leaderCls(v, best)}`}
           >
             {col.fmt(c)}
           </td>
