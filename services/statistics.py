@@ -651,7 +651,12 @@ async def get_statistics_segments(
 # Raw keys carried on each source cell (mirror
 # ghl_statistics_source.SOURCE_FUNNEL_RAW_KEYS). Percentages are derived from
 # these sums downstream (never averaged), same convention as the Segments tab.
-_SOURCE_RAW_KEYS = ("invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings")
+_SOURCE_RAW_KEYS = (
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "confirmed", "shows", "noShows", "canceled", "won",
+    "disqualified", "qualified",
+    "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+)
 
 
 def _shape_source_funnel(raw: dict[str, Any]) -> dict[str, int]:
@@ -662,6 +667,17 @@ def _shape_source_funnel(raw: dict[str, Any]) -> dict[str, int]:
         "regs": int(raw.get("totalRegs") or 0),
         "attendees10m": int(raw.get("total10MinPlus") or 0),
         "bookings": int(raw.get("totalBookings") or 0),
+        "confirmed": int(raw.get("confirmed") or 0),
+        "shows": int(raw.get("shows") or 0),
+        "noShows": int(raw.get("noShows") or 0),
+        "canceled": int(raw.get("canceled") or 0),
+        "won": int(raw.get("won") or 0),
+        "disqualified": int(raw.get("disqualified") or 0),
+        "qualified": int(raw.get("qualified") or 0),
+        "leadQualityGreat": int(raw.get("leadQualityGreat") or 0),
+        "leadQualityOk": int(raw.get("leadQualityOk") or 0),
+        "leadQualityBarelyPassable": int(raw.get("leadQualityBarelyPassable") or 0),
+        "leadQualityBadDq": int(raw.get("leadQualityBadDq") or 0),
     }
 
 
@@ -777,13 +793,13 @@ async def get_statistics_by_source(
         })
 
     by_source = _shape_source_agg(overall)
-    totals = {
-        "source": "Total",
-        "invites": sum(r["invites"] for r in by_source),
-        "regs": sum(r["regs"] for r in by_source),
-        "attendees10m": sum(r["attendees10m"] for r in by_source),
-        "bookings": sum(r["bookings"] for r in by_source),
-    }
+    _total_count_keys = (
+        "invites", "regs", "attendees10m", "bookings",
+        "confirmed", "shows", "noShows", "canceled", "won",
+        "disqualified", "qualified",
+        "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+    )
+    totals = {"source": "Total", **{k: sum(r[k] for r in by_source) for k in _total_count_keys}}
     return {
         "webinars": webinar_options,
         "includedWebinarIds": target_ids,

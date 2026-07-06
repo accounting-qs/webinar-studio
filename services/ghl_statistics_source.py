@@ -209,6 +209,9 @@ def _webinar_series_regex(webinar_number: int) -> str:
 # funnel-derivation logic (percentages derived from these sums, never averaged).
 SOURCE_FUNNEL_RAW_KEYS = (
     "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "confirmed", "shows", "noShows", "canceled", "won",
+    "disqualified", "qualified",
+    "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
 )
 
 # lead_list_name usually leads with the data provider, e.g.
@@ -1692,10 +1695,25 @@ class GoHighLevelStatisticsSource:
                 slot["totalAttended"] = int(row["total_attended"] or 0)
                 slot["total10MinPlus"] = int(row["total_10m"] or 0)
 
-        # booked: opportunity join, matched to this webinar series number.
+        # booked + sales/quality: opportunity join, matched to this webinar
+        # series number. Mirrors the FILTER predicates in _compute_per_list_metrics
+        # (Batch C) so the By List Source tab shows the same Sales/Quality columns
+        # as the Segments tab.
+        qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
         bk_sql = f"""
             SELECT {lln_expr} AS lln,
-                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings
+                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'cancelled') AS canceled,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :won_stage) AS won,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :dq_stage) AS disqualified,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed' AND o.lead_quality IN {qual_in}) AS qualified,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
             FROM contacts c
             JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
             JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
@@ -1704,9 +1722,26 @@ class GoHighLevelStatisticsSource:
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             GROUP BY 1
         """
-        r = await db.execute(sa_text(bk_sql).bindparams(wid=wid, N=N))
+        r = await db.execute(sa_text(bk_sql).bindparams(
+            wid=wid, N=N,
+            won_stage=DEAL_WON_STAGE_ID, dq_stage=DISQUALIFIED_STAGE_ID,
+            lq_great=LEAD_QUALITY_GREAT, lq_ok=LEAD_QUALITY_OK,
+            lq_barely=LEAD_QUALITY_BARELY, lq_dq=LEAD_QUALITY_BAD_DQ,
+        ))
         for row in r.mappings().all():
-            raw.setdefault(row["lln"], {})["totalBookings"] = int(row["total_bookings"] or 0)
+            slot = raw.setdefault(row["lln"], {})
+            slot["totalBookings"] = int(row["total_bookings"] or 0)
+            slot["confirmed"] = int(row["confirmed"] or 0)
+            slot["shows"] = int(row["shows"] or 0)
+            slot["noShows"] = int(row["no_shows"] or 0)
+            slot["canceled"] = int(row["canceled"] or 0)
+            slot["won"] = int(row["won"] or 0)
+            slot["disqualified"] = int(row["disqualified"] or 0)
+            slot["qualified"] = int(row["qualified"] or 0)
+            slot["leadQualityGreat"] = int(row["lq_great"] or 0)
+            slot["leadQualityOk"] = int(row["lq_ok"] or 0)
+            slot["leadQualityBarelyPassable"] = int(row["lq_barely"] or 0)
+            slot["leadQualityBadDq"] = int(row["lq_dq"] or 0)
 
         # Roll raw list names up to (source, vintage) cells.
         cells: dict[tuple[str, str], dict[str, Any]] = {}

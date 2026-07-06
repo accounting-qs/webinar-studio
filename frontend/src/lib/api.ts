@@ -1673,6 +1673,17 @@ export interface SourceVintageRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
 }
 
 export interface SourceFunnelRow {
@@ -1682,6 +1693,19 @@ export interface SourceFunnelRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Sales + quality counts (mirrors SegmentFunnelRow). Show% / Close% / Qual%
+   * are derived from these sums in the table (never averaged per-webinar). */
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
   /** Per list-vintage breakdown within this source (invites desc). */
   vintages: SourceVintageRow[];
 }
@@ -1701,6 +1725,17 @@ export interface SourceFunnelTotals {
   regs: number;
   attendees10m: number;
   bookings: number;
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
 }
 
 export interface SourceFunnelResponse {

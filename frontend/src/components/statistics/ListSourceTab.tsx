@@ -48,24 +48,36 @@ function fmtVintage(v: string): string {
 
 type GroupMode = "source" | "vintage";
 
-type Funnel = { invites: number; regs: number; attendees10m: number; bookings: number };
+/** Raw count fields carried on every source/vintage cell (mirror the backend
+ * SOURCE_FUNNEL_RAW_KEYS / Segments tab). Rates are derived from the sums. */
+const FUNNEL_KEYS = [
+  "invites", "regs", "attendees10m", "bookings",
+  "confirmed", "shows", "noShows", "canceled", "won",
+  "disqualified", "qualified",
+  "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+] as const;
+type FunnelKey = (typeof FUNNEL_KEYS)[number];
+type Funnel = Record<FunnelKey, number>;
 type FlatCell = Funnel & { source: string; vintage: string };
 type ChildRow = Funnel & { key: string };
 type GroupRow = Funnel & { key: string; children: ChildRow[] };
+
+function zeroFunnel(): Funnel {
+  return Object.fromEntries(FUNNEL_KEYS.map((k) => [k, 0])) as Funnel;
+}
+
+function funnelOf(x: Funnel): Funnel {
+  const out = zeroFunnel();
+  for (const k of FUNNEL_KEYS) out[k] = x[k] ?? 0;
+  return out;
+}
 
 /** bySource rows (source → nested vintages) → flat (source, vintage) cells. */
 function flattenCells(bySource: SourceFunnelRow[]): FlatCell[] {
   const cells: FlatCell[] = [];
   for (const s of bySource) {
     for (const v of s.vintages) {
-      cells.push({
-        source: s.source,
-        vintage: v.vintage,
-        invites: v.invites,
-        regs: v.regs,
-        attendees10m: v.attendees10m,
-        bookings: v.bookings,
-      });
+      cells.push({ ...funnelOf(v), source: s.source, vintage: v.vintage });
     }
   }
   return cells;
@@ -80,20 +92,11 @@ function pivot(cells: FlatCell[], primary: GroupMode): GroupRow[] {
     const pk = c[primary];
     let g = groups.get(pk);
     if (!g) {
-      g = { key: pk, invites: 0, regs: 0, attendees10m: 0, bookings: 0, children: [] };
+      g = { key: pk, ...zeroFunnel(), children: [] };
       groups.set(pk, g);
     }
-    g.invites += c.invites;
-    g.regs += c.regs;
-    g.attendees10m += c.attendees10m;
-    g.bookings += c.bookings;
-    g.children.push({
-      key: c[secondary],
-      invites: c.invites,
-      regs: c.regs,
-      attendees10m: c.attendees10m,
-      bookings: c.bookings,
-    });
+    for (const k of FUNNEL_KEYS) g[k] += c[k];
+    g.children.push({ key: c[secondary], ...funnelOf(c) });
   }
   const rows = Array.from(groups.values());
   rows.sort((a, b) => b.invites - a.invites);
@@ -113,6 +116,21 @@ type FunnelCells = {
   bookings: number;
   bookOfAtt: number | null;
   bookPer1kInv: number | null;
+  // Sales + quality (counts summed; rates derived from the sums)
+  confirmed: number;
+  shows: number;
+  showPct: number | null;
+  noShows: number;
+  canceled: number;
+  won: number;
+  closeRate: number | null;
+  disqualified: number;
+  qualified: number;
+  qualRate: number | null;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
 };
 
 function deriveCells(r: Funnel): FunnelCells {
@@ -126,6 +144,20 @@ function deriveCells(r: Funnel): FunnelCells {
     bookings: r.bookings,
     bookOfAtt: safeDiv(r.bookings, r.attendees10m),
     bookPer1kInv: safePer1k(r.bookings, r.invites),
+    confirmed: r.confirmed,
+    shows: r.shows,
+    showPct: safeDiv(r.shows, r.bookings),
+    noShows: r.noShows,
+    canceled: r.canceled,
+    won: r.won,
+    closeRate: safeDiv(r.won, r.shows),
+    disqualified: r.disqualified,
+    qualified: r.qualified,
+    qualRate: safeDiv(r.qualified, r.shows),
+    leadQualityGreat: r.leadQualityGreat,
+    leadQualityOk: r.leadQualityOk,
+    leadQualityBarelyPassable: r.leadQualityBarelyPassable,
+    leadQualityBadDq: r.leadQualityBadDq,
   };
 }
 
@@ -316,17 +348,63 @@ type CellKey = keyof FunnelCells;
 type SortKey = "group" | CellKey;
 type SortDir = "asc" | "desc";
 
-const NUMERIC_COLUMNS: { key: CellKey; label: string; title?: string; fmt: (c: FunnelCells) => string }[] = [
-  { key: "invites", label: "Leads", title: "Distinct contacts mailed from this source", fmt: (c) => fmtInt(c.invites) },
-  { key: "regs", label: "Regs", fmt: (c) => fmtInt(c.regs) },
-  { key: "regPct", label: "Reg%", fmt: (c) => fmtPct(c.regPct) },
-  { key: "attendees10m", label: "Attendees (10min+)", fmt: (c) => fmtInt(c.attendees10m) },
-  { key: "attOfInv", label: "Att% (of leads)", title: "10-min+ attendees ÷ leads", fmt: (c) => fmtPct(c.attOfInv) },
-  { key: "attOfReg", label: "Att% (of reg)", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
-  { key: "bookings", label: "Bookings", fmt: (c) => fmtInt(c.bookings) },
-  { key: "bookOfAtt", label: "Book% (of att)", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
-  { key: "bookPer1kInv", label: "Book/1k leads", title: "Bookings per 1,000 leads", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
+type ColGroup = "Leads" | "Registrations" | "Attendance" | "Sales" | "Quality";
+
+/** Single source of truth for the numeric columns — drives the header, the body
+ * cells, the totals row and the sort keys so they can't drift. `group` bands
+ * each column into a section-wrapper header row above the labels (mirrors the
+ * Segments tab). `lowerIsBetter` flips the heatmap so fewer reads as greener. */
+const NUMERIC_COLUMNS: {
+  key: CellKey;
+  label: string;
+  title?: string;
+  group: ColGroup;
+  fmt: (c: FunnelCells) => string;
+  lowerIsBetter?: boolean;
+}[] = [
+  { key: "invites", label: "Leads", group: "Leads", title: "Distinct contacts mailed from this source", fmt: (c) => fmtInt(c.invites) },
+  { key: "regs", label: "Regs", group: "Registrations", fmt: (c) => fmtInt(c.regs) },
+  { key: "regPct", label: "Reg%", group: "Registrations", fmt: (c) => fmtPct(c.regPct) },
+  { key: "attendees10m", label: "Attendees (10min+)", group: "Attendance", fmt: (c) => fmtInt(c.attendees10m) },
+  { key: "attOfInv", label: "Att% (of leads)", group: "Attendance", title: "10-min+ attendees ÷ leads", fmt: (c) => fmtPct(c.attOfInv) },
+  { key: "attOfReg", label: "Att% (of reg)", group: "Attendance", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
+  { key: "bookings", label: "Bookings", group: "Sales", fmt: (c) => fmtInt(c.bookings) },
+  { key: "bookOfAtt", label: "Book% (of att)", group: "Sales", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
+  { key: "bookPer1kInv", label: "Book/1k leads", group: "Sales", title: "Bookings per 1,000 leads", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
+  { key: "confirmed", label: "Confirmed", group: "Sales", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
+  { key: "shows", label: "Shows", group: "Sales", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
+  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
+  { key: "noShows", label: "No Shows", group: "Sales", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
+  { key: "canceled", label: "Canceled", group: "Sales", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
+  { key: "won", label: "Won", group: "Sales", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },
+  { key: "closeRate", label: "Close%", group: "Sales", title: "Won ÷ shows", fmt: (c) => fmtPct(c.closeRate) },
+  { key: "disqualified", label: "DQ", group: "Quality", title: "Opportunities in the Disqualified stage", fmt: (c) => fmtInt(c.disqualified), lowerIsBetter: true },
+  { key: "qualified", label: "Qualified", group: "Quality", title: "Shows with non-DQ lead quality (Great / Ok / Barely Passable)", fmt: (c) => fmtInt(c.qualified) },
+  { key: "qualRate", label: "Qual%", group: "Quality", title: "Qualified ÷ shows", fmt: (c) => fmtPct(c.qualRate) },
+  { key: "leadQualityGreat", label: "Great", group: "Quality", title: "Lead quality 'Great'", fmt: (c) => fmtInt(c.leadQualityGreat) },
+  { key: "leadQualityOk", label: "Ok", group: "Quality", title: "Lead quality 'Ok'", fmt: (c) => fmtInt(c.leadQualityOk) },
+  { key: "leadQualityBarelyPassable", label: "Barely", group: "Quality", title: "Lead quality 'Barely Passable'", fmt: (c) => fmtInt(c.leadQualityBarelyPassable) },
+  { key: "leadQualityBadDq", label: "Bad/DQ", group: "Quality", title: "Lead quality 'Bad / DQ'", fmt: (c) => fmtInt(c.leadQualityBadDq), lowerIsBetter: true },
 ];
+
+/** Contiguous column groups → colSpans for the section-wrapper header row. */
+const COLUMN_GROUPS: { group: ColGroup; span: number }[] = NUMERIC_COLUMNS.reduce(
+  (acc, col) => {
+    const last = acc[acc.length - 1];
+    if (last && last.group === col.group) last.span += 1;
+    else acc.push({ group: col.group, span: 1 });
+    return acc;
+  },
+  [] as { group: ColGroup; span: number }[],
+);
+
+/** True if the numeric column at `idx` starts a new group (gets a left divider). */
+function isColGroupBoundary(idx: number): boolean {
+  return idx === 0 || NUMERIC_COLUMNS[idx].group !== NUMERIC_COLUMNS[idx - 1].group;
+}
+
+const groupHeadBase =
+  "sticky top-0 z-20 h-6 bg-zinc-50 dark:bg-zinc-900 px-2 py-1 text-[9px] font-bold text-zinc-400 whitespace-nowrap select-none";
 
 function SortArrow({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) return <span className="text-zinc-400 dark:text-zinc-600 text-[10px]">↕</span>;
@@ -367,21 +445,21 @@ function GroupedFunnelTable({
       return n;
     });
 
-  // Per-column min/max across the parent rows — drives the heatmap + leader bold.
+  // Per-column sorted non-null values across the parent rows → rank-based
+  // (quantile) heatmap: color tracks a value's position in the ranked order,
+  // not its distance from the max, so one standout source can't wash the rest
+  // red. Also feeds the column-leader emphasis (min/max are the array ends).
   const colStats = useMemo(() => {
     const parentCells = rows.map((r) => deriveCells(r));
-    const s = {} as Record<CellKey, { min: number; max: number }>;
+    const s = {} as Record<CellKey, number[]>;
     for (const col of NUMERIC_COLUMNS) {
-      let min = Infinity;
-      let max = -Infinity;
+      const vals: number[] = [];
       for (const c of parentCells) {
         const v = c[col.key];
-        if (v !== null) {
-          if (v < min) min = v;
-          if (v > max) max = v;
-        }
+        if (v !== null) vals.push(v);
       }
-      s[col.key] = { min, max };
+      vals.sort((a, b) => a - b);
+      s[col.key] = vals;
     }
     return s;
   }, [rows]);
@@ -413,13 +491,28 @@ function GroupedFunnelTable({
     );
   }
 
+  // top-6 so the label row sticks just below the h-6 group-band row above it.
   const headBase =
-    "sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
+    "sticky top-6 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
 
   return (
     <div className="overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
       <table className="w-full text-xs border-collapse">
         <thead className="text-[11px] uppercase tracking-wider">
+          {/* Row 1: section-wrapper group bands */}
+          <tr>
+            <th className={groupHeadBase} />
+            {COLUMN_GROUPS.map((g) => (
+              <th
+                key={g.group}
+                colSpan={g.span}
+                className={`${groupHeadBase} text-center border-l border-zinc-200 dark:border-zinc-800`}
+              >
+                {g.group}
+              </th>
+            ))}
+          </tr>
+          {/* Row 2: individual column labels */}
           <tr>
             <th onClick={() => handleSort("group")} className={`${headBase} text-left min-w-[200px]`}>
               <span className="inline-flex items-center gap-1">
@@ -427,8 +520,15 @@ function GroupedFunnelTable({
                 <SortArrow active={sortKey === "group"} dir={sortDir} />
               </span>
             </th>
-            {NUMERIC_COLUMNS.map((col) => (
-              <th key={col.key} onClick={() => handleSort(col.key)} title={col.title} className={`${headBase} text-right`}>
+            {NUMERIC_COLUMNS.map((col, idx) => (
+              <th
+                key={col.key}
+                onClick={() => handleSort(col.key)}
+                title={col.title}
+                className={`${headBase} text-right ${
+                  isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800" : ""
+                }`}
+              >
                 <span className="inline-flex items-center justify-end gap-1">
                   {col.label}
                   <SortArrow active={sortKey === col.key} dir={sortDir} />
@@ -464,22 +564,43 @@ function GroupedFunnelTable({
   );
 }
 
-function leaderCls(value: number | null, max: number): string {
-  return value !== null && value === max && Number.isFinite(max)
+function leaderCls(value: number | null, best: number): string {
+  return value !== null && value === best && Number.isFinite(best)
     ? "font-bold text-zinc-900 dark:text-zinc-100"
     : "text-zinc-700 dark:text-zinc-300";
 }
 
-/** Red→amber→green heat background positioned by where the value falls in the
- * column's [min,max] (higher = greener, for every metric). Translucent so it
- * reads on both themes; undefined when there's nothing to scale. */
-function heatBg(value: number | null, min: number, max: number): string | undefined {
-  if (value === null || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) return undefined;
-  const t = (value - min) / (max - min);
+/** A value's quantile (0–1) within the column's sorted values, average-rank for
+ * ties so equal values share a color. null when there's nothing to rank
+ * against. Ranking by position — not raw magnitude — keeps the heatmap robust
+ * to a single outlying source. */
+function quantileRank(value: number, sorted: number[]): number | null {
+  const n = sorted.length;
+  if (n <= 1 || sorted[0] === sorted[n - 1]) return null;
+  let below = 0;
+  let equal = 0;
+  for (const x of sorted) {
+    if (x < value) below++;
+    else if (x === value) equal++;
+  }
+  const avgRank = below + (equal - 1) / 2;
+  return avgRank / (n - 1);
+}
+
+/** Red→amber→green heat background positioned by the value's RANK (quantile)
+ * within the column — median → amber, best → green, worst → red. Pass
+ * invert=true for negative-signal columns (No Shows, Canceled, DQ, Bad/DQ) so
+ * the LOW end greens instead. undefined when there's nothing to rank. */
+function heatBg(value: number | null, sorted: number[], invert = false): string | undefined {
+  if (value === null) return undefined;
+  const q = quantileRank(value, sorted);
+  if (q === null) return undefined;
+  let t = q;
+  if (invert) t = 1 - t;
   const stops: [number, number, number][] = [
-    [239, 68, 68],
-    [245, 158, 11],
-    [34, 197, 94],
+    [239, 68, 68], // red-500
+    [245, 158, 11], // amber-500
+    [34, 197, 94], // green-500
   ];
   const i = t < 0.5 ? 0 : 1;
   const lt = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
@@ -505,7 +626,7 @@ function FunnelRows({
   label: string;
   isOpen: boolean;
   onToggle: () => void;
-  colStats: Record<CellKey, { min: number; max: number }>;
+  colStats: Record<CellKey, number[]>;
   childIsVintage: boolean;
 }) {
   const c = deriveCells(row);
@@ -528,12 +649,19 @@ function FunnelRows({
             <span className="truncate">{label}</span>
           </button>
         </td>
-        {NUMERIC_COLUMNS.map((col) => {
+        {NUMERIC_COLUMNS.map((col, idx) => {
           const v = c[col.key];
-          const { min, max } = colStats[col.key];
-          const bg = heatBg(v, min, max);
+          const sorted = colStats[col.key];
+          const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
+          const bg = heatBg(v, sorted, col.lowerIsBetter);
           return (
-            <td key={col.key} style={bg ? { backgroundColor: bg } : undefined} className={`${COL} ${leaderCls(v, max)}`}>
+            <td
+              key={col.key}
+              style={bg ? { backgroundColor: bg } : undefined}
+              className={`${COL} ${leaderCls(v, best)} ${
+                isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+              }`}
+            >
               {col.fmt(c)}
             </td>
           );
@@ -548,8 +676,13 @@ function FunnelRows({
               <td className="px-3 py-1.5 pl-9 text-left text-zinc-500 dark:text-zinc-400 text-[11px]" title={childLabel}>
                 <span className="truncate">{childLabel}</span>
               </td>
-              {NUMERIC_COLUMNS.map((col) => (
-                <td key={col.key} className={`${COL} text-zinc-500 dark:text-zinc-400 text-[11px]`}>
+              {NUMERIC_COLUMNS.map((col, idx) => (
+                <td
+                  key={col.key}
+                  className={`${COL} text-zinc-500 dark:text-zinc-400 text-[11px] ${
+                    isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+                  }`}
+                >
                   {col.fmt(cc)}
                 </td>
               ))}
@@ -566,8 +699,13 @@ function TotalsRow({ totals }: { totals: SourceFunnelResponse["totals"] }) {
   return (
     <tr className="bg-zinc-100 dark:bg-zinc-900 border-t-2 border-zinc-300 dark:border-zinc-700">
       <td className="px-3 py-2 text-left font-bold text-zinc-900 dark:text-zinc-100">Total</td>
-      {NUMERIC_COLUMNS.map((col) => (
-        <td key={col.key} className={cls}>
+      {NUMERIC_COLUMNS.map((col, idx) => (
+        <td
+          key={col.key}
+          className={`${cls} ${
+            isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+          }`}
+        >
           {col.fmt(c)}
         </td>
       ))}

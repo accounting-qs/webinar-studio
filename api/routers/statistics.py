@@ -695,6 +695,17 @@ class SourceVintageRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
 
 
 class SourceFunnelRow(BaseModel):
@@ -705,6 +716,19 @@ class SourceFunnelRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Sales + quality counts (mirrors SegmentFunnelRow). Rates are derived on the
+    # frontend from these sums. Default 0 so pre-feature snapshots still validate.
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
     vintages: list[SourceVintageRow] = []
 
 
@@ -723,6 +747,17 @@ class SourceFunnelTotals(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
 
 
 class SourceFunnelResponse(BaseModel):
