@@ -271,40 +271,67 @@ type CellKey = keyof FunnelCells;
 type SortKey = "segment" | CellKey;
 type SortDir = "asc" | "desc";
 
+type ColGroup = "Invites" | "Registrations" | "Attendance" | "Sales" | "Quality";
+
 /** Single source of truth for the numeric columns — drives the header, the body
- * cells, the totals row, and the sort keys so they can never drift apart. */
+ * cells, the totals row, and the sort keys so they can never drift apart. The
+ * `group` bands each column into a section-wrapper header row above the labels
+ * (mirrors the Statistics tab). */
 const NUMERIC_COLUMNS: {
   key: CellKey;
   label: string;
   title?: string;
+  group: ColGroup;
   fmt: (c: FunnelCells) => string;
   /** Negative-signal metric: heatmap greens the LOW end (fewer = better). */
   lowerIsBetter?: boolean;
 }[] = [
-  { key: "invites", label: "Invites", fmt: (c) => fmtInt(c.invites) },
-  { key: "regs", label: "Regs", fmt: (c) => fmtInt(c.regs) },
-  { key: "regPct", label: "Reg%", fmt: (c) => fmtPct(c.regPct) },
-  { key: "attendees10m", label: "Attendees (10m+)", fmt: (c) => fmtInt(c.attendees10m) },
-  { key: "attOfInv", label: "Att% (of inv)", title: "10-min+ attendees ÷ invites", fmt: (c) => fmtPct(c.attOfInv) },
-  { key: "attOfReg", label: "Att% (of reg)", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
-  { key: "bookings", label: "Bookings", fmt: (c) => fmtInt(c.bookings) },
-  { key: "bookOfAtt", label: "Book% (of att)", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
-  { key: "bookPer1kInv", label: "Book/1k inv", title: "Bookings per 1,000 invites", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
-  { key: "confirmed", label: "Confirmed", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
-  { key: "shows", label: "Shows", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
-  { key: "showPct", label: "Show%", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
-  { key: "noShows", label: "No Shows", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
-  { key: "canceled", label: "Canceled", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
-  { key: "won", label: "Won", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },
-  { key: "closeRate", label: "Close%", title: "Won ÷ shows", fmt: (c) => fmtPct(c.closeRate) },
-  { key: "disqualified", label: "DQ", title: "Opportunities in the Disqualified stage", fmt: (c) => fmtInt(c.disqualified), lowerIsBetter: true },
-  { key: "qualified", label: "Qualified", title: "Shows with non-DQ lead quality (Great / Ok / Barely Passable)", fmt: (c) => fmtInt(c.qualified) },
-  { key: "qualRate", label: "Qual%", title: "Qualified ÷ shows", fmt: (c) => fmtPct(c.qualRate) },
-  { key: "leadQualityGreat", label: "Great", title: "Lead quality 'Great'", fmt: (c) => fmtInt(c.leadQualityGreat) },
-  { key: "leadQualityOk", label: "Ok", title: "Lead quality 'Ok'", fmt: (c) => fmtInt(c.leadQualityOk) },
-  { key: "leadQualityBarelyPassable", label: "Barely", title: "Lead quality 'Barely Passable'", fmt: (c) => fmtInt(c.leadQualityBarelyPassable) },
-  { key: "leadQualityBadDq", label: "Bad/DQ", title: "Lead quality 'Bad / DQ'", fmt: (c) => fmtInt(c.leadQualityBadDq), lowerIsBetter: true },
+  { key: "invites", label: "Invites", group: "Invites", fmt: (c) => fmtInt(c.invites) },
+  { key: "regs", label: "Regs", group: "Registrations", fmt: (c) => fmtInt(c.regs) },
+  { key: "regPct", label: "Reg%", group: "Registrations", fmt: (c) => fmtPct(c.regPct) },
+  { key: "attendees10m", label: "Attendees (10m+)", group: "Attendance", fmt: (c) => fmtInt(c.attendees10m) },
+  { key: "attOfInv", label: "Att% (of inv)", group: "Attendance", title: "10-min+ attendees ÷ invites", fmt: (c) => fmtPct(c.attOfInv) },
+  { key: "attOfReg", label: "Att% (of reg)", group: "Attendance", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
+  { key: "bookings", label: "Bookings", group: "Sales", fmt: (c) => fmtInt(c.bookings) },
+  { key: "bookOfAtt", label: "Book% (of att)", group: "Sales", title: "Bookings ÷ 10-min+ attendees", fmt: (c) => fmtPct(c.bookOfAtt) },
+  { key: "bookPer1kInv", label: "Book/1k inv", group: "Sales", title: "Bookings per 1,000 invites", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
+  { key: "confirmed", label: "Confirmed", group: "Sales", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
+  { key: "shows", label: "Shows", group: "Sales", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
+  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
+  { key: "noShows", label: "No Shows", group: "Sales", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
+  { key: "canceled", label: "Canceled", group: "Sales", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
+  { key: "won", label: "Won", group: "Sales", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },
+  { key: "closeRate", label: "Close%", group: "Sales", title: "Won ÷ shows", fmt: (c) => fmtPct(c.closeRate) },
+  { key: "disqualified", label: "DQ", group: "Quality", title: "Opportunities in the Disqualified stage", fmt: (c) => fmtInt(c.disqualified), lowerIsBetter: true },
+  { key: "qualified", label: "Qualified", group: "Quality", title: "Shows with non-DQ lead quality (Great / Ok / Barely Passable)", fmt: (c) => fmtInt(c.qualified) },
+  { key: "qualRate", label: "Qual%", group: "Quality", title: "Qualified ÷ shows", fmt: (c) => fmtPct(c.qualRate) },
+  { key: "leadQualityGreat", label: "Great", group: "Quality", title: "Lead quality 'Great'", fmt: (c) => fmtInt(c.leadQualityGreat) },
+  { key: "leadQualityOk", label: "Ok", group: "Quality", title: "Lead quality 'Ok'", fmt: (c) => fmtInt(c.leadQualityOk) },
+  { key: "leadQualityBarelyPassable", label: "Barely", group: "Quality", title: "Lead quality 'Barely Passable'", fmt: (c) => fmtInt(c.leadQualityBarelyPassable) },
+  { key: "leadQualityBadDq", label: "Bad/DQ", group: "Quality", title: "Lead quality 'Bad / DQ'", fmt: (c) => fmtInt(c.leadQualityBadDq), lowerIsBetter: true },
 ];
+
+/** Contiguous column groups → colSpans for the section-wrapper header row.
+ * Derived from NUMERIC_COLUMNS so the bands can't drift from the columns. */
+const COLUMN_GROUPS: { group: ColGroup; span: number }[] = NUMERIC_COLUMNS.reduce(
+  (acc, col) => {
+    const last = acc[acc.length - 1];
+    if (last && last.group === col.group) last.span += 1;
+    else acc.push({ group: col.group, span: 1 });
+    return acc;
+  },
+  [] as { group: ColGroup; span: number }[],
+);
+
+/** True if the numeric column at `idx` starts a new group (gets a left divider). */
+function isColGroupBoundary(idx: number): boolean {
+  return idx === 0 || NUMERIC_COLUMNS[idx].group !== NUMERIC_COLUMNS[idx - 1].group;
+}
+
+/** Group (section-wrapper) header cell — a sticky top band above the sortable
+ * column labels. Fixed h-6 so the label row can stick flush at top-6. */
+const groupHeadBase =
+  "sticky top-0 z-20 h-6 bg-zinc-50 dark:bg-zinc-900 px-2 py-1 text-[9px] font-bold text-zinc-400 whitespace-nowrap select-none";
 
 function SortArrow({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
@@ -407,13 +434,28 @@ function FunnelTable({
   // each <th> pins to its top so the column labels stay visible while the rows
   // scroll inside the table (not the page). Solid bg + inset bottom-border keep
   // the header opaque and divided as rows pass under it.
+  // top-6 so the label row sticks just below the h-6 group-band row above it.
   const headBase =
-    "sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
+    "sticky top-6 z-10 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
 
   return (
     <div className="mt-2 flex-1 min-h-0 overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
       <table className="w-full text-xs border-collapse">
         <thead className="text-[11px] uppercase tracking-wider">
+          {/* Row 1: section-wrapper group bands */}
+          <tr>
+            <th className={groupHeadBase} />
+            {COLUMN_GROUPS.map((g) => (
+              <th
+                key={g.group}
+                colSpan={g.span}
+                className={`${groupHeadBase} text-center border-l border-zinc-200 dark:border-zinc-800`}
+              >
+                {g.group}
+              </th>
+            ))}
+          </tr>
+          {/* Row 2: individual column labels (stick just below the group band) */}
           <tr>
             <th
               onClick={() => handleSort("segment")}
@@ -424,12 +466,16 @@ function FunnelTable({
                 <SortArrow active={sortKey === "segment"} dir={sortDir} />
               </span>
             </th>
-            {NUMERIC_COLUMNS.map((col) => (
+            {NUMERIC_COLUMNS.map((col, idx) => (
               <th
                 key={col.key}
                 onClick={() => handleSort(col.key)}
                 title={col.title}
-                className={`${headBase} text-right`}
+                className={`${headBase} text-right ${
+                  isColGroupBoundary(idx)
+                    ? "border-l border-zinc-200 dark:border-zinc-800"
+                    : ""
+                }`}
               >
                 <span className="inline-flex items-center justify-end gap-1">
                   {col.label}
@@ -556,7 +602,7 @@ function SegmentRow({
           )}
         </div>
       </td>
-      {NUMERIC_COLUMNS.map((col) => {
+      {NUMERIC_COLUMNS.map((col, idx) => {
         const v = c[col.key];
         const { min, max } = colStats[col.key];
         // For negative-signal columns the "best" (bold-emphasized) extreme is
@@ -569,7 +615,9 @@ function SegmentRow({
           <td
             key={col.key}
             style={bg ? { backgroundColor: bg } : undefined}
-            className={`${COL} ${leaderCls(v, best)}`}
+            className={`${COL} ${leaderCls(v, best)} ${
+              isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+            }`}
           >
             {col.fmt(c)}
           </td>
@@ -596,8 +644,13 @@ function TotalsRow({
           {includedCount} webinar{includedCount === 1 ? "" : "s"}
         </span>
       </td>
-      {NUMERIC_COLUMNS.map((col) => (
-        <td key={col.key} className={cls}>
+      {NUMERIC_COLUMNS.map((col, idx) => (
+        <td
+          key={col.key}
+          className={`${cls} ${
+            isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+          }`}
+        >
           {col.fmt(c)}
         </td>
       ))}
