@@ -320,7 +320,7 @@ const NUMERIC_COLUMNS: { key: CellKey; label: string; title?: string; fmt: (c: F
   { key: "invites", label: "Leads", title: "Distinct contacts mailed from this source", fmt: (c) => fmtInt(c.invites) },
   { key: "regs", label: "Regs", fmt: (c) => fmtInt(c.regs) },
   { key: "regPct", label: "Reg%", fmt: (c) => fmtPct(c.regPct) },
-  { key: "attendees10m", label: "Attendees (10m+)", fmt: (c) => fmtInt(c.attendees10m) },
+  { key: "attendees10m", label: "Attendees (10min+)", fmt: (c) => fmtInt(c.attendees10m) },
   { key: "attOfInv", label: "Att% (of leads)", title: "10-min+ attendees ÷ leads", fmt: (c) => fmtPct(c.attOfInv) },
   { key: "attOfReg", label: "Att% (of reg)", title: "10-min+ attendees ÷ registrations", fmt: (c) => fmtPct(c.attOfReg) },
   { key: "bookings", label: "Bookings", fmt: (c) => fmtInt(c.bookings) },
