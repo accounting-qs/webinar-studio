@@ -96,6 +96,64 @@ function deriveCells(r: SegmentFunnelRow): FunnelCells {
   };
 }
 
+/* ── Quality recommendation (attendance-led + booking tiebreak) ─────────── */
+
+/** Below this invite volume a segment's attendance/booking counts are too thin
+ * to judge, so no recommendation is offered. Attendance only firms up around
+ * here (~29 attendees at the portfolio rate); bookings stay sparse regardless,
+ * which is why they carry the lighter weight below. Tunable. */
+const MIN_INVITES_FOR_RECO = 50_000;
+const ATT_WEIGHT = 0.7;
+const BOOK_WEIGHT = 0.3;
+/** Clamp the booking ratio so one fluke booking streak can't override the
+ * (more reliable) attendance signal. */
+const BOOK_RATIO_CAP = 3;
+const GOOD_AT = 1.15; // combined score ≥ → good
+const BAD_AT = 0.85; // combined score ≤ → bad
+
+type Benchmark = { attPerInv: number; bookPerInv: number };
+
+/** Portfolio benchmark from the named bucket rows only (bucketId !== null) —
+ * mirrors colStats, which excludes the "Other (no bucket)" catch-all and the
+ * Total so they don't skew the average. null when there's nothing to divide by. */
+function computeBenchmark(rows: SegmentFunnelRow[]): Benchmark | null {
+  let inv = 0;
+  let att = 0;
+  let book = 0;
+  for (const r of rows) {
+    if (r.bucketId === null) continue;
+    inv += r.invites;
+    att += r.attendees10m;
+    book += r.bookings;
+  }
+  if (inv <= 0 || att <= 0) return null;
+  return { attPerInv: att / inv, bookPerInv: book / inv };
+}
+
+type Recommendation = { quality: BucketQuality; score: number; a: number; b: number };
+
+/** Attendance-led quality suggestion for a segment, scored against the portfolio
+ * benchmark. null when the segment hasn't cleared the volume gate or the
+ * benchmark is unusable. Attendance-per-invite carries the score (70%);
+ * bookings-per-invite nudge borderline cases (30%, clamped). */
+function computeRecommendation(
+  row: SegmentFunnelRow,
+  bench: Benchmark | null,
+): Recommendation | null {
+  if (bench === null || row.bucketId === null) return null;
+  if (row.invites < MIN_INVITES_FOR_RECO) return null;
+  const a = row.invites > 0 ? row.attendees10m / row.invites / bench.attPerInv : 0;
+  const bRaw =
+    bench.bookPerInv > 0 && row.invites > 0
+      ? row.bookings / row.invites / bench.bookPerInv
+      : 0;
+  const b = Math.min(bRaw, BOOK_RATIO_CAP);
+  const score = ATT_WEIGHT * a + BOOK_WEIGHT * b;
+  const quality: BucketQuality =
+    score >= GOOD_AT ? "good" : score <= BAD_AT ? "bad" : "medium";
+  return { quality, score, a, b };
+}
+
 /* ── Tab ────────────────────────────────────────────────────────────────── */
 
 export function SegmentsTab() {
@@ -175,6 +233,37 @@ export function SegmentsTab() {
     [refresh],
   );
 
+  // Apply a quality to several buckets at once (bulk approve / override). Same
+  // optimistic-then-persist pattern as setSegmentQuality; on any failure surface
+  // the error and reload to resync.
+  const setSegmentQualities = useCallback(
+    async (updates: { bucketId: string; quality: BucketQuality }[]) => {
+      if (updates.length === 0) return;
+      const map = new Map(updates.map((u) => [u.bucketId, u.quality]));
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              segments: prev.segments.map((s) =>
+                s.bucketId && map.has(s.bucketId)
+                  ? { ...s, quality: map.get(s.bucketId)! }
+                  : s,
+              ),
+            }
+          : prev,
+      );
+      try {
+        await Promise.all(
+          updates.map((u) => updateBucketQuality(u.bucketId, u.quality)),
+        );
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        refresh();
+      }
+    },
+    [refresh],
+  );
+
   if (loading) {
     return <div className="px-6 py-5 text-xs text-zinc-500">Loading…</div>;
   }
@@ -202,6 +291,8 @@ export function SegmentsTab() {
             <p className="text-xs text-zinc-500 mt-0.5">
               High-level funnel rolled up by bucket across the selected webinars.
               Percentages are computed from summed totals, not averaged per-webinar rates.
+              Quality suggestions appear once a segment passes{" "}
+              {MIN_INVITES_FOR_RECO.toLocaleString()} invites.
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -241,6 +332,7 @@ export function SegmentsTab() {
             totals={data.totals}
             includedCount={data.includedWebinarIds.length - data.pendingWebinarIds.length}
             onSetQuality={setSegmentQuality}
+            onBulkSetQuality={setSegmentQualities}
           />
         </div>
       )}
@@ -350,15 +442,22 @@ function FunnelTable({
   totals,
   includedCount,
   onSetQuality,
+  onBulkSetQuality,
 }: {
   segments: SegmentFunnelRow[];
   totals: SegmentFunnelRow;
   includedCount: number;
   onSetQuality: (bucketId: string, quality: BucketQuality | null) => void;
+  onBulkSetQuality: (
+    updates: { bucketId: string; quality: BucketQuality }[],
+  ) => void;
 }) {
   // Default to invites desc — matches the server's initial ordering.
   const [sortKey, setSortKey] = useState<SortKey>("invites");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  // Bulk-approve selection — bucketIds ticked in the Segment column. Only rows
+  // with a still-pending suggestion are selectable (see pendingIds below).
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const handleSort = (key: SortKey) => {
     if (key === sortKey) {
@@ -427,6 +526,68 @@ function FunnelTable({
     [segments],
   );
 
+  // Portfolio benchmark + per-segment quality suggestions (attendance-led).
+  const benchmark = useMemo(() => computeBenchmark(segments), [segments]);
+  const recos = useMemo(() => {
+    const m = new Map<string, Recommendation>();
+    for (const s of segments) {
+      if (s.bucketId === null) continue;
+      const rec = computeRecommendation(s, benchmark);
+      if (rec) m.set(s.bucketId, rec);
+    }
+    return m;
+  }, [segments, benchmark]);
+
+  // Rows with a live suggestion still awaiting a decision (quality unset). These
+  // are the only selectable / approvable rows.
+  const pendingIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of segments) {
+      if (s.bucketId && s.quality === null && recos.has(s.bucketId)) {
+        ids.add(s.bucketId);
+      }
+    }
+    return ids;
+  }, [segments, recos]);
+
+  // Selection pruned to rows that are still pending — approved rows drop out on
+  // the next render so a stale id can't linger in the bulk bar.
+  const selectedPending = useMemo(() => {
+    const n = new Set<string>();
+    for (const id of selected) if (pendingIds.has(id)) n.add(id);
+    return n;
+  }, [selected, pendingIds]);
+
+  const toggleOne = (id: string) =>
+    setSelected((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+
+  const allPendingSelected =
+    pendingIds.size > 0 && selectedPending.size === pendingIds.size;
+  const toggleAllPending = () =>
+    setSelected(allPendingSelected ? new Set() : new Set(pendingIds));
+  const clearSelection = () => setSelected(new Set());
+
+  const approveSuggested = () => {
+    const updates: { bucketId: string; quality: BucketQuality }[] = [];
+    for (const id of selectedPending) {
+      const rec = recos.get(id);
+      if (rec) updates.push({ bucketId: id, quality: rec.quality });
+    }
+    onBulkSetQuality(updates);
+    clearSelection();
+  };
+  const overrideSelected = (quality: BucketQuality) => {
+    onBulkSetQuality(
+      Array.from(selectedPending).map((id) => ({ bucketId: id, quality })),
+    );
+    clearSelection();
+  };
+
   if (segments.length === 0) {
     return (
       <div className="mt-4 text-xs text-zinc-500 py-8 text-center border border-dashed border-zinc-300 dark:border-zinc-800 rounded-lg">
@@ -448,7 +609,37 @@ function FunnelTable({
     "sticky top-6 left-0 z-30 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 font-semibold text-zinc-500 dark:text-zinc-500 whitespace-nowrap cursor-pointer select-none hover:bg-zinc-100 dark:hover:bg-zinc-800 shadow-[inset_0_-1px_0_#e4e4e7] dark:shadow-[inset_0_-1px_0_#27272a]";
 
   return (
-    <div className="mt-2 flex-1 min-h-0 overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
+    <div className="mt-2 flex-1 min-h-0 flex flex-col">
+      {selectedPending.size > 0 && (
+        <div className="shrink-0 mb-2 flex items-center gap-2 flex-wrap rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs">
+          <span className="font-semibold text-zinc-700 dark:text-zinc-200">
+            {selectedPending.size} selected
+          </span>
+          <button
+            onClick={approveSuggested}
+            className="rounded-md bg-violet-600 hover:bg-violet-500 px-2.5 py-1 font-semibold text-white"
+          >
+            Approve suggested ({selectedPending.size})
+          </button>
+          <span className="text-zinc-400 dark:text-zinc-500">or mark selected</span>
+          {(["good", "medium", "bad"] as BucketQuality[]).map((q) => (
+            <button
+              key={q}
+              onClick={() => overrideSelected(q)}
+              className={`rounded-md border bg-white dark:bg-zinc-900 px-2 py-1 font-semibold hover:bg-zinc-50 dark:hover:bg-zinc-800 ${QUALITY_META[q].cls}`}
+            >
+              {QUALITY_META[q].label}
+            </button>
+          ))}
+          <button
+            onClick={clearSelection}
+            className="ml-auto text-zinc-500 hover:underline"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+      <div className="flex-1 min-h-0 overflow-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
       <table className="w-full text-xs border-collapse">
         <thead className="text-[11px] uppercase tracking-wider">
           {/* Row 1: section-wrapper group bands */}
@@ -471,6 +662,15 @@ function FunnelTable({
               className={`${headCorner} text-left min-w-[220px]`}
             >
               <span className="inline-flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={allPendingSelected}
+                  disabled={pendingIds.size === 0}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={toggleAllPending}
+                  title="Select all suggested segments"
+                  className="accent-violet-500 align-middle disabled:opacity-40 cursor-pointer"
+                />
                 Segment
                 <SortArrow active={sortKey === "segment"} dir={sortDir} />
               </span>
@@ -495,9 +695,23 @@ function FunnelTable({
           </tr>
         </thead>
         <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
-          {sortedNamed.map((s) => (
-            <SegmentRow key={s.bucketId} row={s} colStats={colStats} isOther={false} onSetQuality={onSetQuality} />
-          ))}
+          {sortedNamed.map((s) => {
+            const reco = s.bucketId ? recos.get(s.bucketId) ?? null : null;
+            const pending = !!(s.bucketId && s.quality === null && reco);
+            return (
+              <SegmentRow
+                key={s.bucketId}
+                row={s}
+                colStats={colStats}
+                isOther={false}
+                onSetQuality={onSetQuality}
+                reco={reco}
+                pending={pending}
+                checked={s.bucketId ? selectedPending.has(s.bucketId) : false}
+                onToggle={s.bucketId ? () => toggleOne(s.bucketId!) : undefined}
+              />
+            );
+          })}
           {otherRows.map((s, i) => (
             <SegmentRow key={`other-${i}`} row={s} colStats={colStats} isOther />
           ))}
@@ -506,6 +720,7 @@ function FunnelTable({
           <TotalsRow totals={totals} includedCount={includedCount} />
         </tfoot>
       </table>
+      </div>
     </div>
   );
 }
@@ -598,16 +813,53 @@ function QualitySelect({
   );
 }
 
+/** The suggested quality for a pending segment: a colored chip plus a one-click
+ * Approve that writes the recommendation onto the bucket. The title spells out
+ * the score so the suggestion is auditable. */
+function SuggestionChip({
+  reco,
+  onApprove,
+}: {
+  reco: Recommendation;
+  onApprove: () => void;
+}) {
+  const meta = QUALITY_META[reco.quality];
+  const title = `Suggested from attendance ${reco.a.toFixed(2)}× avg + bookings ${reco.b.toFixed(
+    2,
+  )}× avg → score ${reco.score.toFixed(2)}`;
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1" title={title}>
+      <span className={`rounded border px-1.5 py-0.5 text-[11px] font-semibold ${meta.cls}`}>
+        Suggested: {meta.label}
+      </span>
+      <button
+        onClick={onApprove}
+        className="rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
+      >
+        Approve
+      </button>
+    </span>
+  );
+}
+
 function SegmentRow({
   row,
   colStats,
   isOther,
   onSetQuality,
+  reco,
+  pending,
+  checked,
+  onToggle,
 }: {
   row: SegmentFunnelRow;
   colStats: Record<CellKey, number[]>;
   isOther: boolean;
   onSetQuality?: (bucketId: string, quality: BucketQuality | null) => void;
+  reco?: Recommendation | null;
+  pending?: boolean;
+  checked?: boolean;
+  onToggle?: () => void;
 }) {
   const c = deriveCells(row);
   return (
@@ -621,7 +873,24 @@ function SegmentRow({
         title={row.bucketName ?? ""}
       >
         <div className="flex items-center gap-2">
+          {pending && onToggle ? (
+            <input
+              type="checkbox"
+              checked={!!checked}
+              onChange={onToggle}
+              title="Select for bulk approve"
+              className="accent-violet-500 align-middle cursor-pointer"
+            />
+          ) : (
+            !isOther && <span className="inline-block w-[13px] shrink-0" />
+          )}
           <span className="truncate">{row.bucketName ?? "—"}</span>
+          {!isOther && row.bucketId && onSetQuality && pending && reco && (
+            <SuggestionChip
+              reco={reco}
+              onApprove={() => onSetQuality(row.bucketId!, reco.quality)}
+            />
+          )}
           {!isOther && row.bucketId && onSetQuality && (
             <QualitySelect
               value={row.quality}
