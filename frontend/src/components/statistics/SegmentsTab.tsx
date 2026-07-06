@@ -373,22 +373,22 @@ function FunnelTable({
     [segments],
   );
 
-  // Per-column min/max across the named bucket rows — drives both the
-  // column-leader emphasis and the red→green heatmap. "Other"/Total are
-  // excluded so a catch-all bucket doesn't skew the scale.
+  // Per-column sorted non-null values across the named bucket rows. Drives a
+  // rank-based (quantile) heatmap — color tracks a value's position in the
+  // ranked order, not its distance from the max — so a single standout segment
+  // can't stretch the scale and wash everyone else red. Also feeds the
+  // column-leader emphasis (min/max are the ends of the sorted array).
+  // "Other"/Total are excluded so a catch-all bucket doesn't skew the ranking.
   const colStats = useMemo(() => {
-    const s = {} as Record<CellKey, { min: number; max: number }>;
+    const s = {} as Record<CellKey, number[]>;
     for (const col of NUMERIC_COLUMNS) {
-      let min = Infinity;
-      let max = -Infinity;
+      const vals: number[] = [];
       for (const c of namedCells) {
         const v = c[col.key];
-        if (v !== null) {
-          if (v < min) min = v;
-          if (v > max) max = v;
-        }
+        if (v !== null) vals.push(v);
       }
-      s[col.key] = { min, max };
+      vals.sort((a, b) => a - b);
+      s[col.key] = vals;
     }
     return s;
   }, [namedCells]);
@@ -507,17 +507,36 @@ function leaderCls(value: number | null, max: number): string {
     : "text-zinc-700 dark:text-zinc-300";
 }
 
-/** Red→amber→green heat background for a cell, positioned by where its value
- * falls in the column's [min,max] (higher = greener by default). Pass
- * invert=true for negative-signal columns (No Shows, Canceled, DQ, Bad/DQ) so
- * the LOW end greens instead. Returns a translucent rgba so it reads on both
- * light and dark rows, or undefined when there's nothing to scale (null value,
- * or a single distinct value). */
-function heatBg(value: number | null, min: number, max: number, invert = false): string | undefined {
-  if (value === null || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
-    return undefined;
+/** A value's quantile (0–1) within the column's sorted values, using
+ * average-rank for ties so equal values share a color: min → 0, median → ~0.5,
+ * max → 1. null when there's nothing to rank against (0/1 values, or no spread
+ * at all). Ranking by position — not raw magnitude — is what keeps the heatmap
+ * robust to a single outlying segment. */
+function quantileRank(value: number, sorted: number[]): number | null {
+  const n = sorted.length;
+  if (n <= 1 || sorted[0] === sorted[n - 1]) return null;
+  let below = 0;
+  let equal = 0;
+  for (const x of sorted) {
+    if (x < value) below++;
+    else if (x === value) equal++;
   }
-  let t = (value - min) / (max - min); // 0 = worst (red), 1 = best (green)
+  const avgRank = below + (equal - 1) / 2; // 0-indexed average rank among ties
+  return avgRank / (n - 1);
+}
+
+/** Red→amber→green heat background for a cell, positioned by the value's RANK
+ * (quantile) within the column — median → amber, best → green, worst → red — so
+ * one standout segment can't stretch the scale and push everyone else to red.
+ * Pass invert=true for negative-signal columns (No Shows, Canceled, DQ, Bad/DQ)
+ * so the LOW end greens instead. Returns a translucent rgba so it reads on both
+ * light and dark rows, or undefined when there's nothing to rank (null value,
+ * or a column with no spread). */
+function heatBg(value: number | null, sorted: number[], invert = false): string | undefined {
+  if (value === null) return undefined;
+  const q = quantileRank(value, sorted);
+  if (q === null) return undefined;
+  let t = q; // 0 = worst (red), 1 = best (green)
   if (invert) t = 1 - t; // fewer = better: flip so low values read green
   const stops: [number, number, number][] = [
     [239, 68, 68], // red-500
@@ -577,7 +596,7 @@ function SegmentRow({
   onSetQuality,
 }: {
   row: SegmentFunnelRow;
-  colStats: Record<CellKey, { min: number; max: number }>;
+  colStats: Record<CellKey, number[]>;
   isOther: boolean;
   onSetQuality?: (bucketId: string, quality: BucketQuality | null) => void;
 }) {
@@ -604,13 +623,13 @@ function SegmentRow({
       </td>
       {NUMERIC_COLUMNS.map((col, idx) => {
         const v = c[col.key];
-        const { min, max } = colStats[col.key];
+        const sorted = colStats[col.key];
         // For negative-signal columns the "best" (bold-emphasized) extreme is
         // the low end, and the heatmap greens the low end too.
-        const best = col.lowerIsBetter ? min : max;
+        const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
         // Heat only the named segment rows; the "Other (no bucket)" catch-all
         // isn't part of the comparison set.
-        const bg = isOther ? undefined : heatBg(v, min, max, col.lowerIsBetter);
+        const bg = isOther ? undefined : heatBg(v, sorted, col.lowerIsBetter);
         return (
           <td
             key={col.key}
