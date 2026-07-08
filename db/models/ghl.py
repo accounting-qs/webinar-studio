@@ -72,6 +72,12 @@ class GHLOpportunity(Base):
     call1_appointment_status: Mapped[Optional[str]] = mapped_column(Text)
     call1_appointment_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     call1_booking_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call2_appointment_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call2_appointment_status: Mapped[Optional[str]] = mapped_column(Text)
+    # Provenance for the call1_* columns: 'calendar' (derived from real calendar
+    # appointments) or 'custom_field' (legacy GHL custom-field fallback when the
+    # contact has no first-call appointment).
+    call1_source: Mapped[Optional[str]] = mapped_column(Text)
 
     # Opportunity owner (Sales Rep): GHL `assignedTo` user id + resolved name
     assigned_to_id: Mapped[Optional[str]] = mapped_column(Text)
@@ -92,6 +98,49 @@ class GHLOpportunity(Base):
         Index("ix_ghl_opp_contact", "ghl_contact_id"),
         Index("ix_ghl_opp_stage", "pipeline_stage_id"),
         Index("ix_ghl_opp_lead_quality", "lead_quality"),
+    )
+
+
+class GHLCalendar(Base):
+    """Cached {calendar_id: name} map + name-based classification.
+
+    Classified at sync time by services.ghl_appointments.classify_calendar:
+    calendar_class is 'first' | 'followup' | 'exclude'; funnel_tag is an
+    optional 'webinar' | 'outreach' | 'referral' hint on 1st-call calendars.
+    """
+    __tablename__ = "ghl_calendar"
+
+    calendar_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(Text)
+    calendar_class: Mapped[Optional[str]] = mapped_column(Text)
+    funnel_tag: Mapped[Optional[str]] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GHLAppointment(Base):
+    """One row per GHL calendar appointment booked on a contact.
+
+    The source of truth for 1st/2nd call date + status — replaces the
+    unreliable opportunity custom fields. `calendar_class` is denormalized
+    from ghl_calendar at write time so a later-deleted calendar can't strand
+    the row's classification.
+    """
+    __tablename__ = "ghl_appointment"
+
+    appointment_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(Text)
+    calendar_id: Mapped[Optional[str]] = mapped_column(Text)
+    calendar_class: Mapped[Optional[str]] = mapped_column(Text)
+    start_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    status: Mapped[Optional[str]] = mapped_column(Text)
+    booked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ghl_appt_contact", "ghl_contact_id"),
+        Index("ix_ghl_appt_class", "calendar_class"),
     )
 
 

@@ -28,7 +28,8 @@ from db.models.connectors import (  # noqa: F401
     ConnectorCredential, WebinarGeekWebinar, WebinarGeekSubscriber,
 )
 from db.models.ghl import (  # noqa: F401
-    GHLContact, GHLOpportunity, GHLSyncRun, GHLSyncSettings, GHLWebinarStats,
+    GHLAppointment, GHLCalendar, GHLContact, GHLOpportunity, GHLSyncRun,
+    GHLSyncSettings, GHLWebinarStats,
 )
 from db.models.blocklist import BlocklistEntry  # noqa: F401
 from db.models.webinar_calendar import (  # noqa: F401

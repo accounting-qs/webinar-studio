@@ -25,8 +25,14 @@ from sqlalchemy import select, text as sa_text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import BlocklistEntry, GHLContact, GHLOpportunity, GHLSyncRun, GHLSyncSettings, GHLWebinarStats
+import httpx
+
+from db.models import (
+    BlocklistEntry, GHLAppointment, GHLCalendar, GHLContact, GHLOpportunity,
+    GHLSyncRun, GHLSyncSettings, GHLWebinarStats,
+)
 from db.session import AsyncSessionLocal
+from services.ghl_appointments import classify_calendar, derive_calls
 from integrations.ghl_client import (
     CONTACT_FIELD_BOOK_CAMPAIGN_CONTENT,
     CONTACT_FIELD_BOOK_CAMPAIGN_ID,
@@ -295,6 +301,231 @@ async def _upsert_opps_batch(db: AsyncSession, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Appointments: fetch real calendar appointments → derive call1/call2
+# ---------------------------------------------------------------------------
+
+# Bounded concurrency for the per-contact /appointments fetch. GHL's v2 burst
+# is ~10 req/s; the /appointments endpoint 429s hard above that. 4 concurrent
+# workers each pacing ~0.2s between requests keeps us ~8 req/s — under the
+# ceiling with retry headroom, ~4× faster than serial. DB writes stay
+# sequential (one writer).
+_APPT_FETCH_CONCURRENCY = 4
+_APPT_FETCH_PACE_S = 0.2
+# How many contacts to fetch before flushing rows + writing a heartbeat.
+_APPT_CHUNK = 300
+
+
+def _chunked(seq: list, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _normalize_appt_row(a: dict, contact_id: str, cal_map: dict[str, tuple[str, str | None]]) -> dict | None:
+    """Normalize a raw GHL appointment into a ghl_appointment row, or None if
+    it has no id. calendar_class is denormalized from the classified cal_map."""
+    appt_id = a.get("id")
+    if not appt_id:
+        return None
+    calendar_id = a.get("calendarId")
+    cal_class = cal_map.get(calendar_id, (None, None))[0] if calendar_id else None
+    return {
+        "appointment_id": appt_id,
+        "ghl_contact_id": a.get("contactId") or contact_id,
+        "calendar_id": calendar_id,
+        "calendar_class": cal_class,
+        "start_time": _parse_dt(a.get("startTime")),
+        "status": a.get("appointmentStatus") or a.get("status"),
+        "booked_at": _parse_dt(a.get("createdAt") or a.get("dateAdded")),
+        "deleted": bool(a.get("deleted")),
+        "raw": a,
+        "synced_at": datetime.now(timezone.utc),
+    }
+
+
+async def _upsert_appts_batch(db: AsyncSession, rows: list[dict]) -> None:
+    if not rows:
+        return
+    stmt = pg_insert(GHLAppointment).values(rows)
+    update_cols = {k: getattr(stmt.excluded, k) for k in rows[0].keys() if k != "appointment_id"}
+    stmt = stmt.on_conflict_do_update(index_elements=["appointment_id"], set_=update_cols)
+    await db.execute(stmt)
+
+
+async def _sync_calendars(client: GHLClient) -> dict[str, tuple[str, str | None]]:
+    """Fetch + classify the location's calendars, upsert ghl_calendar, and
+    return {calendar_id: (calendar_class, funnel_tag)} for appointment tagging."""
+    names = await client.fetch_calendars()
+    cal_map: dict[str, tuple[str, str | None]] = {}
+    rows: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for cid, name in names.items():
+        cls, tag = classify_calendar(name)
+        cal_map[cid] = (cls, tag)
+        rows.append({
+            "calendar_id": cid, "name": name, "calendar_class": cls,
+            "funnel_tag": tag, "fetched_at": now,
+        })
+    if rows:
+        async with AsyncSessionLocal() as db:
+            stmt = pg_insert(GHLCalendar).values(rows)
+            update_cols = {k: getattr(stmt.excluded, k) for k in rows[0].keys() if k != "calendar_id"}
+            stmt = stmt.on_conflict_do_update(index_elements=["calendar_id"], set_=update_cols)
+            await db.execute(stmt)
+            await db.commit()
+    return cal_map
+
+
+async def _opp_contact_ids(updated_after: datetime | None) -> list[str]:
+    """Distinct contact ids that have an opportunity. Incremental syncs narrow
+    to opps touched in the window; full sync returns every opp contact."""
+    async with AsyncSessionLocal() as db:
+        q = select(GHLOpportunity.ghl_contact_id).where(GHLOpportunity.ghl_contact_id.isnot(None))
+        if updated_after is not None:
+            q = q.where(GHLOpportunity.updated_at_ghl >= updated_after)
+        q = q.distinct()
+        result = await db.execute(q)
+        return [r for (r,) in result.all() if r]
+
+
+async def _fetch_and_store_appointments(
+    client: GHLClient,
+    state: _SyncState,
+    contact_ids: list[str],
+    cal_map: dict[str, tuple[str, str | None]],
+) -> None:
+    """Fetch /contacts/{id}/appointments for each contact with bounded
+    concurrency and upsert into ghl_appointment. A contact that can't be
+    fetched is skipped (logged) — we never delete or NULL existing rows."""
+    sem = asyncio.Semaphore(_APPT_FETCH_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=60.0) as http:
+        async def fetch_one(cid: str):
+            async with sem:
+                try:
+                    return cid, await client.fetch_contact_appointments(http, cid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    state.errors.append({"type": "appointments_fetch", "id": cid, "error": str(exc)[:500]})
+                    logger.warning("Failed to fetch appointments for contact %s: %s", cid, exc)
+                    return None
+                finally:
+                    # Pace within the held semaphore slot so overall throughput
+                    # stays under GHL's rate ceiling.
+                    await asyncio.sleep(_APPT_FETCH_PACE_S)
+
+        for chunk in _chunked(contact_ids, _APPT_CHUNK):
+            results = await asyncio.gather(*(fetch_one(c) for c in chunk))
+            rows: list[dict] = []
+            for res in results:
+                if res is None:
+                    continue
+                cid, raw = res
+                for a in raw:
+                    row = _normalize_appt_row(a, cid, cal_map)
+                    if row is not None:
+                        rows.append(row)
+            if rows:
+                # Fresh session per chunk (see reliability note in _stream_into_upserts).
+                async with AsyncSessionLocal() as db:
+                    try:
+                        for sub in _chunked(rows, _UPSERT_BATCH_SIZE):
+                            await _upsert_appts_batch(db, sub)
+                        await db.commit()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        state.errors.append({"type": "appointment_batch", "size": len(rows), "error": str(exc)[:500]})
+                        logger.exception("Failed to upsert appointment batch")
+                        await db.rollback()
+            await _heartbeat(state)
+
+
+async def _derive_calls_for_contacts(state: _SyncState, contact_ids: list[str]) -> None:
+    """Re-derive call1/call2 for every opportunity whose contact is in the set,
+    from that contact's stored appointments, and bulk-update ghl_opportunity.
+
+    Opps whose contact has a first-call appointment get calendar-derived values
+    (call1_source='calendar'); opps with no first-call keep their existing
+    custom-field values and are only tagged call1_source='custom_field'."""
+    for chunk in _chunked(contact_ids, 1000):
+        async with AsyncSessionLocal() as db:
+            appt_res = await db.execute(
+                select(
+                    GHLAppointment.ghl_contact_id, GHLAppointment.calendar_class,
+                    GHLAppointment.start_time, GHLAppointment.status,
+                    GHLAppointment.booked_at, GHLAppointment.deleted,
+                ).where(GHLAppointment.ghl_contact_id.in_(chunk))
+            )
+            by_contact: dict[str, list[dict]] = {}
+            for cid, cls, start, status, booked, deleted in appt_res.all():
+                by_contact.setdefault(cid, []).append({
+                    "calendar_class": cls, "start_time": start, "status": status,
+                    "booked_at": booked, "deleted": deleted,
+                })
+
+            opp_res = await db.execute(
+                select(GHLOpportunity.ghl_opportunity_id, GHLOpportunity.ghl_contact_id)
+                .where(GHLOpportunity.ghl_contact_id.in_(chunk))
+            )
+
+            calendar_updates: list[dict] = []
+            fallback_ids: list[str] = []
+            for opp_id, cid in opp_res.all():
+                derived = derive_calls(by_contact.get(cid, []))
+                if derived.get("has_call1"):
+                    calendar_updates.append({
+                        "ghl_opportunity_id": opp_id,
+                        "call1_source": derived["call1_source"],
+                        "call1_appointment_status": derived["call1_appointment_status"],
+                        "call1_appointment_date": derived["call1_appointment_date"],
+                        "call1_booking_date": derived["call1_booking_date"],
+                        "call2_appointment_date": derived["call2_appointment_date"],
+                        "call2_appointment_status": derived["call2_appointment_status"],
+                    })
+                else:
+                    fallback_ids.append(opp_id)
+
+            if calendar_updates:
+                await db.execute(update(GHLOpportunity), calendar_updates)
+            if fallback_ids:
+                await db.execute(
+                    update(GHLOpportunity)
+                    .where(GHLOpportunity.ghl_opportunity_id.in_(fallback_ids))
+                    .values(call1_source="custom_field")
+                )
+            await db.commit()
+        await _heartbeat(state)
+
+
+async def sync_appointments_and_derive(
+    client: GHLClient,
+    state: _SyncState,
+    *,
+    updated_after: datetime | None = None,
+) -> None:
+    """Third sync stage: calendars → appointments → derive call1/call2.
+
+    Best-effort — any failure is recorded on state.errors but must not abort the
+    surrounding sync, which has already upserted contacts + opportunities."""
+    try:
+        cal_map = await _sync_calendars(client)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state.errors.append({"type": "calendars_fetch", "error": str(exc)[:500]})
+        logger.exception("Failed to fetch/classify calendars — skipping appointment stage")
+        return
+
+    contact_ids = await _opp_contact_ids(updated_after)
+    if not contact_ids:
+        return
+    logger.info("Appointment stage: %d opportunity-linked contacts", len(contact_ids))
+    await _fetch_and_store_appointments(client, state, contact_ids, cal_map)
+    await _derive_calls_for_contacts(state, contact_ids)
+
+
+# ---------------------------------------------------------------------------
 # Sync v2: lifecycle, heartbeats, cancellation, recovery
 # ---------------------------------------------------------------------------
 
@@ -401,12 +632,17 @@ async def _stream_into_upserts(
         await queue.put(sentinel)
 
     async def consumer() -> None:
-        async with AsyncSessionLocal() as db:
-            while True:
-                item = await queue.get()
-                if item is sentinel:
-                    break
-                batch: list[dict] = item
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                break
+            batch: list[dict] = item
+            # Fresh session per batch. Managed poolers (Supabase/PgBouncer) close
+            # connections held idle too long, so we never keep one session open
+            # across the whole multi-hour stream. On error we roll back the
+            # (possibly dead) session and drop it — the next batch opens a clean
+            # one, so one bad row / connection drop can't cascade.
+            async with AsyncSessionLocal() as db:
                 try:
                     await upsert_batch(db, batch)
                     if is_contacts:
@@ -414,13 +650,13 @@ async def _stream_into_upserts(
                     else:
                         state.opportunities_synced += len(batch)
                     await db.commit()
-                    await _heartbeat(state)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     state.errors.append({"type": batch_kind, "size": len(batch), "error": str(exc)[:500]})
                     logger.exception("Failed to upsert %s batch", batch_kind)
                     await db.rollback()
+            await _heartbeat(state)
 
     await asyncio.gather(producer(), consumer())
 
@@ -557,6 +793,14 @@ async def run_sync(sync_type: SyncType, trigger: SyncTrigger = "scheduled") -> s
                 is_contacts=False,
                 error_kind="opportunity",
                 batch_kind="opp_batch",
+            )
+            await _heartbeat(state)
+
+            # Calendar-derived call1/call2 truth (replaces the unreliable opp
+            # custom fields). Scoped to opps in the window for incrementals.
+            await sync_appointments_and_derive(
+                client, state,
+                updated_after=(updated_after if sync_type_effective == "incremental" else None),
             )
             await _heartbeat(state)
 
@@ -712,6 +956,10 @@ async def run_webinar_sync(
                     error_kind="opportunity",
                     batch_kind="opp_batch",
                 )
+                await _heartbeat(state)
+
+                # Calendar-derived call1/call2 truth for this webinar's opps.
+                await sync_appointments_and_derive(client, state)
                 await _heartbeat(state)
 
             # New data → cached statistics responses are stale. Drop the

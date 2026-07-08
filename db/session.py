@@ -18,6 +18,10 @@ engine = create_async_engine(
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,
+    # Managed poolers (Supabase/PgBouncer) close connections held/idle beyond a
+    # few minutes. Recycle before that so a long-running sync never hands out a
+    # server-closed connection mid-operation.
+    pool_recycle=1800,
 )
 
 AsyncSessionLocal = async_sessionmaker(

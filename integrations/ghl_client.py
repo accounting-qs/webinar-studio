@@ -403,6 +403,46 @@ class GHLClient:
                 out[uid] = name
         return out
 
+    # ------------------------------------------------------------------
+    # Calendars + appointments (source of truth for 1st/2nd call tracking)
+    # ------------------------------------------------------------------
+
+    async def fetch_calendars(self) -> dict[str, str]:
+        """Return {calendar_id: name} for the location's calendars.
+
+        Used to classify each appointment's calendar by name (see
+        services.ghl_appointments.classify_calendar). Cheap — one request.
+        """
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            data = await self._get(
+                client, "/calendars/", {"locationId": self._location_id}
+            )
+        out: dict[str, str] = {}
+        for cal in data.get("calendars", []) or []:
+            cid = cal.get("id")
+            if not cid:
+                continue
+            out[cid] = (cal.get("name") or "").strip()
+        return out
+
+    async def fetch_contact_appointments(
+        self, client: httpx.AsyncClient, contact_id: str
+    ) -> list[dict]:
+        """Return the raw appointment dicts for one contact.
+
+        Each item has id, calendarId, startTime, appointmentStatus (Showed |
+        No Show | Cancelled | Confirmed), createdAt, deleted. Shares a passed-in
+        client so the caller can bound concurrency across many contacts; retries
+        429/5xx via _request_with_retry.
+        """
+        data = await self._get(
+            client, f"/contacts/{contact_id}/appointments", {}
+        )
+        events = data.get("events")
+        if events is None:
+            events = data.get("appointments") or []
+        return events or []
+
     async def count_contacts_with_filter(self, filters: list[dict]) -> int:
         """Return the total count matching a filter in a single request.
 
