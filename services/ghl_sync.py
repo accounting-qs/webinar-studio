@@ -815,6 +815,48 @@ async def run_sync(sync_type: SyncType, trigger: SyncTrigger = "scheduled") -> s
             return state.run_id
 
 
+async def run_opportunities_sync(trigger: SyncTrigger = "scheduled") -> str:
+    """Sync ALL opportunities + their calendar appointments — no contacts pull.
+
+    This is the focused "sales + qualification" refresh: it pulls every
+    opportunity in the pipeline, fetches the real calendar appointments for the
+    opportunity-linked contacts, and derives call1/call2 date + status onto each
+    opportunity. Lighter and faster than a full sync (which also re-pulls the
+    contacts base). Every webinar's Sales + Quality metrics read the resulting
+    columns, so this alone refreshes them across all webinars.
+    """
+    if _sync_lock.locked():
+        logger.warning("Sync already running — skipping opportunities trigger (%s)", trigger)
+        raise RuntimeError("A sync is already running")
+
+    async with _sync_lock:
+        async with _sync_run("opportunities", trigger) as state:
+            client = await GHLClient.create()  # may raise — caught and finalized by `_sync_run`
+
+            users_map = await _fetch_users_map(client, state)
+            await _stream_into_upserts(
+                client.stream_opportunities(),
+                lambda o: _build_opp_row(o, users_map),
+                _upsert_opps_batch,
+                state,
+                is_contacts=False,
+                error_kind="opportunity",
+                batch_kind="opp_batch",
+            )
+            await _heartbeat(state)
+
+            # Calendar-derived call1/call2 truth for every opportunity.
+            await sync_appointments_and_derive(client, state)
+            await _heartbeat(state)
+
+            from services.statistics import invalidate_stats_cache
+            from services.statistics_snapshot import schedule_recompute
+            invalidate_stats_cache()
+            schedule_recompute()
+
+            return state.run_id
+
+
 async def _upsert_webinar_stats(webinar_number: int, gcal_invited_count: int) -> None:
     async with AsyncSessionLocal() as db:
         stmt = pg_insert(GHLWebinarStats).values(

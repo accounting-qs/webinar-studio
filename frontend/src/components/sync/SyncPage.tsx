@@ -82,6 +82,7 @@ function formatSyncType(raw: string): string {
     if (id === "all") return "WG · All Broadcasts";
     return `WG · Broadcast ${id}`;
   }
+  if (raw === "opportunities") return "Sales + Calls";
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
@@ -229,7 +230,7 @@ export function SyncPage() {
 
   const stats = useMemo(() => computeStats(history), [history]);
 
-  const handleTrigger = async (syncType: "full" | "incremental") => {
+  const handleTrigger = async (syncType: "full" | "incremental" | "opportunities") => {
     if (triggering) return;
     setTriggering(true);
     try {
@@ -331,6 +332,14 @@ export function SyncPage() {
               className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               Sync Incremental
+            </button>
+            <button
+              onClick={() => handleTrigger("opportunities")}
+              disabled={triggering || status?.is_running}
+              title="Sync all opportunities + their calendar appointments (Sales + Quality data for every webinar). Skips the contacts pull, so it's faster than a full sync. Also runs as part of the scheduled full sync."
+              className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              Sync Sales + Calls
             </button>
             <button
               onClick={() => handleTrigger("full")}

@@ -17,6 +17,7 @@ from services import ghl_scheduler
 from services.ghl_sync import (
     recover_orphaned_runs,
     request_cancel,
+    run_opportunities_sync,
     run_sync,
     run_webinar_sync,
     run_webinar_sync_full,
@@ -144,12 +145,20 @@ async def sync_history(
 
 @router.post("/trigger", response_model=SyncTriggerResponse, status_code=202)
 async def trigger_sync(
-    sync_type: str = Query("incremental", pattern="^(full|incremental)$"),
+    sync_type: str = Query("incremental", pattern="^(full|incremental|opportunities)$"),
 ):
-    """Kick off a sync as a background task. Returns immediately with run_id."""
+    """Kick off a sync as a background task. Returns immediately with run_id.
+
+    - full / incremental: contacts + opportunities + appointments.
+    - opportunities: all opportunities + their calendar appointments only
+      (skips the contacts pull) — the focused Sales + Quality refresh.
+    """
     # Reject if another sync is already running
-    # (Race-free check happens inside run_sync via asyncio.Lock)
-    task = asyncio.create_task(run_sync(sync_type, trigger="manual"))  # type: ignore[arg-type]
+    # (Race-free check happens inside the sync via asyncio.Lock)
+    if sync_type == "opportunities":
+        task = asyncio.create_task(run_opportunities_sync(trigger="manual"))
+    else:
+        task = asyncio.create_task(run_sync(sync_type, trigger="manual"))  # type: ignore[arg-type]
 
     # Wait briefly for the run row to be created so we can return its id
     try:

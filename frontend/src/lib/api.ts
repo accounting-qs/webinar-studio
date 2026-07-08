@@ -1972,7 +1972,7 @@ export async function fetchGhlSyncHistory(limit = 50): Promise<{ runs: GhlSyncRu
   return res.json();
 }
 
-export async function triggerGhlSync(syncType: "full" | "incremental"): Promise<{ run_id: string; sync_type: string; status: string }> {
+export async function triggerGhlSync(syncType: "full" | "incremental" | "opportunities"): Promise<{ run_id: string; sync_type: string; status: string }> {
   const res = await fetch(`${API_URL}/ghl-sync/trigger?sync_type=${syncType}`, {
     method: "POST",
     headers: authHeaders(),
