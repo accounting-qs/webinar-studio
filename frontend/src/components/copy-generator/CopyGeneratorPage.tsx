@@ -1373,7 +1373,7 @@ export function CopyGeneratorPage() {
                           <LoadingSpinner /> Generating…
                         </span>
                       ) : titleStatus === "failed" ? (
-                        <div className="flex flex-col gap-1">
+                        <div className="flex flex-col gap-1 max-w-[280px]">
                           <span
                             className="inline-flex items-center gap-1 text-[10px] text-red-500 font-medium"
                             title={jobMap.get(`${bucket.id}-title`)?.errorMessage || "Generation failed"}
@@ -1381,6 +1381,9 @@ export function CopyGeneratorPage() {
                             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                             Failed
                           </span>
+                          <p className="text-[10px] leading-snug text-red-500/80 dark:text-red-400/80">
+                            {jobMap.get(`${bucket.id}-title`)?.errorMessage || "Generation failed. Retry to try again."}
+                          </p>
                           <button
                             onClick={() => doRetryGeneration(bucket.id, "title")}
                             className="text-[10px] font-medium text-violet-500 hover:text-violet-400 self-start"
@@ -1458,7 +1461,7 @@ export function CopyGeneratorPage() {
                           <LoadingSpinner /> Generating…
                         </span>
                       ) : descStatus === "failed" ? (
-                        <div className="flex flex-col gap-1">
+                        <div className="flex flex-col gap-1 max-w-[320px]">
                           <span
                             className="inline-flex items-center gap-1 text-[10px] text-red-500 font-medium"
                             title={jobMap.get(`${bucket.id}-description`)?.errorMessage || "Generation failed"}
@@ -1466,6 +1469,9 @@ export function CopyGeneratorPage() {
                             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                             Failed
                           </span>
+                          <p className="text-[10px] leading-snug text-red-500/80 dark:text-red-400/80">
+                            {jobMap.get(`${bucket.id}-description`)?.errorMessage || "Generation failed. Retry to try again."}
+                          </p>
                           <button
                             onClick={() => doRetryGeneration(bucket.id, "description")}
                             className="text-[10px] font-medium text-blue-500 hover:text-blue-400 self-start"

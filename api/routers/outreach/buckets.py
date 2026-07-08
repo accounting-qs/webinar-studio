@@ -473,6 +473,36 @@ async def delete_copy(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _friendly_generation_error(exc: Exception) -> str:
+    """Map a raw generation exception to a concise, user-facing message.
+
+    Classifies by exception name / HTTP status so we can surface something
+    actionable (e.g. a rotated API key) instead of a raw stack-trace string.
+    """
+    status = getattr(exc, "status_code", None)
+    name = type(exc).__name__
+    raw = str(exc).strip()
+
+    if name == "AuthenticationError" or status == 401:
+        return ("AI service authentication failed — the API key is invalid or has "
+                "been rotated. Update ANTHROPIC_API_KEY, then retry.")
+    if name == "PermissionDeniedError" or status == 403:
+        return ("AI service denied the request (403) — the API key may lack access "
+                "to the model. Check the key's permissions, then retry.")
+    if name == "RateLimitError" or status == 429:
+        return ("AI service is rate-limited (429) — too many requests. "
+                "Wait a moment and retry.")
+    if name in ("APIConnectionError", "APITimeoutError"):
+        return ("Could not reach the AI service — a network or timeout error "
+                "occurred. Retry in a moment.")
+    if isinstance(status, int) and 500 <= status < 600:
+        return (f"AI service error ({status}) — the provider is temporarily "
+                "unavailable. Retry shortly.")
+    if raw.startswith("Model returned invalid JSON") or raw.startswith("Model did not return"):
+        return "The AI returned an unexpected response. Retry to generate again."
+    return raw[:300] if raw else "Copy generation failed for an unknown reason."
+
+
 async def _run_single_copy_generation_job(job_id: str) -> None:
     """Execute one copy-generation job. Uses its own DB session."""
     async with AsyncSessionLocal() as db:
@@ -563,7 +593,7 @@ async def _run_single_copy_generation_job(job_id: str) -> None:
                 job = fail_result.scalar_one_or_none()
                 if job:
                     job.status = "failed"
-                    job.error_message = str(exc)[:500]
+                    job.error_message = _friendly_generation_error(exc)
                     job.completed_at = datetime.utcnow()
                     await db.commit()
             except Exception:

@@ -61,6 +61,24 @@ async def _log_claude_cost(
 _client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
+async def _resolve_client(db: AsyncSession) -> anthropic.AsyncAnthropic:
+    """Resolve the Anthropic client to use for generation.
+
+    Prefers the key saved on the Connectors tab (connector_credentials), which is
+    the same source the Statistics chat assistant uses. Falls back to the ENV key
+    only when no connector is configured, so a rotated key managed from the UI
+    takes effect without a redeploy.
+    """
+    from services.chat_agent import get_anthropic_client
+    try:
+        return await get_anthropic_client(db)
+    except ValueError:
+        if settings.ANTHROPIC_API_KEY:
+            logger.warning("[generation] No Anthropic connector configured — falling back to ENV key")
+            return _client
+        raise
+
+
 # Shared authority hierarchy injected into every generation prompt. Principles
 # are supreme; examples are structural references only (never a source of values).
 _AUTHORITY_NOTE = """## Authority Order (read this first)
@@ -107,7 +125,7 @@ def _validate_copy(text: str, copy_type: str) -> list[str]:
     return violations
 
 
-async def _repair_copy(text: str, copy_type: str, violations: list[str]) -> str:
+async def _repair_copy(client: anthropic.AsyncAnthropic, text: str, copy_type: str, violations: list[str]) -> str:
     """One targeted repair pass — fix only the flagged violations, keep everything else."""
     fixes = "\n".join(f"- {v}" for v in violations)
     prompt = f"""Rewrite this calendar-invite {copy_type} to fix ONLY these deliverability violations. Change nothing else about the meaning, proof, or structure.
@@ -123,7 +141,7 @@ Return ONLY the rewritten {copy_type} text — no preamble, no quotes, no code f
 
 CURRENT {copy_type.upper()}:
 {text}"""
-    msg = await _client.messages.create(
+    msg = await client.messages.create(
         model=settings.CLAUDE_MODEL, max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -138,7 +156,7 @@ CURRENT {copy_type.upper()}:
     return out.strip().strip('"').strip()
 
 
-async def _validate_and_repair(copies: list[str], copy_type: str) -> list[str]:
+async def _validate_and_repair(client: anthropic.AsyncAnthropic, copies: list[str], copy_type: str) -> list[str]:
     """Validate each variant; run one repair pass on any with violations, keeping
     whichever version has fewer violations."""
     out: list[str] = []
@@ -147,7 +165,7 @@ async def _validate_and_repair(copies: list[str], copy_type: str) -> list[str]:
         if viol:
             logger.warning("[copy_validator] %s has %d violation(s): %s", copy_type, len(viol), viol)
             try:
-                repaired = await _repair_copy(c, copy_type, viol)
+                repaired = await _repair_copy(client, c, copy_type, viol)
                 if repaired and len(_validate_copy(repaired, copy_type)) < len(viol):
                     c = repaired
                     residual = _validate_copy(c, copy_type)
@@ -163,7 +181,7 @@ def _first_word(t: str) -> str:
     return (t.strip().split() or [""])[0].lower().strip(":,")
 
 
-async def _repair_title_structure(text: str, avoid_word: str) -> str | None:
+async def _repair_title_structure(client: anthropic.AsyncAnthropic, text: str, avoid_word: str) -> str | None:
     """Rewrite a title with a different opening structure to break variant sameness.
     Returns the raw rewrite (length/bans are enforced by the caller)."""
     prompt = (
@@ -173,7 +191,7 @@ async def _repair_title_structure(text: str, avoid_word: str) -> str | None:
         f'segment and the tool (AI Webinars), no curiosity/reveal opener, no "The ... Use to" construction, no emoji. '
         f'Return ONLY the rewritten title.\n\nTITLE: {text}'
     )
-    msg = await _client.messages.create(
+    msg = await client.messages.create(
         model=settings.CLAUDE_MODEL, max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -181,7 +199,7 @@ async def _repair_title_structure(text: str, avoid_word: str) -> str | None:
     return out or None
 
 
-async def _diversify_titles(titles: list[str]) -> list[str]:
+async def _diversify_titles(client: anthropic.AsyncAnthropic, titles: list[str]) -> list[str]:
     """Ensure title variants don't all share the same opening word (e.g. all 'How ...').
     Repairs later duplicates into a different opening; retries, then enforces length/bans."""
     seen: set[str] = set()
@@ -192,13 +210,13 @@ async def _diversify_titles(titles: list[str]) -> list[str]:
         while first in seen and attempts < 2:
             attempts += 1
             try:
-                repaired = await _repair_title_structure(t, first)
+                repaired = await _repair_title_structure(client, t, first)
             except Exception as e:
                 logger.warning("[title_diversify] repair failed: %s", e)
                 break
             if not repaired:
                 break
-            repaired = (await _validate_and_repair([repaired], "title"))[0]
+            repaired = (await _validate_and_repair(client, [repaired], "title"))[0]
             t = repaired
             first = _first_word(t)
         seen.add(first)
@@ -206,7 +224,7 @@ async def _diversify_titles(titles: list[str]) -> list[str]:
     return out
 
 
-async def _gate_variants(result: dict) -> dict:
+async def _gate_variants(client: anthropic.AsyncAnthropic, result: dict) -> dict:
     """Run the deliverability validator/repair over each A/B/C variant's title +
     description, then diversify the titles (used by the segment-based generator)."""
     variants = result.get("variants") if isinstance(result, dict) else None
@@ -214,12 +232,12 @@ async def _gate_variants(result: dict) -> dict:
         dict_variants = [v for v in variants if isinstance(v, dict)]
         for v in dict_variants:
             if v.get("title"):
-                v["title"] = (await _validate_and_repair([str(v["title"])], "title"))[0]
+                v["title"] = (await _validate_and_repair(client, [str(v["title"])], "title"))[0]
             if v.get("description"):
-                v["description"] = (await _validate_and_repair([str(v["description"])], "description"))[0]
+                v["description"] = (await _validate_and_repair(client, [str(v["description"])], "description"))[0]
         titled = [v for v in dict_variants if v.get("title")]
         if len(titled) >= 2:
-            div = await _diversify_titles([str(v["title"]) for v in titled])
+            div = await _diversify_titles(client, [str(v["title"]) for v in titled])
             for v, nt in zip(titled, div):
                 v["title"] = nt
     return result
@@ -501,7 +519,8 @@ async def generate_calendar_blocker(
         "Generating calendar blocker — segment=%s sub_niche=%s", segment, sub_niche
     )
 
-    message = await _client.messages.create(
+    client = await _resolve_client(db)
+    message = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=4096,
         system=system,
@@ -528,7 +547,7 @@ async def generate_calendar_blocker(
         logger.error("JSON parse failed: %s\nRaw: %s", e, raw[:500])
         raise ValueError(f"Model returned invalid JSON: {e}") from e
 
-    return await _gate_variants(result)
+    return await _gate_variants(client, result)
 
 
 async def stream_calendar_blocker(
@@ -552,7 +571,8 @@ async def stream_calendar_blocker(
 
     full_text = []
 
-    async with _client.messages.stream(
+    client = await _resolve_client(db)
+    async with client.messages.stream(
         model=settings.CLAUDE_MODEL,
         max_tokens=4096,
         system=system,
@@ -578,7 +598,7 @@ async def stream_calendar_blocker(
 
     try:
         result = json.loads(raw)
-        result = await _gate_variants(result)
+        result = await _gate_variants(client, result)
         yield f"data: {json.dumps({'type': 'done', 'result': result})}\n\n"
     except json.JSONDecodeError as e:
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -806,7 +826,8 @@ async def generate_bucket_copies(
         count, copy_type, bucket_name, industry, len(case_studies),
     )
 
-    message = await _client.messages.create(
+    client = await _resolve_client(db)
+    message = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=4096,
         system=system,
@@ -838,9 +859,9 @@ async def generate_bucket_copies(
         raise ValueError("Model did not return any copies")
 
     variants = [str(c) for c in copies[:count]]
-    gated = await _validate_and_repair(variants, copy_type)
+    gated = await _validate_and_repair(client, variants, copy_type)
     if copy_type == "title":
-        gated = await _diversify_titles(gated)
+        gated = await _diversify_titles(client, gated)
     return gated
 
 
@@ -910,7 +931,8 @@ Generate an improved version that addresses this feedback."""
 
     logger.info("Regenerating %s — bucket=%s feedback=%s", copy_type, bucket_name, feedback[:100])
 
-    message = await _client.messages.create(
+    client = await _resolve_client(db)
+    message = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=2048,
         system=system,
@@ -936,4 +958,4 @@ Generate an improved version that addresses this feedback."""
         raise ValueError(f"Model returned invalid JSON: {e}") from e
 
     text = str(result.get("copy", raw))
-    return (await _validate_and_repair([text], copy_type))[0]
+    return (await _validate_and_repair(client, [text], copy_type))[0]
