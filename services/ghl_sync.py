@@ -1154,5 +1154,8 @@ async def get_sync_settings() -> dict:
             "weekly_full_day_of_week": s.weekly_full_day_of_week,
             "weekly_full_hour_local": s.weekly_full_hour_local,
             "weekly_full_timezone": s.weekly_full_timezone,
+            "daily_sales_enabled": s.daily_sales_enabled,
+            "daily_sales_hour_local": s.daily_sales_hour_local,
+            "daily_sales_timezone": s.daily_sales_timezone,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None,
         }

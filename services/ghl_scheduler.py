@@ -15,6 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from services.ghl_sync import (
     get_sync_settings,
     recover_orphaned_runs,
+    run_opportunities_sync,
     run_sync,
     sweep_stale_runs,
 )
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 INCREMENTAL_JOB_ID = "ghl_incremental_sync"
 WEEKLY_JOB_ID = "ghl_weekly_full_sync"
+DAILY_SALES_JOB_ID = "ghl_daily_sales_sync"
 STALE_SWEEPER_JOB_ID = "ghl_stale_sweeper"
 
 # How often to scan for sync runs with stale heartbeats and reap them.
@@ -50,6 +52,13 @@ async def _weekly_job() -> None:
         await run_sync("full", trigger="scheduled")
     except Exception as exc:
         logger.error("Scheduled weekly full sync failed: %s", exc)
+
+
+async def _daily_sales_job() -> None:
+    try:
+        await run_opportunities_sync(trigger="scheduled")
+    except Exception as exc:
+        logger.error("Scheduled daily sales sync failed: %s", exc)
 
 
 async def _stale_sweeper_job() -> None:
@@ -114,7 +123,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -176,4 +185,22 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         logger.info(
             "Registered weekly full sync %s %02d:00 %s",
             s["weekly_full_day_of_week"], s["weekly_full_hour_local"], s["weekly_full_timezone"],
+        )
+
+    if s["daily_sales_enabled"]:
+        scheduler.add_job(
+            _daily_sales_job,
+            trigger=CronTrigger(
+                hour=int(s["daily_sales_hour_local"]),
+                minute=0,
+                timezone=s["daily_sales_timezone"],
+            ),
+            id=DAILY_SALES_JOB_ID,
+            max_instances=1,
+            misfire_grace_time=300,
+            replace_existing=True,
+        )
+        logger.info(
+            "Registered daily sales sync %02d:00 %s",
+            s["daily_sales_hour_local"], s["daily_sales_timezone"],
         )

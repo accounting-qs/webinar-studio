@@ -577,6 +577,39 @@ export function SyncPage() {
                 />
               </div>
 
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={settings.daily_sales_enabled}
+                    onChange={(e) => handleSettingsChange({ daily_sales_enabled: e.target.checked })}
+                    disabled={savingSettings}
+                    className="w-4 h-4"
+                  />
+                  <span className="font-semibold text-zinc-800 dark:text-zinc-200">Daily Sales + Calls sync</span>
+                </label>
+                <span className="text-zinc-500 text-xs">at</span>
+                <select
+                  value={settings.daily_sales_hour_local}
+                  onChange={(e) => handleSettingsChange({ daily_sales_hour_local: parseInt(e.target.value) })}
+                  disabled={savingSettings || !settings.daily_sales_enabled}
+                  className="bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-xs text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
+                >
+                  {Array.from({ length: 24 }).map((_, h) => (
+                    <option key={h} value={h}>{h.toString().padStart(2, "0")}:00</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={settings.daily_sales_timezone}
+                  onChange={(e) => handleSettingsChange({ daily_sales_timezone: e.target.value })}
+                  onBlur={(e) => handleSettingsChange({ daily_sales_timezone: e.target.value })}
+                  disabled={savingSettings || !settings.daily_sales_enabled}
+                  placeholder="America/Chicago"
+                  className="w-40 bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-xs text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
+                />
+              </div>
+
               {settings.updated_at && (
                 <p className="text-[10px] text-zinc-500">Last updated: {formatTimestamp(settings.updated_at)}</p>
               )}

@@ -192,4 +192,7 @@ class GHLSyncSettings(Base):
     weekly_full_day_of_week: Mapped[str] = mapped_column(String(3), nullable=False, server_default="wed")
     weekly_full_hour_local: Mapped[int] = mapped_column(Integer, nullable=False, server_default="4")
     weekly_full_timezone: Mapped[str] = mapped_column(Text, nullable=False, server_default="America/Chicago")
+    daily_sales_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    daily_sales_hour_local: Mapped[int] = mapped_column(Integer, nullable=False, server_default="6")
+    daily_sales_timezone: Mapped[str] = mapped_column(Text, nullable=False, server_default="America/Chicago")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

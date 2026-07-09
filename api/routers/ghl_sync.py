@@ -77,6 +77,9 @@ class SyncSettingsResponse(BaseModel):
     weekly_full_day_of_week: str
     weekly_full_hour_local: int
     weekly_full_timezone: str
+    daily_sales_enabled: bool
+    daily_sales_hour_local: int
+    daily_sales_timezone: str
     updated_at: datetime | None = None
 
 
@@ -87,6 +90,9 @@ class SyncSettingsUpdate(BaseModel):
     weekly_full_day_of_week: str | None = None
     weekly_full_hour_local: int | None = None
     weekly_full_timezone: str | None = None
+    daily_sales_enabled: bool | None = None
+    daily_sales_hour_local: int | None = None
+    daily_sales_timezone: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +286,9 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         "weekly_full_day_of_week": s.weekly_full_day_of_week,
         "weekly_full_hour_local": s.weekly_full_hour_local,
         "weekly_full_timezone": s.weekly_full_timezone,
+        "daily_sales_enabled": s.daily_sales_enabled,
+        "daily_sales_hour_local": s.daily_sales_hour_local,
+        "daily_sales_timezone": s.daily_sales_timezone,
         "updated_at": s.updated_at,
     }
 
@@ -312,6 +321,14 @@ async def update_settings(
         values["weekly_full_hour_local"] = payload.weekly_full_hour_local
     if payload.weekly_full_timezone is not None:
         values["weekly_full_timezone"] = payload.weekly_full_timezone
+    if payload.daily_sales_enabled is not None:
+        values["daily_sales_enabled"] = payload.daily_sales_enabled
+    if payload.daily_sales_hour_local is not None:
+        if not (0 <= payload.daily_sales_hour_local <= 23):
+            raise HTTPException(status_code=422, detail="hour must be 0..23")
+        values["daily_sales_hour_local"] = payload.daily_sales_hour_local
+    if payload.daily_sales_timezone is not None:
+        values["daily_sales_timezone"] = payload.daily_sales_timezone
 
     if values:
         await db.execute(update(GHLSyncSettings).where(GHLSyncSettings.id == 1).values(**values))
@@ -333,5 +350,8 @@ async def update_settings(
         "weekly_full_day_of_week": s.weekly_full_day_of_week,
         "weekly_full_hour_local": s.weekly_full_hour_local,
         "weekly_full_timezone": s.weekly_full_timezone,
+        "daily_sales_enabled": s.daily_sales_enabled,
+        "daily_sales_hour_local": s.daily_sales_hour_local,
+        "daily_sales_timezone": s.daily_sales_timezone,
         "updated_at": s.updated_at,
     }

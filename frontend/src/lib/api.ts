@@ -1991,6 +1991,9 @@ export interface GhlSyncSettings {
   weekly_full_day_of_week: string;
   weekly_full_hour_local: number;
   weekly_full_timezone: string;
+  daily_sales_enabled: boolean;
+  daily_sales_hour_local: number;
+  daily_sales_timezone: string;
   updated_at: string | null;
 }
 
