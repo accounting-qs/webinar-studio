@@ -1166,14 +1166,15 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {nld_yes_pred})   AS yes_unplanned,
                 COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {nld_maybe_pred}) AS maybe_unplanned,
                 COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE bcws = :N)        AS booked_unplanned,
-                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {self_reg_filter}) AS lp_regs_unplanned
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE {self_reg_filter}) AS lp_regs_unplanned,
+                COUNT(DISTINCT COALESCE(ghl_contact_id, lem)) FILTER (WHERE ({self_reg_filter}) AND bcws = :N) AS self_reg_bookings_unplanned
             FROM unplanned
         """
         r = await db.execute(sa_text(nld_counts_sql).bindparams(**nld_params))
         row = r.one_or_none()
-        total_u, yes_u, maybe_u, booked_u, lp_regs_u = (
-            (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0), int(row[4] or 0))
-            if row else (0, 0, 0, 0, 0)
+        total_u, yes_u, maybe_u, booked_u, lp_regs_u, sr_bookings_u = (
+            (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0), int(row[4] or 0), int(row[5] or 0))
+            if row else (0, 0, 0, 0, 0, 0)
         )
 
         # NLD contacts are *not* part of the invite pool — we didn't send
@@ -1188,6 +1189,7 @@ class GoHighLevelStatisticsSource:
             "maybeMarked": maybe_u,
             "selfRegMarked": lp_regs_u,
             "lpRegs": lp_regs_u,
+            "selfRegBookings": sr_bookings_u,
             "totalBookings": booked_u,
         }
 
@@ -1213,6 +1215,16 @@ class GoHighLevelStatisticsSource:
                 wg_csv_prefix = ""
                 wg_nld_params["yes_re"] = yes_re
                 wg_nld_params["maybe_re"] = maybe_re
+
+            if has_window:
+                wg_sr_pred = (
+                    "g.webinar_registration_in_form_date > :sr_start "
+                    "AND g.webinar_registration_in_form_date <= :sr_end"
+                )
+                wg_nld_params["sr_start"] = prev_date
+                wg_nld_params["sr_end"] = current_date
+            else:
+                wg_sr_pred = "FALSE"
 
             # Exclude nonjoiner attendees here too — their attendance is shown
             # on the Nonjoiners row, so it must not also count in NLD.
@@ -1242,7 +1254,9 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred})                                AS yes_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred}   AND wgs.minutes_viewing >= 10) AS yes_10m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred})                              AS maybe_attended,
-                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}))                               AS self_reg_attended,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
                 LEFT JOIN planned p ON p.email = LOWER(wgs.email)
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
@@ -1262,6 +1276,9 @@ class GoHighLevelStatisticsSource:
                 nld_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
                 nld_metrics["total10MinPlus"] = int(wrow["ten_min"] or 0)
                 nld_metrics["total30MinPlus"] = int(wrow["thirty_min"] or 0)
+                if has_window:
+                    nld_metrics["selfRegAttended"] = int(wrow["self_reg_attended"] or 0)
+                    nld_metrics["selfReg10MinPlus"] = int(wrow["self_reg_10m"] or 0)
 
                 # totalRegs / totalAttended on NLD reflect the WG-vs-planned
                 # gap: anything WG reports (including no-email registrants
