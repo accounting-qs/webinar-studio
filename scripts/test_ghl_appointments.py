@@ -20,10 +20,10 @@ def dt(y, m, d, h=0):
     return datetime(y, m, d, h, tzinfo=timezone.utc)
 
 
-def appt(cls, start, status="Confirmed", booked=None, deleted=False):
+def appt(cls, start, status="Confirmed", booked=None, deleted=False, calendar_id=None):
     return {
-        "calendar_class": cls, "start_time": start, "status": status,
-        "booked_at": booked, "deleted": deleted,
+        "calendar_id": calendar_id, "calendar_class": cls, "start_time": start,
+        "status": status, "booked_at": booked, "deleted": deleted,
     }
 
 
@@ -62,15 +62,27 @@ def test_no_first_call_falls_back():
 def test_showed_wins_status_and_uses_showed_date():
     # A no-show attempt then a later showed attempt: status=Showed, date=showed date.
     r = derive_calls([
-        appt(CLASS_FIRST, dt(2026, 1, 3), "No Show", booked=dt(2026, 1, 1)),
-        appt(CLASS_FIRST, dt(2026, 1, 10), "Showed", booked=dt(2026, 1, 8)),
+        appt(CLASS_FIRST, dt(2026, 1, 3), "No Show", booked=dt(2026, 1, 1), calendar_id="cal_A"),
+        appt(CLASS_FIRST, dt(2026, 1, 10), "Showed", booked=dt(2026, 1, 8), calendar_id="cal_B"),
     ])
     assert r["has_call1"] is True
     assert r["call1_source"] == "calendar"
     assert r["call1_appointment_status"] == STATUS_SHOWED
     assert r["call1_appointment_date"] == dt(2026, 1, 10)
     assert r["call1_booking_date"] == dt(2026, 1, 1)  # earliest booking
-    print("  showed wins status + showed date + earliest booking OK")
+    assert r["call1_calendar_id"] == "cal_B"  # showed attempt's calendar
+    print("  showed wins status + showed date + earliest booking + calendar OK")
+
+
+def test_call1_calendar_uses_latest_when_not_showed():
+    # No show: chosen attempt = latest, so its calendar wins.
+    r = derive_calls([
+        appt(CLASS_FIRST, dt(2026, 2, 1), "Confirmed", calendar_id="cal_early"),
+        appt(CLASS_FIRST, dt(2026, 2, 14), "Confirmed", calendar_id="cal_late"),
+    ])
+    assert r["call1_appointment_date"] == dt(2026, 2, 14)
+    assert r["call1_calendar_id"] == "cal_late"
+    print("  non-showed call1 calendar = latest attempt OK")
 
 
 def test_reschedule_upcoming_uses_latest_date():

@@ -232,6 +232,7 @@ def build_contacts_query(
         joins.append("LEFT JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)")
     if spec.needs_opp:
         joins.append("JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id")
+        joins.append("LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id")
 
     wheres = ["wla.webinar_id = CAST(:webinar_id AS uuid)"]
     wheres.extend(f"({w})" for w in spec.where_clauses)
@@ -251,6 +252,8 @@ def build_contacts_query(
             o.call1_appointment_status,
             o.call1_appointment_date,
             o.call1_booking_date,
+            cal.name AS call1_calendar_name,
+            cal.source_label AS call1_source_label,
             o.owner_name,
             o.lead_quality,
             o.webinar_source_number,
@@ -324,6 +327,7 @@ def build_webinar_wide_opp_query(
     list_sql = f"""
         SELECT opportunity_id, pipeline_stage_id, monetary_value,
                call1_appointment_status, call1_appointment_date, call1_booking_date,
+               call1_calendar_name, call1_source_label,
                owner_name, lead_quality,
                webinar_source_number, ghl_contact_id, email,
                book_source, book_medium, book_name, book_content, book_term, book_id,
@@ -336,6 +340,8 @@ def build_webinar_wide_opp_query(
                 o.call1_appointment_status  AS call1_appointment_status,
                 o.call1_appointment_date    AS call1_appointment_date,
                 o.call1_booking_date        AS call1_booking_date,
+                cal.name                    AS call1_calendar_name,
+                cal.source_label            AS call1_source_label,
                 o.owner_name                AS owner_name,
                 o.lead_quality              AS lead_quality,
                 o.webinar_source_number     AS webinar_source_number,
@@ -354,6 +360,7 @@ def build_webinar_wide_opp_query(
             FROM ghl_opportunity o
             LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
             LEFT JOIN contacts c ON LOWER(c.email) = LOWER(g.email)
+            LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id
             WHERE {where}
             ORDER BY o.ghl_opportunity_id, c.first_name NULLS LAST
         ) sub

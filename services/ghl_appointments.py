@@ -106,14 +106,14 @@ def derive_calls(appointments: Iterable[dict]) -> dict:
     """Derive call1/call2 date + status for one opportunity's contact.
 
     `appointments` is an iterable of normalized appointment dicts with keys:
-      calendar_class, start_time (datetime|None), status (str|None),
-      booked_at (datetime|None), deleted (bool).
+      calendar_id (str|None), calendar_class, start_time (datetime|None),
+      status (str|None), booked_at (datetime|None), deleted (bool).
 
     Returns a dict. When the contact HAS a first-call appointment:
       {
         has_call1: True, call1_source: 'calendar',
         call1_appointment_status, call1_appointment_date, call1_booking_date,
-        call2_appointment_date, call2_appointment_status,
+        call1_calendar_id, call2_appointment_date, call2_appointment_status,
       }
     When the contact has NO first-call appointment (custom-field fallback):
       { has_call1: False, call1_source: 'custom_field' }
@@ -137,17 +137,20 @@ def derive_calls(appointments: Iterable[dict]) -> dict:
     outcome = next((c for c in _STATUS_PRECEDENCE if c in categories), "confirmed")
     call1_status = _CATEGORY_TO_LABEL[outcome]
 
-    # Attribution date: the showed attempt's start (earliest showed) if one
-    # showed; otherwise the LATEST attempt's start (reschedules move forward).
+    # Attribution: the showed attempt (earliest showed) if one showed; otherwise
+    # the LATEST attempt (reschedules move forward). The chosen attempt drives
+    # both the date and the booking calendar.
     if outcome == "showed":
         showed = [a for a, c in zip(firsts, categories) if c == "showed"]
-        call1_date = min((_start(a) for a in showed))
+        chosen = min(showed, key=_start)
     else:
-        call1_date = max((_start(a) for a in firsts))
-    # min/max over start_time can surface the datetime.max sentinel if every
-    # attempt lacks a start_time — treat that as unknown.
+        chosen = max(firsts, key=_start)
+    call1_date = _start(chosen)
+    # _start returns the datetime.max sentinel when an attempt lacks a
+    # start_time — treat that as unknown.
     if call1_date == datetime.max:
         call1_date = None
+    call1_calendar_id = chosen.get("calendar_id")
 
     booking_dates = [a.get("booked_at") for a in firsts if a.get("booked_at")]
     call1_booking_date = min(booking_dates) if booking_dates else None
@@ -174,6 +177,7 @@ def derive_calls(appointments: Iterable[dict]) -> dict:
         "call1_appointment_status": call1_status,
         "call1_appointment_date": call1_date,
         "call1_booking_date": call1_booking_date,
+        "call1_calendar_id": call1_calendar_id,
         "call2_appointment_date": (call2.get("start_time") if call2 else None),
         "call2_appointment_status": call2_status,
     }

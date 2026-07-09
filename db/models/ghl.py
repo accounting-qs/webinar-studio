@@ -78,6 +78,9 @@ class GHLOpportunity(Base):
     # appointments) or 'custom_field' (legacy GHL custom-field fallback when the
     # contact has no first-call appointment).
     call1_source: Mapped[Optional[str]] = mapped_column(Text)
+    # Calendar the derived 1st call was booked on (→ ghl_calendar). Drives the
+    # calendar-derived "Booking source" breakdown in the Bookings drill-down.
+    call1_calendar_id: Mapped[Optional[str]] = mapped_column(Text)
 
     # Opportunity owner (Sales Rep): GHL `assignedTo` user id + resolved name
     assigned_to_id: Mapped[Optional[str]] = mapped_column(Text)
@@ -114,6 +117,8 @@ class GHLCalendar(Base):
     name: Mapped[Optional[str]] = mapped_column(Text)
     calendar_class: Mapped[Optional[str]] = mapped_column(Text)
     funnel_tag: Mapped[Optional[str]] = mapped_column(Text)
+    # Curated source label. Seeded from funnel_tag on sync; user edits persist.
+    source_label: Mapped[Optional[str]] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -1824,6 +1824,9 @@ export interface ContactDrilldownItem {
   call1_status?: string | null;
   call1_date?: string | null;
   call1_booking_date?: string | null;
+  // Calendar the 1st call was booked on + its curated source label.
+  call1_calendar_name?: string | null;
+  call1_source_label?: string | null;
   webinar_source_number?: number | null;
   lead_quality?: string | null;
 }
@@ -1858,6 +1861,37 @@ export async function fetchStatisticsContacts(params: {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to fetch contacts drill-down");
+  return res.json();
+}
+
+/* ── Booking calendars (curated calendar → source mapping) ───────────────── */
+
+export interface BookingCalendar {
+  calendar_id: string;
+  name: string | null;
+  calendar_class: string | null; // first | followup | exclude
+  funnel_tag: string | null;     // webinar | outreach | referral
+  source_label: string | null;   // curated (editable)
+  booking_count: number;
+}
+
+export async function fetchBookingCalendars(): Promise<BookingCalendar[]> {
+  const res = await fetch(`${API_URL}/statistics/booking-calendars`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch booking calendars");
+  const data = await res.json();
+  return data.calendars as BookingCalendar[];
+}
+
+export async function updateBookingCalendarSource(
+  calendarId: string,
+  sourceLabel: string | null,
+): Promise<BookingCalendar> {
+  const res = await fetch(`${API_URL}/statistics/booking-calendars/${calendarId}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ source_label: sourceLabel }),
+  });
+  if (!res.ok) throw new Error("Failed to update calendar source");
   return res.json();
 }
 

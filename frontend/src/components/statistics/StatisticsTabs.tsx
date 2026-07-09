@@ -5,10 +5,11 @@ import { StatisticsPage } from "./StatisticsPage";
 import { SegmentsTab } from "./SegmentsTab";
 import { ListSourceTab } from "./ListSourceTab";
 import { CalendarUploadsTab } from "./CalendarUploadsTab";
+import { BookingCalendarsTab } from "./BookingCalendarsTab";
 import { AccountHealthTab } from "./AccountHealthTab";
 import { DayOfWeekTab } from "./DayOfWeekTab";
 
-type Tab = "statistics" | "segments" | "by-list-source" | "calendar-uploads" | "account-health" | "send-day";
+type Tab = "statistics" | "segments" | "by-list-source" | "calendar-uploads" | "booking-calendars" | "account-health" | "send-day";
 
 export function StatisticsTabs() {
   const [tab, setTab] = useState<Tab>("statistics");
@@ -29,6 +30,9 @@ export function StatisticsTabs() {
           <TabButton active={tab === "calendar-uploads"} onClick={() => setTab("calendar-uploads")}>
             Calendar Uploads
           </TabButton>
+          <TabButton active={tab === "booking-calendars"} onClick={() => setTab("booking-calendars")}>
+            Calendars
+          </TabButton>
           <TabButton active={tab === "account-health"} onClick={() => setTab("account-health")}>
             Account Health
           </TabButton>
@@ -46,6 +50,8 @@ export function StatisticsTabs() {
           <ListSourceTab />
         ) : tab === "calendar-uploads" ? (
           <CalendarUploadsTab />
+        ) : tab === "booking-calendars" ? (
+          <BookingCalendarsTab />
         ) : tab === "account-health" ? (
           <AccountHealthTab />
         ) : (

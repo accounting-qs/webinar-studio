@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import select, text as sa_text, update
+from sqlalchemy import func, select, text as sa_text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -363,12 +363,22 @@ async def _sync_calendars(client: GHLClient) -> dict[str, tuple[str, str | None]
         cal_map[cid] = (cls, tag)
         rows.append({
             "calendar_id": cid, "name": name, "calendar_class": cls,
-            "funnel_tag": tag, "fetched_at": now,
+            "funnel_tag": tag, "source_label": tag, "fetched_at": now,
         })
     if rows:
         async with AsyncSessionLocal() as db:
             stmt = pg_insert(GHLCalendar).values(rows)
-            update_cols = {k: getattr(stmt.excluded, k) for k in rows[0].keys() if k != "calendar_id"}
+            # Refresh name/class/tag/timestamp on every sync, but SEED source_label
+            # only when it's still NULL — a curated (user-edited) label is never
+            # clobbered.
+            update_cols = {
+                k: getattr(stmt.excluded, k)
+                for k in rows[0].keys()
+                if k not in ("calendar_id", "source_label")
+            }
+            update_cols["source_label"] = func.coalesce(
+                GHLCalendar.source_label, stmt.excluded.source_label
+            )
             stmt = stmt.on_conflict_do_update(index_elements=["calendar_id"], set_=update_cols)
             await db.execute(stmt)
             await db.commit()
@@ -452,16 +462,16 @@ async def _derive_calls_for_contacts(state: _SyncState, contact_ids: list[str]) 
         async with AsyncSessionLocal() as db:
             appt_res = await db.execute(
                 select(
-                    GHLAppointment.ghl_contact_id, GHLAppointment.calendar_class,
-                    GHLAppointment.start_time, GHLAppointment.status,
-                    GHLAppointment.booked_at, GHLAppointment.deleted,
+                    GHLAppointment.ghl_contact_id, GHLAppointment.calendar_id,
+                    GHLAppointment.calendar_class, GHLAppointment.start_time,
+                    GHLAppointment.status, GHLAppointment.booked_at, GHLAppointment.deleted,
                 ).where(GHLAppointment.ghl_contact_id.in_(chunk))
             )
             by_contact: dict[str, list[dict]] = {}
-            for cid, cls, start, status, booked, deleted in appt_res.all():
+            for cid, cal_id, cls, start, status, booked, deleted in appt_res.all():
                 by_contact.setdefault(cid, []).append({
-                    "calendar_class": cls, "start_time": start, "status": status,
-                    "booked_at": booked, "deleted": deleted,
+                    "calendar_id": cal_id, "calendar_class": cls, "start_time": start,
+                    "status": status, "booked_at": booked, "deleted": deleted,
                 })
 
             opp_res = await db.execute(
@@ -480,6 +490,7 @@ async def _derive_calls_for_contacts(state: _SyncState, contact_ids: list[str]) 
                         "call1_appointment_status": derived["call1_appointment_status"],
                         "call1_appointment_date": derived["call1_appointment_date"],
                         "call1_booking_date": derived["call1_booking_date"],
+                        "call1_calendar_id": derived["call1_calendar_id"],
                         "call2_appointment_date": derived["call2_appointment_date"],
                         "call2_appointment_status": derived["call2_appointment_status"],
                     })

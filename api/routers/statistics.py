@@ -206,6 +206,9 @@ class ContactDrilldownItem(BaseModel):
     call1_status: str | None = None
     call1_date: str | None = None
     call1_booking_date: str | None = None
+    # Calendar the 1st call was booked on + its curated source label.
+    call1_calendar_name: str | None = None
+    call1_source_label: str | None = None
     webinar_source_number: int | None = None
     lead_quality: str | None = None
 
@@ -368,6 +371,8 @@ async def list_contacts_for_metric(
                     "call1_status": row.get("call1_appointment_status"),
                     "call1_date": row["call1_appointment_date"].isoformat() if row.get("call1_appointment_date") else None,
                     "call1_booking_date": row["call1_booking_date"].isoformat() if row.get("call1_booking_date") else None,
+                    "call1_calendar_name": row.get("call1_calendar_name"),
+                    "call1_source_label": row.get("call1_source_label"),
                     "webinar_source_number": row.get("webinar_source_number"),
                     "lead_quality": row.get("lead_quality"),
                 })
@@ -830,3 +835,73 @@ async def get_statistics_webinar(webinar_id: str, source: str = "auto"):
     if webinar is None:
         raise HTTPException(status_code=404, detail=f"Webinar {webinar_id} not found")
     return webinar
+
+
+# ---------------------------------------------------------------------------
+# Booking calendars — curated calendar → source mapping
+# ---------------------------------------------------------------------------
+
+class BookingCalendarItem(BaseModel):
+    calendar_id: str
+    name: str | None = None
+    calendar_class: str | None = None  # first | followup | exclude
+    funnel_tag: str | None = None      # webinar | outreach | referral
+    source_label: str | None = None    # curated (editable)
+    booking_count: int = 0             # distinct opps whose 1st call is on this calendar
+
+
+class BookingCalendarsResponse(BaseModel):
+    calendars: list[BookingCalendarItem]
+
+
+class BookingCalendarUpdate(BaseModel):
+    source_label: str | None = None
+
+
+@router.get("/booking-calendars", response_model=BookingCalendarsResponse)
+async def list_booking_calendars():
+    """Every calendar we book appointments on, with its auto-classification,
+    curated source label, and how many 1st calls it sourced. Powers the
+    Calendars tab where the source mapping is curated."""
+    from sqlalchemy import text
+    from db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(text("""
+            SELECT c.calendar_id, c.name, c.calendar_class, c.funnel_tag, c.source_label,
+                   COUNT(o.ghl_opportunity_id) AS booking_count
+            FROM ghl_calendar c
+            LEFT JOIN ghl_opportunity o ON o.call1_calendar_id = c.calendar_id
+            GROUP BY c.calendar_id, c.name, c.calendar_class, c.funnel_tag, c.source_label
+            ORDER BY booking_count DESC, c.name
+        """))).mappings().all()
+    return {"calendars": [dict(r) for r in rows]}
+
+
+@router.patch("/booking-calendars/{calendar_id}", response_model=BookingCalendarItem)
+async def update_booking_calendar(calendar_id: str, payload: BookingCalendarUpdate):
+    """Set the curated source label for a calendar. Invalidates the stats cache
+    so the Bookings drill-down regroups by the new label."""
+    from sqlalchemy import text
+    from db.session import AsyncSessionLocal
+
+    label = (payload.source_label or "").strip() or None
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text("UPDATE ghl_calendar SET source_label = :label WHERE calendar_id = :cid"),
+            {"label": label, "cid": calendar_id},
+        )
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Calendar {calendar_id} not found")
+        await db.commit()
+        row = (await db.execute(text("""
+            SELECT c.calendar_id, c.name, c.calendar_class, c.funnel_tag, c.source_label,
+                   COUNT(o.ghl_opportunity_id) AS booking_count
+            FROM ghl_calendar c
+            LEFT JOIN ghl_opportunity o ON o.call1_calendar_id = c.calendar_id
+            WHERE c.calendar_id = :cid
+            GROUP BY c.calendar_id, c.name, c.calendar_class, c.funnel_tag, c.source_label
+        """), {"cid": calendar_id})).mappings().one()
+
+    stats_svc.invalidate_stats_cache()
+    return dict(row)

@@ -180,7 +180,7 @@ function BookingSourceChart({ groups, itemCount }: { groups: Group[]; itemCount:
   return (
     <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/60 bg-zinc-50/60 dark:bg-zinc-900/30 px-4 py-3">
       <div className="flex items-center justify-between mb-2">
-        <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">Booking source</div>
+        <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">UTM source <span className="normal-case font-normal text-zinc-400">(often untracked)</span></div>
         <div className="text-[11px] text-zinc-500">{total} unique · {itemCount} bookings</div>
       </div>
       <div className="flex items-center gap-5">
@@ -194,6 +194,81 @@ function BookingSourceChart({ groups, itemCount }: { groups: Group[]; itemCount:
               <span className="font-mono text-zinc-400 w-9 text-right">{Math.round((s.value / (total || 1)) * 100)}%</span>
             </div>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Calendar-derived booking source: groups bookings by the curated source
+ * label of the calendar the 1st call was booked on (fallback to calendar name).
+ * Near-100% populated, unlike the UTM source. Each legend row expands to show
+ * the constituent calendars. */
+function BookingCalendarSourceChart({ groups, itemCount }: { groups: Group[]; itemCount: number }) {
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const { slices, calByLabel } = useMemo(() => {
+    const m = new Map<string, number>();
+    const cal = new Map<string, Map<string, number>>();
+    for (const g of groups) {
+      const label = (g.rep.call1_source_label || "").trim() || (g.rep.call1_calendar_name || "").trim() || "—";
+      m.set(label, (m.get(label) ?? 0) + 1);
+      const inner = cal.get(label) ?? new Map<string, number>();
+      const cName = (g.rep.call1_calendar_name || "").trim() || "—";
+      inner.set(cName, (inner.get(cName) ?? 0) + 1);
+      cal.set(label, inner);
+    }
+    const slices = [...m.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([label, value], i) => ({ label, value, color: CHART_COLORS[i % CHART_COLORS.length] }));
+    return { slices, calByLabel: cal };
+  }, [groups]);
+
+  const hasCalendar = groups.some((g) => g.rep.call1_calendar_name || g.rep.call1_source_label);
+  if (!hasCalendar) return null;
+
+  const total = groups.length;
+  const toggle = (label: string) =>
+    setOpen((s) => { const n = new Set(s); if (n.has(label)) n.delete(label); else n.add(label); return n; });
+
+  return (
+    <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/60 bg-zinc-50/60 dark:bg-zinc-900/30 px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">Booking source <span className="normal-case font-normal text-zinc-400">(by calendar)</span></div>
+        <div className="text-[11px] text-zinc-500">{slices.length} sources · {itemCount} bookings</div>
+      </div>
+      <div className="flex items-center gap-5">
+        <Donut slices={slices} total={total} />
+        <div className="grid grid-cols-1 gap-y-1 min-w-0 flex-1">
+          {slices.map((s) => {
+            const cals = [...(calByLabel.get(s.label)?.entries() ?? [])].sort((a, b) => b[1] - a[1]);
+            const expandable = cals.length > 1 || (cals[0] && cals[0][0] !== s.label);
+            const isOpen = open.has(s.label);
+            return (
+              <div key={s.label} className="min-w-0">
+                <button
+                  type="button"
+                  onClick={() => expandable && toggle(s.label)}
+                  className={`w-full flex items-center gap-2 text-xs min-w-0 ${expandable ? "cursor-pointer" : "cursor-default"}`}
+                >
+                  <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: s.color }} />
+                  <span className="truncate text-zinc-700 dark:text-zinc-300">{s.label}</span>
+                  {expandable && <span className="text-[8px] text-zinc-400">{isOpen ? "▼" : "▶"}</span>}
+                  <span className="ml-auto font-mono text-zinc-500">{s.value}</span>
+                  <span className="font-mono text-zinc-400 w-9 text-right">{Math.round((s.value / (total || 1)) * 100)}%</span>
+                </button>
+                {isOpen && (
+                  <div className="ml-4 mt-0.5 mb-1 space-y-0.5">
+                    {cals.map(([cName, n]) => (
+                      <div key={cName} className="flex items-center gap-2 text-[11px] text-zinc-500 min-w-0">
+                        <span className="truncate">{cName}</span>
+                        <span className="ml-auto font-mono">{n}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -335,8 +410,9 @@ export function ContactsDrilldownTable({ data }: { data: ContactDrilldownRespons
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
-        <BookingSourceChart groups={groups} itemCount={data.items.length} />
+        {isOpp && <BookingCalendarSourceChart groups={groups} itemCount={data.items.length} />}
         {isOpp && <SalesRepChart groups={groups} itemCount={data.items.length} />}
+        <BookingSourceChart groups={groups} itemCount={data.items.length} />
       </div>
       <div className="rounded-lg border border-zinc-200 dark:border-zinc-800/40 bg-white dark:bg-zinc-900/20 overflow-x-auto">
         <table className="w-full text-xs">
