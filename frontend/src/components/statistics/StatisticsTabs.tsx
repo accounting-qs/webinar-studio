@@ -27,17 +27,17 @@ export function StatisticsTabs() {
           <TabButton active={tab === "by-list-source"} onClick={() => setTab("by-list-source")}>
             By List Source
           </TabButton>
-          <TabButton active={tab === "calendar-uploads"} onClick={() => setTab("calendar-uploads")}>
-            Calendar Uploads
-          </TabButton>
-          <TabButton active={tab === "booking-calendars"} onClick={() => setTab("booking-calendars")}>
-            Calendars
-          </TabButton>
           <TabButton active={tab === "account-health"} onClick={() => setTab("account-health")}>
             Account Health
           </TabButton>
           <TabButton active={tab === "send-day"} onClick={() => setTab("send-day")}>
             Send Day
+          </TabButton>
+          <TabButton active={tab === "calendar-uploads"} onClick={() => setTab("calendar-uploads")}>
+            Calendar Uploads
+          </TabButton>
+          <TabButton active={tab === "booking-calendars"} onClick={() => setTab("booking-calendars")}>
+            Calendars
           </TabButton>
         </div>
       </div>

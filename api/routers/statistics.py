@@ -856,6 +856,16 @@ class BookingCalendarsResponse(BaseModel):
 
 class BookingCalendarUpdate(BaseModel):
     source_label: str | None = None
+    calendar_class: str | None = None  # first | followup | exclude
+
+
+class SourceRenameRequest(BaseModel):
+    from_label: str
+    to_label: str
+
+
+class SourceRenameResponse(BaseModel):
+    updated: int
 
 
 @router.get("/booking-calendars", response_model=BookingCalendarsResponse)
@@ -880,20 +890,51 @@ async def list_booking_calendars():
 
 @router.patch("/booking-calendars/{calendar_id}", response_model=BookingCalendarItem)
 async def update_booking_calendar(calendar_id: str, payload: BookingCalendarUpdate):
-    """Set the curated source label for a calendar. Invalidates the stats cache
-    so the Bookings drill-down regroups by the new label."""
+    """Update a calendar's curated source label and/or its class override.
+
+    A calendar_class edit marks the row manual (so syncs stop re-classifying
+    it), retags the calendar's stored appointments, and re-derives call1/call2
+    for every affected opportunity — first-call attribution follows the new
+    class. Invalidates the stats cache either way."""
     from sqlalchemy import text
     from db.session import AsyncSessionLocal
+    from services.ghl_sync import apply_manual_calendar_class
 
-    label = (payload.source_label or "").strip() or None
+    fields = payload.model_fields_set
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    new_class: str | None = None
+    if "calendar_class" in fields:
+        new_class = (payload.calendar_class or "").strip().lower()
+        if new_class not in ("first", "followup", "exclude"):
+            raise HTTPException(
+                status_code=400,
+                detail="calendar_class must be one of: first, followup, exclude",
+            )
+
+    sets, params = [], {"cid": calendar_id}
+    if "source_label" in fields:
+        sets.append("source_label = :label")
+        params["label"] = (payload.source_label or "").strip() or None
+    if new_class is not None:
+        sets.append("calendar_class = :cls")
+        sets.append("class_is_manual = TRUE")
+        params["cls"] = new_class
+
     async with AsyncSessionLocal() as db:
         res = await db.execute(
-            text("UPDATE ghl_calendar SET source_label = :label WHERE calendar_id = :cid"),
-            {"label": label, "cid": calendar_id},
+            text(f"UPDATE ghl_calendar SET {', '.join(sets)} WHERE calendar_id = :cid"),
+            params,
         )
         if res.rowcount == 0:
             raise HTTPException(status_code=404, detail=f"Calendar {calendar_id} not found")
         await db.commit()
+
+    if new_class is not None:
+        await apply_manual_calendar_class(calendar_id, new_class)
+
+    async with AsyncSessionLocal() as db:
         row = (await db.execute(text("""
             SELECT c.calendar_id, c.name, c.calendar_class, c.funnel_tag, c.source_label,
                    COUNT(o.ghl_opportunity_id) AS booking_count
@@ -905,3 +946,28 @@ async def update_booking_calendar(calendar_id: str, payload: BookingCalendarUpda
 
     stats_svc.invalidate_stats_cache()
     return dict(row)
+
+
+@router.post("/booking-calendars/rename-source", response_model=SourceRenameResponse)
+async def rename_booking_source(payload: SourceRenameRequest):
+    """Rename a source label across every calendar that carries it, so the
+    Bookings drill-down regroups under the new name in one step."""
+    from sqlalchemy import text
+    from db.session import AsyncSessionLocal
+
+    from_label = payload.from_label.strip()
+    to_label = payload.to_label.strip()
+    if not from_label or not to_label:
+        raise HTTPException(status_code=400, detail="Both labels are required")
+    if from_label == to_label:
+        return {"updated": 0}
+
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text("UPDATE ghl_calendar SET source_label = :to WHERE source_label = :frm"),
+            {"to": to_label, "frm": from_label},
+        )
+        await db.commit()
+
+    stats_svc.invalidate_stats_cache()
+    return {"updated": res.rowcount}

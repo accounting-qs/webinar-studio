@@ -119,6 +119,9 @@ class GHLCalendar(Base):
     funnel_tag: Mapped[Optional[str]] = mapped_column(Text)
     # Curated source label. Seeded from funnel_tag on sync; user edits persist.
     source_label: Mapped[Optional[str]] = mapped_column(Text)
+    # True once the user overrides calendar_class from the Calendars tab; sync
+    # then stops refreshing calendar_class from the name-based classification.
+    class_is_manual: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

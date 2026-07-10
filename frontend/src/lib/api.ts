@@ -1882,17 +1882,29 @@ export async function fetchBookingCalendars(): Promise<BookingCalendar[]> {
   return data.calendars as BookingCalendar[];
 }
 
-export async function updateBookingCalendarSource(
+export async function updateBookingCalendar(
   calendarId: string,
-  sourceLabel: string | null,
+  patch: { source_label?: string | null; calendar_class?: string },
 ): Promise<BookingCalendar> {
   const res = await fetch(`${API_URL}/statistics/booking-calendars/${calendarId}`, {
     method: "PATCH",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ source_label: sourceLabel }),
+    body: JSON.stringify(patch),
   });
-  if (!res.ok) throw new Error("Failed to update calendar source");
+  if (!res.ok) throw new Error("Failed to update calendar");
   return res.json();
+}
+
+/** Rename a source label on every calendar that carries it. */
+export async function renameBookingSource(fromLabel: string, toLabel: string): Promise<number> {
+  const res = await fetch(`${API_URL}/statistics/booking-calendars/rename-source`, {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ from_label: fromLabel, to_label: toLabel }),
+  });
+  if (!res.ok) throw new Error("Failed to rename source");
+  const data = await res.json();
+  return data.updated as number;
 }
 
 /* ── List-name distribution ─────────────────────────────────────────────── */

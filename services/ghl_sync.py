@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import func, select, text as sa_text, update
+from sqlalchemy import case, func, select, text as sa_text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -355,34 +355,43 @@ async def _sync_calendars(client: GHLClient) -> dict[str, tuple[str, str | None]
     """Fetch + classify the location's calendars, upsert ghl_calendar, and
     return {calendar_id: (calendar_class, funnel_tag)} for appointment tagging."""
     names = await client.fetch_calendars()
-    cal_map: dict[str, tuple[str, str | None]] = {}
     rows: list[dict] = []
     now = datetime.now(timezone.utc)
     for cid, name in names.items():
         cls, tag = classify_calendar(name)
-        cal_map[cid] = (cls, tag)
         rows.append({
             "calendar_id": cid, "name": name, "calendar_class": cls,
             "funnel_tag": tag, "source_label": tag, "fetched_at": now,
         })
-    if rows:
-        async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as db:
+        if rows:
             stmt = pg_insert(GHLCalendar).values(rows)
             # Refresh name/class/tag/timestamp on every sync, but SEED source_label
             # only when it's still NULL — a curated (user-edited) label is never
-            # clobbered.
+            # clobbered. Same for calendar_class once the user has overridden it
+            # (class_is_manual).
             update_cols = {
                 k: getattr(stmt.excluded, k)
                 for k in rows[0].keys()
-                if k not in ("calendar_id", "source_label")
+                if k not in ("calendar_id", "source_label", "calendar_class")
             }
             update_cols["source_label"] = func.coalesce(
                 GHLCalendar.source_label, stmt.excluded.source_label
             )
+            update_cols["calendar_class"] = case(
+                (GHLCalendar.class_is_manual, GHLCalendar.calendar_class),
+                else_=stmt.excluded.calendar_class,
+            )
             stmt = stmt.on_conflict_do_update(index_elements=["calendar_id"], set_=update_cols)
             await db.execute(stmt)
             await db.commit()
-    return cal_map
+        # Return the DB's view (not the raw classification) so manually
+        # overridden classes flow into the appointment denormalization, and
+        # calendars GHL no longer returns still tag their stored appointments.
+        db_rows = (await db.execute(
+            select(GHLCalendar.calendar_id, GHLCalendar.calendar_class, GHLCalendar.funnel_tag)
+        )).all()
+    return {cid: (cls, tag) for cid, cls, tag in db_rows}
 
 
 async def _opp_contact_ids(updated_after: datetime | None) -> list[str]:
@@ -451,13 +460,16 @@ async def _fetch_and_store_appointments(
             await _heartbeat(state)
 
 
-async def _derive_calls_for_contacts(state: _SyncState, contact_ids: list[str]) -> None:
+async def _derive_calls_for_contacts(state: _SyncState | None, contact_ids: list[str]) -> None:
     """Re-derive call1/call2 for every opportunity whose contact is in the set,
     from that contact's stored appointments, and bulk-update ghl_opportunity.
 
     Opps whose contact has a first-call appointment get calendar-derived values
     (call1_source='calendar'); opps with no first-call keep their existing
-    custom-field values and are only tagged call1_source='custom_field'."""
+    custom-field values and are only tagged call1_source='custom_field'.
+
+    `state` is None when called outside a sync run (e.g. re-deriving after a
+    manual calendar-class edit) — heartbeats are skipped."""
     for chunk in _chunked(contact_ids, 1000):
         async with AsyncSessionLocal() as db:
             appt_res = await db.execute(
@@ -506,7 +518,34 @@ async def _derive_calls_for_contacts(state: _SyncState, contact_ids: list[str]) 
                     .values(call1_source="custom_field")
                 )
             await db.commit()
-        await _heartbeat(state)
+        if state is not None:
+            await _heartbeat(state)
+
+
+async def apply_manual_calendar_class(calendar_id: str, calendar_class: str) -> None:
+    """Apply a user's calendar-class override end-to-end: retag the calendar's
+    stored appointments (calendar_class is denormalized onto them) and
+    re-derive call1/call2 for every opportunity whose contact has an
+    appointment on this calendar. The ghl_calendar row itself is updated by
+    the API endpoint before calling this."""
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(GHLAppointment)
+            .where(GHLAppointment.calendar_id == calendar_id)
+            .values(calendar_class=calendar_class)
+        )
+        await db.commit()
+        contact_res = await db.execute(
+            select(GHLAppointment.ghl_contact_id)
+            .where(
+                GHLAppointment.calendar_id == calendar_id,
+                GHLAppointment.ghl_contact_id.isnot(None),
+            )
+            .distinct()
+        )
+        contact_ids = [r for (r,) in contact_res.all()]
+    if contact_ids:
+        await _derive_calls_for_contacts(None, contact_ids)
 
 
 async def sync_appointments_and_derive(
