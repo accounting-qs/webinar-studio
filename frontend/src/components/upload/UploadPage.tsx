@@ -572,23 +572,22 @@ export function UploadPage() {
                 from the per-contact Country column; used as a fallback when it's blank) */}
             <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "16px 0 0" }}>
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted-foreground)", textTransform: "uppercase", letterSpacing: "0.5px", whiteSpace: "nowrap" }}>List Location:</span>
-              <select
+              <input
+                type="text"
+                list="list-location-options"
                 value={listLocation}
                 onChange={(e) => setListLocation(e.target.value)}
+                placeholder="Search region or country… (none = per-contact country only)"
                 style={{
                   padding: "6px 12px", borderRadius: 8, border: "1px solid var(--border-subtle)",
                   background: "var(--card-bg)", color: "var(--foreground)", fontSize: 13,
-                  outline: "none", minWidth: 240, cursor: "pointer",
+                  outline: "none", minWidth: 320,
                 }}
-              >
-                <option value="">— None (use per-contact country only) —</option>
-                <optgroup label="Regions">
-                  {REGION_ORDER.map((r) => <option key={r} value={r}>{r}</option>)}
-                </optgroup>
-                <optgroup label="Countries">
-                  {COUNTRIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                </optgroup>
-              </select>
+              />
+              <datalist id="list-location-options">
+                {REGION_ORDER.map((r) => <option key={r} value={r}>Region</option>)}
+                {COUNTRIES.map((c) => <option key={c} value={c} />)}
+              </datalist>
               <span style={{ fontSize: 11, color: "var(--muted-foreground)" }}>
                 Applied to all {uploadResponse ? formatNumber(uploadResponse.total_rows) : ""} contacts in this import
               </span>

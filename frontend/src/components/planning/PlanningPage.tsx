@@ -18,7 +18,7 @@ import {
   type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
   type AssignCountry,
 } from "@/lib/api";
-import { REGION_COUNTRIES, REGION_ORDER, normCountry } from "@/lib/locations";
+import { REGION_COUNTRIES, REGION_ORDER, normCountry, COUNTRIES } from "@/lib/locations";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
@@ -611,7 +611,7 @@ function MultiCountryDropdown({
                       </span>
                       <span className="truncate">{o.country}</span>
                     </span>
-                    <span className="text-[10px] text-zinc-400 font-mono shrink-0">{o.count.toLocaleString()}</span>
+                    {o.count > 0 && <span className="text-[10px] text-zinc-400 font-mono shrink-0">{o.count.toLocaleString()}</span>}
                   </button>
                 );
               })
@@ -833,6 +833,14 @@ export function PlanningPage() {
       .catch(() => { if (!cancelled) setAssignAvailCountries([]); });
     return () => { cancelled = true; };
   }, [assignSource, assignTab]);
+
+  // Full option set for the filter: countries present in the source (with counts,
+  // shown first) followed by every other country so any location is selectable/searchable.
+  const assignLocationOptions = useMemo(() => {
+    const present = new Set(assignAvailCountries.map((c) => c.country));
+    const extra = COUNTRIES.filter((c) => !present.has(c)).map((c) => ({ country: c, count: 0 }));
+    return [...assignAvailCountries, ...extra];
+  }, [assignAvailCountries]);
 
   const updateSender = async (id: string, field: keyof Sender, value: number) => {
     // Optimistic update
@@ -2202,13 +2210,13 @@ export function PlanningPage() {
                             </button>
                           </div>
 
-                          {/* Assignment form — country / region filter (shown when a source has countries) */}
-                          {assignSource && assignAvailCountries.length > 0 && (
+                          {/* Assignment form — country / region filter (shown when a source is selected) */}
+                          {assignSource && (
                             <div className="flex items-center gap-3 mb-2">
                               <div className="w-72">
                                 <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Country / Region filter</label>
                                 <MultiCountryDropdown
-                                  options={assignAvailCountries}
+                                  options={assignLocationOptions}
                                   value={assignFilterCountries}
                                   onChange={setAssignFilterCountries}
                                 />
