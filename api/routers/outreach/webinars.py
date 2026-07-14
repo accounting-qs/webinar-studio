@@ -281,6 +281,12 @@ async def assign_bucket(
     blocklist_sq = _blocklist_email_subquery()
     not_blocklisted = sa_func.lower(Contact.email).notin_(blocklist_sq)
 
+    # Optional contact-country filter, applied identically to the availability
+    # counts and the claim query so the volume validation matches what gets claimed.
+    country_filter = (
+        [Contact.country.in_(body.filter_countries)] if body.filter_countries else []
+    )
+
     if is_custom_list:
         # Validate custom list upload
         from db.models import UploadHistory
@@ -303,6 +309,7 @@ async def assign_bucket(
                 Contact.bucket_id.is_(None),
                 Contact.outreach_status == "available",
                 not_blocklisted,
+                *country_filter,
             )
         )
         available_count = available_count_result.scalar() or 0
@@ -345,6 +352,7 @@ async def assign_bucket(
                 Contact.bucket_id == body.bucket_id,
                 Contact.outreach_status == "available",
                 not_blocklisted,
+                *country_filter,
             )
         )
         available_count = available_count_result.scalar() or 0
@@ -424,12 +432,14 @@ async def assign_bucket(
             Contact.bucket_id.is_(None),
             Contact.outreach_status == "available",
             not_blocklisted,
+            *country_filter,
         )
     else:
         claim_where = (
             Contact.bucket_id == body.bucket_id,
             Contact.outreach_status == "available",
             not_blocklisted,
+            *country_filter,
         )
 
     # Re-check `outreach_status == 'available'` on each outer UPDATE so PostgreSQL's
@@ -509,6 +519,45 @@ async def assign_bucket(
     resp = assignment_dict(assignment, blocklist_counts=bl.get(assignment.id))
     resp["bucket_remaining"] = bucket.remaining_contacts if bucket else None
     return resp
+
+
+@router.get("/assign-countries")
+async def assign_countries(
+    bucket_id: str | None = None,
+    upload_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Distinct contact countries (with available, non-blocklisted counts) for the
+    given bucket or custom list. Powers the country/region filter on the assign form.
+    Mirrors the availability predicates used by the claim so counts line up."""
+    if not bucket_id and not upload_id:
+        raise HTTPException(400, "Either bucket_id or upload_id must be provided")
+    if bucket_id and upload_id:
+        raise HTTPException(400, "Cannot provide both bucket_id and upload_id")
+
+    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+    if upload_id is not None:
+        source_where = (
+            Contact.upload_id == upload_id,
+            Contact.bucket_id.is_(None),
+        )
+    else:
+        source_where = (Contact.bucket_id == bucket_id,)
+
+    result = await db.execute(
+        select(Contact.country, sa_func.count())
+        .where(
+            *source_where,
+            Contact.outreach_status == "available",
+            not_blocklisted,
+            Contact.country.isnot(None),
+            Contact.country != "",
+        )
+        .group_by(Contact.country)
+        .order_by(sa_func.count().desc())
+    )
+    return {"countries": [{"country": c, "count": n} for c, n in result.all()]}
 
 
 @router.put("/assignments/{assignment_id}")

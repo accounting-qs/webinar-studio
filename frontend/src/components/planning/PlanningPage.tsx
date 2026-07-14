@@ -13,8 +13,10 @@ import {
   startWebinarListExport, fetchActiveWebinarListExports, fetchLatestWebinarListExport,
   downloadWebinarListExport,
   fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
+  fetchAssignCountries,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
   type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
+  type AssignCountry,
 } from "@/lib/api";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
@@ -473,6 +475,176 @@ function Dropdown({
   );
 }
 
+/* ─── Country / region filter ──────────────────────────────────────────────
+ * Regions map to sets of (normalized, lowercased) country strings so we can
+ * group whatever countries actually appear in the data under a shortcut.
+ * "Europe" is intentionally broad (EU + UK + EFTA + rest of geographic Europe).
+ * Tune these sets here — they're matched case-insensitively against contacts.country. */
+const REGION_COUNTRIES: Record<string, Set<string>> = {
+  Europe: new Set([
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czechia", "czech republic",
+    "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland",
+    "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "the netherlands",
+    "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden",
+    "united kingdom", "uk", "u.k.", "great britain", "england", "scotland", "wales",
+    "switzerland", "norway", "iceland", "liechtenstein", "ukraine", "serbia", "monaco",
+    "andorra", "san marino", "north macedonia", "macedonia", "montenegro",
+    "bosnia and herzegovina", "albania", "moldova", "kosovo",
+  ]),
+  USA: new Set([
+    "united states", "united states of america", "usa", "us", "u.s.", "u.s.a.", "america",
+  ]),
+  Canada: new Set(["canada", "ca"]),
+};
+const REGION_ORDER = ["Europe", "USA", "Canada"];
+
+const normCountry = (c: string) => c.trim().toLowerCase();
+
+/** Multi-select dropdown over country options, with region shortcuts at the top
+ *  that toggle every present country in that region. `value` is the flat list of
+ *  selected country strings (exactly as they appear in the data). */
+function MultiCountryDropdown({
+  options,
+  value,
+  onChange,
+  placeholder = "All countries",
+  className = "",
+}: {
+  options: AssignCountry[];
+  value: string[];
+  onChange: (value: string[]) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setQuery(""); }
+    }
+    if (open) document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  const selected = new Set(value);
+  const q = query.trim().toLowerCase();
+  const filtered = q ? options.filter((o) => o.country.toLowerCase().includes(q)) : options;
+
+  // Region shortcuts, limited to regions that actually have present countries.
+  const regions = REGION_ORDER
+    .map((label) => ({
+      label,
+      countries: options.filter((o) => REGION_COUNTRIES[label].has(normCountry(o.country))).map((o) => o.country),
+    }))
+    .filter((r) => r.countries.length > 0);
+
+  const toggle = (country: string) => {
+    const next = new Set(selected);
+    if (next.has(country)) next.delete(country); else next.add(country);
+    onChange([...next]);
+  };
+  const toggleRegion = (countries: string[]) => {
+    const allOn = countries.every((c) => selected.has(c));
+    const next = new Set(selected);
+    if (allOn) countries.forEach((c) => next.delete(c));
+    else countries.forEach((c) => next.add(c));
+    onChange([...next]);
+  };
+
+  const summary =
+    value.length === 0 ? placeholder
+    : value.length === 1 ? value[0]
+    : `${value.length} countries`;
+
+  return (
+    <div ref={ref} className={`relative ${className}`}>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-left flex items-center justify-between gap-2 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
+      >
+        <span className={`truncate ${value.length ? "text-zinc-800 dark:text-zinc-200" : "text-zinc-500"}`}>{summary}</span>
+        <span className="flex items-center gap-1 shrink-0">
+          {value.length > 0 && (
+            <span
+              onClick={(e) => { e.stopPropagation(); onChange([]); }}
+              className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 text-xs"
+              title="Clear"
+            >✕</span>
+          )}
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+            className={`text-zinc-500 transition-transform duration-150 ${open ? "rotate-180" : ""}`}>
+            <path d="M6 9l6 6 6-6" />
+          </svg>
+        </span>
+      </button>
+
+      {open && (
+        <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg shadow-xl shadow-black/10 dark:shadow-black/40 flex flex-col max-h-[300px]">
+          <div className="p-1.5 border-b border-zinc-200 dark:border-zinc-800/60 shrink-0">
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search country…"
+              className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded px-2 py-1 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+          </div>
+          <div className="overflow-y-auto py-1">
+            {!q && regions.length > 0 && (
+              <>
+                {regions.map((r) => {
+                  const allOn = r.countries.every((c) => selected.has(c));
+                  return (
+                    <button
+                      key={r.label}
+                      type="button"
+                      onClick={() => toggleRegion(r.countries)}
+                      className="w-full text-left px-3 py-1.5 text-sm flex items-center gap-2 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60"
+                    >
+                      <span className={`inline-flex items-center justify-center w-3.5 h-3.5 rounded-sm border shrink-0 ${allOn ? "bg-violet-500 border-violet-500 text-white" : "border-zinc-400 dark:border-zinc-600"}`}>
+                        {allOn && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M20 6L9 17l-5-5" /></svg>}
+                      </span>
+                      <span className="font-semibold">{r.label}</span>
+                      <span className="text-[10px] text-zinc-400">{r.countries.length} {r.countries.length === 1 ? "country" : "countries"}</span>
+                    </button>
+                  );
+                })}
+                <div className="my-1 border-t border-zinc-200 dark:border-zinc-800/60" />
+              </>
+            )}
+            {filtered.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-zinc-500">No countries</div>
+            ) : (
+              filtered.map((o) => {
+                const on = selected.has(o.country);
+                return (
+                  <button
+                    key={o.country}
+                    type="button"
+                    onClick={() => toggle(o.country)}
+                    className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between gap-2 transition-colors ${on ? "bg-violet-500/10 text-violet-600 dark:text-violet-400" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800/60"}`}
+                  >
+                    <span className="flex items-center gap-2 min-w-0">
+                      <span className={`inline-flex items-center justify-center w-3.5 h-3.5 rounded-sm border shrink-0 ${on ? "bg-violet-500 border-violet-500 text-white" : "border-zinc-400 dark:border-zinc-600"}`}>
+                        {on && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M20 6L9 17l-5-5" /></svg>}
+                      </span>
+                      <span className="truncate">{o.country}</span>
+                    </span>
+                    <span className="text-[10px] text-zinc-400 font-mono shrink-0">{o.count.toLocaleString()}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ─── Main Component ───────────────────────────────────────────────────── */
 
 export function PlanningPage() {
@@ -663,9 +835,26 @@ export function PlanningPage() {
   // Assignment filter overrides (pre-filled from bucket, editable)
   const [assignCountries, setAssignCountries] = useState("");
   const [assignEmpRange, setAssignEmpRange] = useState("");
+  // Country/region filter: which contact countries are eligible for this claim.
+  // Empty = no filter. `assignAvailCountries` are the options for the selected source.
+  const [assignFilterCountries, setAssignFilterCountries] = useState<string[]>([]);
+  const [assignAvailCountries, setAssignAvailCountries] = useState<AssignCountry[]>([]);
   const [assignAccounts, setAssignAccounts] = useState(0);
   const [assignSendPerAcct, setAssignSendPerAcct] = useState(0);
   const [assignDays, setAssignDays] = useState(5);
+
+  // Load the country options for the selected source and reset the filter.
+  const assignSource = assignTab === "custom_lists" ? assignCustomList : assignBucket;
+  useEffect(() => {
+    setAssignFilterCountries([]);
+    if (!assignSource) { setAssignAvailCountries([]); return; }
+    let cancelled = false;
+    const params = assignTab === "custom_lists" ? { upload_id: assignSource } : { bucket_id: assignSource };
+    fetchAssignCountries(params)
+      .then((cs) => { if (!cancelled) setAssignAvailCountries(cs); })
+      .catch(() => { if (!cancelled) setAssignAvailCountries([]); });
+    return () => { cancelled = true; };
+  }, [assignSource, assignTab]);
 
   const updateSender = async (id: string, field: keyof Sender, value: number) => {
     // Optimistic update
@@ -1015,6 +1204,7 @@ export function PlanningPage() {
 
     let requestData: Parameters<typeof assignBucketToWebinar>[1];
 
+    const filterCountries = assignFilterCountries.length ? assignFilterCountries : undefined;
     if (isCustomListAssign) {
       requestData = {
         upload_id: assignCustomList,
@@ -1023,6 +1213,7 @@ export function PlanningPage() {
         accounts_used: accts,
         send_per_account: sendPerAcct,
         days: assignDays,
+        filter_countries: filterCountries,
       };
     } else {
       const bucket = buckets.find((b) => b.id === assignBucket);
@@ -1039,6 +1230,7 @@ export function PlanningPage() {
         days: assignDays,
         countries_override: countries,
         emp_range_override: empRange,
+        filter_countries: filterCountries,
       };
     }
 
@@ -1082,7 +1274,7 @@ export function PlanningPage() {
       assignInFlightRef.current = null;
       setAssignInFlight(null);
     }
-  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
@@ -2031,6 +2223,25 @@ export function PlanningPage() {
                               {assignInFlight === w.id ? "Assigning…" : "Assign →"}
                             </button>
                           </div>
+
+                          {/* Assignment form — country / region filter (shown when a source has countries) */}
+                          {assignSource && assignAvailCountries.length > 0 && (
+                            <div className="flex items-center gap-3 mb-2">
+                              <div className="w-72">
+                                <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Country / Region filter</label>
+                                <MultiCountryDropdown
+                                  options={assignAvailCountries}
+                                  value={assignFilterCountries}
+                                  onChange={setAssignFilterCountries}
+                                />
+                              </div>
+                              <span className="text-[10px] text-zinc-500 mt-4">
+                                {assignFilterCountries.length === 0
+                                  ? "No filter — assigning from all countries"
+                                  : `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match`}
+                              </span>
+                            </div>
+                          )}
 
                           {/* Assignment form — row 2: sending config (shown when bucket + sender selected) */}
                           {(assignTab === "custom_lists" ? assignCustomList : assignBucket) && assignSender && (() => {

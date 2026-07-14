@@ -91,6 +91,7 @@ class Contact(Base):
     created_date: Mapped[Optional[str]] = mapped_column(Text)
     industry: Mapped[Optional[str]] = mapped_column(Text)
     employee_range: Mapped[Optional[str]] = mapped_column(Text)
+    employee_count: Mapped[Optional[int]] = mapped_column(Integer)
     country: Mapped[Optional[str]] = mapped_column(Text)
     database_provider: Mapped[Optional[str]] = mapped_column(Text)
     scraper: Mapped[Optional[str]] = mapped_column(Text)
@@ -98,6 +99,14 @@ class Contact(Base):
     primary_identity: Mapped[Optional[str]] = mapped_column(Text)
     sub_identity: Mapped[Optional[str]] = mapped_column(Text)
     sector: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Person / company firmographics
+    title: Mapped[Optional[str]] = mapped_column(Text)
+    seniority: Mapped[Optional[str]] = mapped_column(Text)
+    company_founded_year: Mapped[Optional[str]] = mapped_column(Text)
+    company_total_funding: Mapped[Optional[str]] = mapped_column(Text)
+    company_annual_revenue: Mapped[Optional[str]] = mapped_column(Text)
+    company_country: Mapped[Optional[str]] = mapped_column(Text)
 
     # Custom fields stored as JSONB
     custom_data: Mapped[Optional[dict]] = mapped_column(JSONB, server_default="{}")

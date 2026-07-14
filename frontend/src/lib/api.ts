@@ -753,6 +753,7 @@ export async function assignBucketToWebinar(
     days?: number;
     countries_override?: string;
     emp_range_override?: string;
+    filter_countries?: string[];
   }
 ): Promise<ApiAssignment> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}/assign`, {
@@ -765,6 +766,25 @@ export async function assignBucketToWebinar(
     throw new Error(err.detail ?? "Failed to assign");
   }
   return res.json();
+}
+
+export interface AssignCountry {
+  country: string;
+  count: number;
+}
+
+/** Distinct contact countries (with available counts) for a bucket or custom list,
+ *  used to build the country/region filter on the assign form. */
+export async function fetchAssignCountries(
+  params: { bucket_id?: string; upload_id?: string }
+): Promise<AssignCountry[]> {
+  const qs = new URLSearchParams(params as Record<string, string>).toString();
+  const res = await fetch(`${API_URL}/outreach/assign-countries?${qs}`, {
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.countries ?? [];
 }
 
 export async function updateAssignment(

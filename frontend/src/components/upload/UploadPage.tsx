@@ -33,9 +33,16 @@ const SYSTEM_FIELDS = [
   { value: "created_date", label: "Created Date", group: "source" },
   { value: "industry", label: "Industry", group: "source" },
   { value: "employee_range", label: "Employee Range", group: "source" },
+  { value: "employee_count", label: "Employee Count", group: "source" },
   { value: "country", label: "Country", group: "source" },
   { value: "database_provider", label: "Database Provider", group: "source" },
   { value: "scraper", label: "Scraper", group: "source" },
+  { value: "title", label: "Title", group: "source" },
+  { value: "seniority", label: "Seniority", group: "source" },
+  { value: "company_founded_year", label: "Company Founded Year", group: "source" },
+  { value: "company_total_funding", label: "Company Total Funding", group: "source" },
+  { value: "company_annual_revenue", label: "Company Annual Revenue", group: "source" },
+  { value: "company_country", label: "Company Country", group: "source" },
 ];
 
 const AUTO_MAP: Record<string, string> = {
@@ -65,6 +72,16 @@ const AUTO_MAP: Record<string, string> = {
   characteristic: "sub_identity",
   sub_identity: "sub_identity",
   sector: "sector",
+  // Firmographic export headers (e.g. Apollo / Ampleleads).
+  industry: "industry",
+  country: "country",
+  title: "title",
+  seniority: "seniority",
+  "employees count": "employee_count",
+  "company founded year": "company_founded_year",
+  "company total funding": "company_total_funding",
+  "company annual revenue": "company_annual_revenue",
+  "company country": "company_country",
 };
 
 function autoMapHeader(header: string): string {

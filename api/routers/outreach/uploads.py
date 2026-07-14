@@ -87,10 +87,33 @@ _COPY_COLUMNS: tuple[str, ...] = (
     "contact_id", "first_name", "last_name", "email", "company_website",
     "bucket_name", "classification", "confidence", "reasoning", "cost", "status",
     "lead_list_name", "segment_name", "created_date", "industry", "employee_range",
-    "country", "database_provider", "scraper", "enrichment_classification",
+    "employee_count", "country", "database_provider", "scraper", "enrichment_classification",
     "primary_identity", "sub_identity", "sector",
+    "title", "seniority", "company_founded_year", "company_total_funding",
+    "company_annual_revenue", "company_country",
     "custom_data",
 )
+
+
+# Canonical company-size buckets. When a CSV gives a raw headcount instead of a
+# range, we bucket it here and store the label in employee_range so range-source
+# and count-source imports share one filter vocabulary. Upper bound is inclusive.
+_EMPLOYEE_BUCKETS: tuple[tuple[int, str], ...] = (
+    (10, "1 - 10"),
+    (50, "11 - 50"),
+    (200, "51 - 200"),
+    (500, "201 - 500"),
+    (1000, "501 - 1000"),
+    (5000, "1001 - 5000"),
+    (10000, "5001 - 10000"),
+)
+
+
+def _employee_bucket(count: int) -> str:
+    for ceiling, label in _EMPLOYEE_BUCKETS:
+        if count <= ceiling:
+            return label
+    return "10000+"
 
 
 def _contact_to_copy_tuple(c: dict) -> tuple:
@@ -117,6 +140,7 @@ def _contact_to_copy_tuple(c: dict) -> tuple:
         c.get("created_date"),
         c.get("industry"),
         c.get("employee_range"),
+        c.get("employee_count"),
         c.get("country"),
         c.get("database_provider"),
         c.get("scraper"),
@@ -124,6 +148,12 @@ def _contact_to_copy_tuple(c: dict) -> tuple:
         c.get("primary_identity"),
         c.get("sub_identity"),
         c.get("sector"),
+        c.get("title"),
+        c.get("seniority"),
+        c.get("company_founded_year"),
+        c.get("company_total_funding"),
+        c.get("company_annual_revenue"),
+        c.get("company_country"),
         c.get("custom_data") or {},
     )
 
@@ -1039,10 +1069,14 @@ async def _process_csv_import(
             "contact_id", "first_name", "last_name", "email", "company_website",
             "bucket_name", "classification", "confidence", "reasoning", "cost",
             "status", "lead_list_name", "segment_name", "created_date",
-            "industry", "employee_range", "country", "database_provider", "scraper",
+            "industry", "employee_range", "employee_count", "country",
+            "database_provider", "scraper",
             "enrichment_classification", "primary_identity", "sub_identity", "sector",
+            "title", "seniority", "company_founded_year", "company_total_funding",
+            "company_annual_revenue", "company_country",
         }
         FLOAT_FIELDS = {"confidence", "cost"}
+        INT_FIELDS = {"employee_count"}
         is_custom_list = upload_mode == "custom_list"
         if is_custom_list:
             print(f"[IMPORT] Custom list mode — skipping bucket classification")
@@ -1118,6 +1152,10 @@ async def _process_csv_import(
                         contact[target] = float(value)
                     except (ValueError, TypeError):
                         contact[target] = None
+                elif target in INT_FIELDS:
+                    # Tolerate thousands separators / stray chars (e.g. "1,200").
+                    digits = "".join(ch for ch in value if ch.isdigit())
+                    contact[target] = int(digits) if digits else None
                 elif target.startswith("custom:"):
                     custom_data[target[7:]] = value
                 else:
@@ -1126,6 +1164,10 @@ async def _process_csv_import(
                 contact["custom_data"] = custom_data
             if contact.get("email"):
                 contact["email"] = contact["email"].lower().strip()
+            # Keep employee_range as the single unified size filter: when the source
+            # gives a raw headcount but no range, bucket the count into a range label.
+            if not contact.get("employee_range") and contact.get("employee_count") is not None:
+                contact["employee_range"] = _employee_bucket(contact["employee_count"])
             return contact
 
         # Pre-compute the INSERT…SELECT statement that resolves conflicts.

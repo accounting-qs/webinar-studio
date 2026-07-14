@@ -119,6 +119,11 @@ class AssignRequest(BaseModel):
     days: int | None = None
     countries_override: str | None = None
     emp_range_override: str | None = None
+    # Contact-country filter for the claim: only contacts whose `country` is in this
+    # list are eligible. Empty/None = no filter (assign from the whole pool, as before).
+    # The frontend expands region shortcuts (Europe / USA / Canada) into concrete
+    # country strings before sending, so this is always a flat list of countries.
+    filter_countries: list[str] | None = None
 
 class AssignmentUpdate(BaseModel):
     title_copy_id: str | None = None
