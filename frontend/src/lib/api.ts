@@ -773,8 +773,9 @@ export interface AssignCountry {
   count: number;
 }
 
-/** Distinct contact countries (with available counts) for a bucket or custom list,
- *  used to build the country/region filter on the assign form. */
+/** Selectable location options for the assign filter: per-contact countries merged
+ *  with list-level locations (for contacts that have no per-contact country). The
+ *  same selected values match either dimension server-side. */
 export async function fetchAssignCountries(
   params: { bucket_id?: string; upload_id?: string }
 ): Promise<AssignCountry[]> {
@@ -784,7 +785,13 @@ export async function fetchAssignCountries(
   });
   if (!res.ok) return [];
   const data = await res.json();
-  return data.countries ?? [];
+  const merged = new Map<string, number>();
+  for (const { country, count } of [...(data.countries ?? []), ...(data.locations ?? [])]) {
+    merged.set(country, (merged.get(country) ?? 0) + count);
+  }
+  return [...merged.entries()]
+    .map(([country, count]) => ({ country, count }))
+    .sort((a, b) => b.count - a.count);
 }
 
 export async function updateAssignment(
@@ -952,6 +959,7 @@ export async function startImport(
   duplicateMode: string = "ignore",
   uploadMode: string = "bucket",
   customListName?: string,
+  listLocation?: string,
 ): Promise<{ id: string; status: string }> {
   const res = await fetch(`${API_URL}/outreach/uploads/${uploadId}/import`, {
     method: "POST",
@@ -961,6 +969,7 @@ export async function startImport(
       duplicate_mode: duplicateMode,
       upload_mode: uploadMode,
       custom_list_name: customListName,
+      list_location: listLocation,
     }),
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start import"));

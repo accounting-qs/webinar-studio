@@ -18,6 +18,8 @@ class UploadHistory(Base):
     duplicate_mode: Mapped[str] = mapped_column(String(20), nullable=False, server_default="ignore")
     upload_mode: Mapped[str] = mapped_column(String(20), nullable=False, server_default="bucket")
     custom_list_name: Mapped[Optional[str]] = mapped_column(Text)
+    # List-level location (country or region) applied to every contact of this import.
+    list_location: Mapped[Optional[str]] = mapped_column(Text)
 
     total_contacts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     total_buckets: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -107,6 +109,10 @@ class Contact(Base):
     company_total_funding: Mapped[Optional[str]] = mapped_column(Text)
     company_annual_revenue: Mapped[Optional[str]] = mapped_column(Text)
     company_country: Mapped[Optional[str]] = mapped_column(Text)
+
+    # List-level location chosen at import (a country or a region like "Europe").
+    # Kept separate from `country`; used as a fallback when country is blank.
+    list_location: Mapped[Optional[str]] = mapped_column(Text)
 
     # Custom fields stored as JSONB
     custom_data: Mapped[Optional[dict]] = mapped_column(JSONB, server_default="{}")

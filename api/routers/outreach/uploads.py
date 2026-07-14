@@ -90,7 +90,7 @@ _COPY_COLUMNS: tuple[str, ...] = (
     "employee_count", "country", "database_provider", "scraper", "enrichment_classification",
     "primary_identity", "sub_identity", "sector",
     "title", "seniority", "company_founded_year", "company_total_funding",
-    "company_annual_revenue", "company_country",
+    "company_annual_revenue", "company_country", "list_location",
     "custom_data",
 )
 
@@ -154,6 +154,7 @@ def _contact_to_copy_tuple(c: dict) -> tuple:
         c.get("company_total_funding"),
         c.get("company_annual_revenue"),
         c.get("company_country"),
+        c.get("list_location"),
         c.get("custom_data") or {},
     )
 
@@ -548,6 +549,7 @@ async def start_import(
     upload.duplicate_mode = body.duplicate_mode
     upload.upload_mode = body.upload_mode
     upload.custom_list_name = body.custom_list_name
+    upload.list_location = (body.list_location or "").strip() or None
     upload.status = "processing"
     upload.progress = 0
 
@@ -582,7 +584,10 @@ async def start_import(
         _import_cancel_flags.pop(upload_id, None)
 
     task = asyncio.create_task(
-        _process_csv_import(upload_id, upload.storage_path, body.field_mappings, body.duplicate_mode, body.upload_mode)
+        _process_csv_import(
+            upload_id, upload.storage_path, body.field_mappings, body.duplicate_mode,
+            body.upload_mode, list_location=upload.list_location,
+        )
     )
     _active_import_tasks[upload_id] = task
     task.add_done_callback(_cleanup)
@@ -941,6 +946,7 @@ def resume_orphan_import(upload: "UploadHistory") -> bool:
             upload.field_mappings,
             upload.duplicate_mode or "ignore",
             upload.upload_mode or "bucket",
+            list_location=upload.list_location,
             start_from_row=upload.processed_rows or 0,
             initial_inserted=upload.inserted_count or 0,
             initial_skipped=upload.skipped_count or 0,
@@ -959,6 +965,7 @@ async def _process_csv_import(
     duplicate_mode: str,
     upload_mode: str = "bucket",
     *,
+    list_location: str | None = None,
     start_from_row: int = 0,
     initial_inserted: int = 0,
     initial_skipped: int = 0,
@@ -1135,6 +1142,7 @@ async def _process_csv_import(
                 "upload_id": upload_id,
                 "bucket_id": None,
                 "outreach_status": "available",
+                "list_location": list_location,
                 "custom_data": {},
             }
             for f in STANDARD_FIELDS:

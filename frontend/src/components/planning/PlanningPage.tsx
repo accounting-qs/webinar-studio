@@ -18,6 +18,7 @@ import {
   type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
   type AssignCountry,
 } from "@/lib/api";
+import { REGION_COUNTRIES, REGION_ORDER, normCountry } from "@/lib/locations";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
@@ -475,30 +476,7 @@ function Dropdown({
   );
 }
 
-/* ─── Country / region filter ──────────────────────────────────────────────
- * Regions map to sets of (normalized, lowercased) country strings so we can
- * group whatever countries actually appear in the data under a shortcut.
- * "Europe" is intentionally broad (EU + UK + EFTA + rest of geographic Europe).
- * Tune these sets here — they're matched case-insensitively against contacts.country. */
-const REGION_COUNTRIES: Record<string, Set<string>> = {
-  Europe: new Set([
-    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czechia", "czech republic",
-    "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland",
-    "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "the netherlands",
-    "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden",
-    "united kingdom", "uk", "u.k.", "great britain", "england", "scotland", "wales",
-    "switzerland", "norway", "iceland", "liechtenstein", "ukraine", "serbia", "monaco",
-    "andorra", "san marino", "north macedonia", "macedonia", "montenegro",
-    "bosnia and herzegovina", "albania", "moldova", "kosovo",
-  ]),
-  USA: new Set([
-    "united states", "united states of america", "usa", "us", "u.s.", "u.s.a.", "america",
-  ]),
-  Canada: new Set(["canada", "ca"]),
-};
-const REGION_ORDER = ["Europe", "USA", "Canada"];
-
-const normCountry = (c: string) => c.trim().toLowerCase();
+/* ─── Country / region filter ────────────────────────────────────────────── */
 
 /** Multi-select dropdown over country options, with region shortcuts at the top
  *  that toggle every present country in that region. `value` is the flat list of

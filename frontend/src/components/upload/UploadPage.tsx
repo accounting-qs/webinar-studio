@@ -8,6 +8,7 @@ import {
   fetchCustomFields,
   type ApiUpload, type UploadFileResponse, type UploadStatusResponse,
 } from "@/lib/api";
+import { COUNTRIES, REGION_ORDER } from "@/lib/locations";
 
 /* ─── Constants ────────────────────────────────────────────────────────── */
 
@@ -114,6 +115,8 @@ export function UploadPage() {
   // Upload mode
   const [uploadMode, setUploadMode] = useState<"bucket" | "custom_list">("bucket");
   const [customListName, setCustomListName] = useState("");
+  // List-level location (a region or country) written to every contact of this import.
+  const [listLocation, setListLocation] = useState("");
 
   // Duplicate handling
   const [duplicateMode, setDuplicateMode] = useState<"ignore" | "overwrite">("ignore");
@@ -229,17 +232,18 @@ export function UploadPage() {
     if (!uploadResponse) return;
 
     try {
-      await startImport(uploadResponse.id, mappings, duplicateMode, uploadMode, uploadMode === "custom_list" ? customListName : undefined);
+      await startImport(uploadResponse.id, mappings, duplicateMode, uploadMode, uploadMode === "custom_list" ? customListName : undefined, listLocation || undefined);
       setStep("idle");
       setUploadResponse(null);
       setMappings({});
       setUploadMode("bucket");
       setCustomListName("");
+      setListLocation("");
       loadHistory();
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : "Failed to start import");
     }
-  }, [uploadResponse, mappings, duplicateMode, uploadMode, customListName, loadHistory]);
+  }, [uploadResponse, mappings, duplicateMode, uploadMode, customListName, listLocation, loadHistory]);
 
   /* ── History item click handler ────────────────────────────────────── */
 
@@ -562,6 +566,32 @@ export function UploadPage() {
                   />
                 </div>
               )}
+            </div>
+
+            {/* List location — written to every contact of this import (kept separate
+                from the per-contact Country column; used as a fallback when it's blank) */}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "16px 0 0" }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted-foreground)", textTransform: "uppercase", letterSpacing: "0.5px", whiteSpace: "nowrap" }}>List Location:</span>
+              <select
+                value={listLocation}
+                onChange={(e) => setListLocation(e.target.value)}
+                style={{
+                  padding: "6px 12px", borderRadius: 8, border: "1px solid var(--border-subtle)",
+                  background: "var(--card-bg)", color: "var(--foreground)", fontSize: 13,
+                  outline: "none", minWidth: 240, cursor: "pointer",
+                }}
+              >
+                <option value="">— None (use per-contact country only) —</option>
+                <optgroup label="Regions">
+                  {REGION_ORDER.map((r) => <option key={r} value={r}>{r}</option>)}
+                </optgroup>
+                <optgroup label="Countries">
+                  {COUNTRIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </optgroup>
+              </select>
+              <span style={{ fontSize: 11, color: "var(--muted-foreground)" }}>
+                Applied to all {uploadResponse ? formatNumber(uploadResponse.total_rows) : ""} contacts in this import
+              </span>
             </div>
 
             {/* Mapping table */}

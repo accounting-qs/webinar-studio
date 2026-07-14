@@ -152,6 +152,8 @@ class ImportStartCreate(BaseModel):
     duplicate_mode: str = "ignore"  # "ignore" | "overwrite"
     upload_mode: str = "bucket"  # "bucket" | "custom_list"
     custom_list_name: str | None = None
+    # List-level location (a country or region label) written to every contact.
+    list_location: str | None = None
 
 
 # ── Custom Fields ──────────────────────────────────────────────────────────

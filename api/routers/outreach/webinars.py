@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, func as sa_func, delete, update
+from sqlalchemy import select, func as sa_func, delete, update, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, undefer
 
@@ -281,11 +281,19 @@ async def assign_bucket(
     blocklist_sq = _blocklist_email_subquery()
     not_blocklisted = sa_func.lower(Contact.email).notin_(blocklist_sq)
 
-    # Optional contact-country filter, applied identically to the availability
-    # counts and the claim query so the volume validation matches what gets claimed.
-    country_filter = (
-        [Contact.country.in_(body.filter_countries)] if body.filter_countries else []
-    )
+    # Optional location filter, applied identically to the availability counts and
+    # the claim query so volume validation matches what gets claimed. A contact
+    # matches if its per-contact `country` is in the selected set, OR — as a
+    # second-level scan when country is blank — its list-level `list_location` is.
+    if body.filter_countries:
+        sel = body.filter_countries
+        blank_country = or_(Contact.country.is_(None), Contact.country == "")
+        country_filter = [or_(
+            Contact.country.in_(sel),
+            and_(blank_country, Contact.list_location.in_(sel)),
+        )]
+    else:
+        country_filter = []
 
     if is_custom_list:
         # Validate custom list upload
@@ -545,19 +553,31 @@ async def assign_countries(
     else:
         source_where = (Contact.bucket_id == bucket_id,)
 
-    result = await db.execute(
+    base_where = (*source_where, Contact.outreach_status == "available", not_blocklisted)
+
+    # Per-contact countries.
+    country_res = await db.execute(
         select(Contact.country, sa_func.count())
-        .where(
-            *source_where,
-            Contact.outreach_status == "available",
-            not_blocklisted,
-            Contact.country.isnot(None),
-            Contact.country != "",
-        )
+        .where(*base_where, Contact.country.isnot(None), Contact.country != "")
         .group_by(Contact.country)
         .order_by(sa_func.count().desc())
     )
-    return {"countries": [{"country": c, "count": n} for c, n in result.all()]}
+    # List-level locations for contacts with no per-contact country (the fallback set).
+    loc_res = await db.execute(
+        select(Contact.list_location, sa_func.count())
+        .where(
+            *base_where,
+            or_(Contact.country.is_(None), Contact.country == ""),
+            Contact.list_location.isnot(None),
+            Contact.list_location != "",
+        )
+        .group_by(Contact.list_location)
+        .order_by(sa_func.count().desc())
+    )
+    return {
+        "countries": [{"country": c, "count": n} for c, n in country_res.all()],
+        "locations": [{"country": loc, "count": n} for loc, n in loc_res.all()],
+    }
 
 
 @router.put("/assignments/{assignment_id}")
