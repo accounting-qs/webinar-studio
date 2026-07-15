@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 from datetime import datetime
 from typing import AsyncGenerator
 
@@ -35,9 +37,48 @@ GHL_PAGE_DELAY_S = 0.05
 
 # Retry config for transient HTTP errors (5xx, 429, network timeouts).
 # A single mid-stream blip used to fail an entire 200k-row deep sync;
-# this turns those into a brief pause and a continued stream.
-_RETRY_MAX_ATTEMPTS = 4
-_RETRY_BASE_DELAY_S = 1.0  # 1s, 2s, 4s, 8s
+# this turns those into a brief pause and a continued stream. 6 attempts
+# with a capped, jittered backoff survives a sustained sub-account throttle
+# (which 4 attempts / ~15s did not) without letting 2**attempt run away.
+_RETRY_MAX_ATTEMPTS = 6
+_RETRY_BASE_DELAY_S = 1.0  # 1s, 2s, 4s, 8s, 16s (capped at _RETRY_MAX_DELAY_S)
+_RETRY_MAX_DELAY_S = 30.0
+
+# Global request pace across the whole client. GHL's sub-account v2 burst is
+# ~10 req/s; contacts/opps streams and the concurrent /appointments workers all
+# funnel through _request_with_retry, so one shared limiter caps CUMULATIVE
+# throughput regardless of per-caller concurrency. 7 req/s keeps headroom the
+# per-worker pacing can't guarantee when streams + appointments overlap.
+_RATE_LIMIT_RPS = 7.0
+
+
+class _RateLimiter:
+    """Async min-interval gate: allows at most `rps` requests per second across
+    all coroutines sharing this instance. Spaces requests by (1/rps) using a
+    monotonic clock under a lock — simple and burst-free."""
+
+    def __init__(self, rps: float) -> None:
+        self._min_interval = 1.0 / rps if rps > 0 else 0.0
+        self._lock = asyncio.Lock()
+        self._next_allowed = 0.0
+
+    async def acquire(self) -> None:
+        if self._min_interval <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._next_allowed = now + self._min_interval
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Capped exponential backoff with full jitter. Jitter de-synchronizes the
+    concurrent /appointments workers so their retries don't re-burst in lockstep."""
+    ceiling = min(_RETRY_BASE_DELAY_S * (2 ** attempt), _RETRY_MAX_DELAY_S)
+    return ceiling / 2 + random.random() * (ceiling / 2)
 
 
 async def get_ghl_credentials() -> tuple[str, str, str | None]:
@@ -172,6 +213,9 @@ class GHLClient:
         self._pipeline_id = pipeline_id
         self._page_delay_s = GHL_PAGE_DELAY_S
         self._page_size = GHL_PAGE_SIZE
+        # Shared across every request this client makes (streams + the
+        # concurrent /appointments workers) to cap cumulative req/s.
+        self._rate_limiter = _RateLimiter(_RATE_LIMIT_RPS)
 
     @classmethod
     async def create(cls) -> "GHLClient":
@@ -194,13 +238,19 @@ class GHLClient:
     ) -> dict:
         """HTTP request with retry on 429 / 5xx / network errors.
 
-        Retries up to _RETRY_MAX_ATTEMPTS times with exponential backoff.
-        For 429, honours the Retry-After header if present. 4xx (other
-        than 429) raises immediately — those are bugs, not transient.
+        Retries up to _RETRY_MAX_ATTEMPTS times with capped, jittered
+        exponential backoff. For 429, honours the Retry-After header if
+        present. A 401 whose body is GHL's transient "Command timed out"
+        gateway error is retried too. Other 4xx raise immediately — those
+        are bugs (or genuinely-bad ids), not transient.
+
+        A shared per-client rate limiter gates every attempt so cumulative
+        throughput stays under GHL's burst ceiling.
         """
         url = f"{self._base_url}{path}"
         last_exc: Exception | None = None
         for attempt in range(_RETRY_MAX_ATTEMPTS):
+            await self._rate_limiter.acquire()
             try:
                 if method == "GET":
                     response = await client.get(url, headers=self._headers, params=params)
@@ -210,7 +260,7 @@ class GHLClient:
                 last_exc = exc
                 if attempt == _RETRY_MAX_ATTEMPTS - 1:
                     raise
-                delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
+                delay = _backoff_delay(attempt)
                 logger.warning("GHL %s %s network error (attempt %d/%d): %s — retrying in %.1fs",
                                method, path, attempt + 1, _RETRY_MAX_ATTEMPTS, exc, delay)
                 await asyncio.sleep(delay)
@@ -218,20 +268,27 @@ class GHLClient:
 
             if response.status_code < 400:
                 return response.json()
-            if response.status_code == 429 or response.status_code >= 500:
+            # 401 "Command timed out" is GHL's gateway timing out server-side,
+            # not a credential rejection — transient, so retry it like a 429.
+            transient_401 = (
+                response.status_code == 401
+                and "command timed out" in (response.text or "").lower()
+            )
+            if response.status_code == 429 or response.status_code >= 500 or transient_401:
                 if attempt == _RETRY_MAX_ATTEMPTS - 1:
                     response.raise_for_status()
-                # Honour Retry-After if present, otherwise exponential backoff
+                # Honour Retry-After if present, otherwise jittered backoff. Cap
+                # even an honoured Retry-After so a bogus header can't stall us.
                 retry_after = response.headers.get("Retry-After")
                 try:
-                    delay = float(retry_after) if retry_after else _RETRY_BASE_DELAY_S * (2 ** attempt)
+                    delay = min(float(retry_after), _RETRY_MAX_DELAY_S) if retry_after else _backoff_delay(attempt)
                 except ValueError:
-                    delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
+                    delay = _backoff_delay(attempt)
                 logger.warning("GHL %s %s HTTP %d (attempt %d/%d) — retrying in %.1fs",
                                method, path, response.status_code, attempt + 1, _RETRY_MAX_ATTEMPTS, delay)
                 await asyncio.sleep(delay)
                 continue
-            # 4xx (not 429) — don't retry. Include the response body in the
+            # 4xx (not 429 / not transient 401) — don't retry. Include the response body in the
             # raised error so the sync's error_details JSONB captures what
             # GHL actually said (e.g. "filters[1].field is required"), not
             # just the bare status code.

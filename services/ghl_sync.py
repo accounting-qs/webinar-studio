@@ -265,7 +265,7 @@ async def _upsert_contacts_batch(db: AsyncSession, rows: list[dict]) -> None:
 
 async def _upsert_blocklist_from_ghl_batch(db: AsyncSession, rows: list[dict]) -> None:
     """Push GHL DND contacts (cold_calendar_unsubscribe_date set) into blocklist."""
-    from api.routers.outreach._helpers import LLOYD_USER_ID
+    from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
 
     dnd_rows = [
         {
@@ -285,6 +285,8 @@ async def _upsert_blocklist_from_ghl_batch(db: AsyncSession, rows: list[dict]) -
     )
     try:
         await db.execute(stmt)
+        # Keep the denormalized contact flag in sync for newly-DND emails.
+        await mark_contacts_blocklisted(db, [r["email"] for r in dnd_rows])
     except Exception as exc:
         logger.warning("Failed to upsert blocklist from GHL batch: %s", exc)
 
@@ -305,11 +307,11 @@ async def _upsert_opps_batch(db: AsyncSession, rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 # Bounded concurrency for the per-contact /appointments fetch. GHL's v2 burst
-# is ~10 req/s; the /appointments endpoint 429s hard above that. 4 concurrent
-# workers each pacing ~0.2s between requests keeps us ~8 req/s — under the
-# ceiling with retry headroom, ~4× faster than serial. DB writes stay
-# sequential (one writer).
-_APPT_FETCH_CONCURRENCY = 4
+# is ~10 req/s; the /appointments endpoint 429s hard above that. The client's
+# shared rate limiter now caps cumulative req/s across all callers, so this is
+# just the worker count feeding that gate — 3 keeps a little extra margin.
+# DB writes stay sequential (one writer).
+_APPT_FETCH_CONCURRENCY = 3
 _APPT_FETCH_PACE_S = 0.2
 # How many contacts to fetch before flushing rows + writing a heartbeat.
 _APPT_CHUNK = 300
@@ -425,6 +427,12 @@ async def _fetch_and_store_appointments(
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    # A 400 "Contact not found" is a stale/deleted id, not an
+                    # actionable failure — skip it silently so it doesn't inflate
+                    # errors_count on otherwise-healthy runs.
+                    if "contact not found" in str(exc).lower():
+                        logger.debug("Skipping appointments for missing contact %s", cid)
+                        return None
                     state.errors.append({"type": "appointments_fetch", "id": cid, "error": str(exc)[:500]})
                     logger.warning("Failed to fetch appointments for contact %s: %s", cid, exc)
                     return None

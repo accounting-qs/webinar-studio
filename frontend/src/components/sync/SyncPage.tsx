@@ -180,6 +180,86 @@ function StatCard({ label, value, valueClass }: { label: string; value: string |
   );
 }
 
+function SyncErrorModal({ run, onClose }: { run: GhlSyncRun; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [onClose]);
+
+  const errorsJson = JSON.stringify(run.error_details ?? [], null, 2);
+
+  const handleCopy = () => {
+    const text =
+      `Sync run: ${run.id}\n` +
+      `Type: ${formatSyncType(run.sync_type)}   Started: ${formatTimestamp(run.started_at)}\n` +
+      errorsJson;
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-[80%] max-w-5xl max-h-[80vh] flex flex-col rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 sticky top-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-sm font-semibold text-red-400 whitespace-nowrap">
+              Errors for run {run.id.slice(0, 8)}…
+            </span>
+            <span className="text-[11px] text-zinc-500 truncate">
+              {formatSyncType(run.sync_type)} · {run.errors_count} error{run.errors_count === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleCopy}
+              className={`flex items-center gap-1 text-[11px] font-medium px-2 py-[3px] rounded transition-all duration-100 ${
+                copied
+                  ? "bg-emerald-500/10 text-emerald-400"
+                  : "text-zinc-600 hover:text-zinc-800 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700/40"
+              }`}
+            >
+              {copied ? (
+                <><svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>Copied</>
+              ) : (
+                <><svg width="10" height="10" viewBox="0 0 12 12" fill="none"><rect x="4" y="1" width="7" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.2"/><path d="M1 4.5V10a1 1 0 001 1h5.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>Copy all</>
+              )}
+            </button>
+            <button
+              onClick={onClose}
+              className="text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors"
+              aria-label="Close"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+        <div className="overflow-y-auto px-4 py-3">
+          <pre className="text-[11px] text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-words">
+            {errorsJson}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SyncPage() {
   const [status, setStatus] = useState<GhlSyncStatus | null>(null);
   const [history, setHistory] = useState<GhlSyncRun[]>([]);
@@ -187,7 +267,7 @@ export function SyncPage() {
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
-  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
+  const [errorModalRunId, setErrorModalRunId] = useState<string | null>(null);
   const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
   const [recovering, setRecovering] = useState(false);
   const pollRef = useRef<number | null>(null);
@@ -288,14 +368,7 @@ export function SyncPage() {
     }
   };
 
-  const toggleErrorExpand = (runId: string) => {
-    setExpandedErrors((prev) => {
-      const next = new Set(prev);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
-      return next;
-    });
-  };
+  const errorModalRun = errorModalRunId ? history.find((h) => h.id === errorModalRunId) ?? null : null;
 
   if (loading) {
     return (
@@ -414,7 +487,7 @@ export function SyncPage() {
                   <tr
                     key={r.id}
                     className={`border-t border-zinc-200 dark:border-zinc-800/20 ${stale ? "bg-red-500/5" : ""} ${r.errors_count > 0 ? "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/30" : ""}`}
-                    onClick={r.errors_count > 0 ? () => toggleErrorExpand(r.id) : undefined}
+                    onClick={r.errors_count > 0 ? () => setErrorModalRunId(r.id) : undefined}
                   >
                     <td className="px-4 py-2.5 text-zinc-700 dark:text-zinc-300 whitespace-nowrap">
                       {formatTimestamp(r.started_at)}
@@ -488,20 +561,12 @@ export function SyncPage() {
             </table>
           )}
 
-          {/* Error details expandable */}
-          {[...expandedErrors].map((runId) => {
-            const run = history.find((h) => h.id === runId);
-            if (!run || !run.error_details) return null;
-            return (
-              <div key={runId} className="px-4 py-3 bg-red-500/5 border-t border-red-500/20 text-[11px]">
-                <div className="text-red-400 font-semibold mb-1">Errors for run {runId.slice(0, 8)}...</div>
-                <pre className="text-zinc-600 dark:text-zinc-400 overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(run.error_details, null, 2)}
-                </pre>
-              </div>
-            );
-          })}
         </div>
+
+        {/* Error details modal */}
+        {errorModalRun && (
+          <SyncErrorModal run={errorModalRun} onClose={() => setErrorModalRunId(null)} />
+        )}
 
         {/* Settings panel (kept as-is per user) */}
         {settings && (
