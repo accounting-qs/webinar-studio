@@ -155,6 +155,15 @@ interface Webinar {
   registrationLink: string;
   unsubscribeLink: string;
   lists: PlannedList[];
+  /** Whether this webinar's assignments (lists) have been fetched yet.
+   * Rows start with lists=[] and are hydrated lazily, newest first. */
+  listsLoaded: boolean;
+  /** Summary totals from the webinars metadata endpoint, shown on the
+   * collapsed parent row before its lists are hydrated. */
+  metaVolume: number;
+  metaRemaining: number;
+  metaAccounts: number;
+  metaAssignmentCount: number;
   expanded: boolean;
   /** Free-text A/B variant label, e.g. "Account A". null if this webinar
    * is the unique row for its number. */
@@ -303,6 +312,39 @@ function apiAssignmentToList(a: ApiAssignment): PlannedList {
     titleVariants: a.title_copy ? [{ id: a.title_copy.id, text: a.title_copy.text, selected: true, variantIndex: a.title_copy.variant_index }] : undefined,
     descVariants: a.desc_copy ? [{ id: a.desc_copy.id, text: a.desc_copy.text, selected: true, variantIndex: a.desc_copy.variant_index }] : undefined,
   };
+}
+
+/** Enrich freshly-mapped lists with all copy variants from their bucket.
+ * Pure — takes a bucket→copies map so it can be reused by the initial load
+ * and by lazy hydration of older campaigns. */
+function enrichListsWithCopies(
+  lists: PlannedList[],
+  bucketCopiesMap: Record<string, { titles: ApiCopy[]; descriptions: ApiCopy[] }>,
+): PlannedList[] {
+  return lists.map((l) => {
+    if (!l.bucketId || !bucketCopiesMap[l.bucketId]) return l;
+    const copies = bucketCopiesMap[l.bucketId];
+    const selectedTitleId = l.titleVariants?.[0]?.id;
+    const selectedDescId = l.descVariants?.[0]?.id;
+    return {
+      ...l,
+      copiesGenerated: copies.titles.length > 0 || copies.descriptions.length > 0,
+      titleVariants: copies.titles.map((c) => ({
+        id: c.id, text: c.text, selected: c.id === selectedTitleId || (!selectedTitleId && c.is_primary), variantIndex: c.variant_index,
+      })),
+      descVariants: copies.descriptions.map((c) => ({
+        id: c.id, text: c.text, selected: c.id === selectedDescId || (!selectedDescId && c.is_primary), variantIndex: c.variant_index,
+      })),
+      title: (() => {
+        if (selectedTitleId) {
+          const match = copies.titles.find(c => c.id === selectedTitleId);
+          if (match) return match.text;
+        }
+        const primary = copies.titles.find(c => c.is_primary);
+        return primary?.text || l.title;
+      })(),
+    };
+  });
 }
 
 /* ─── List Name suffix helper ─────────────────────────────────────────── */
@@ -632,8 +674,75 @@ export function PlanningPage() {
   const [webinars, setWebinars] = useState<Webinar[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loadingData, setLoadingData] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
 
-  /* ── Load all data from API on mount ──────────────────────────────── */
+  /* ── Lazy loading of per-webinar lists ─────────────────────────────────
+   * The old load fetched every webinar's assignments in a sequential
+   * waterfall, and each /lists call runs an expensive blocklist GROUP BY
+   * over the contacts table — so N campaigns meant N slow round-trips before
+   * anything rendered. Now we render campaign rows from lightweight metadata
+   * and hydrate their lists newest-first: the two most recent immediately,
+   * a few more in the background, and the long tail behind a Load-more
+   * button. */
+  const INITIAL_LOAD = 2;   // most-recent campaigns shown before revealing the page
+  const AUTO_MORE = 4;      // extra recent campaigns pulled in the background
+  const LOAD_MORE_CHUNK = 4; // parallelism when loading the tail on demand
+
+  // Cached bucket→copies so repeated hydrations don't refetch copies.
+  const bucketCopiesCacheRef = useRef<Record<string, { titles: ApiCopy[]; descriptions: ApiCopy[] }>>({});
+  // Newest-first webinar id order — the frontier the Load-more button walks.
+  const recencyOrderRef = useRef<string[]>([]);
+  const loadedWebinarIdsRef = useRef<Set<string>>(new Set());
+  const loadingWebinarIdsRef = useRef<Set<string>>(new Set());
+  const [loadedCount, setLoadedCount] = useState(0);
+
+  /** Fetch assignments + bucket copies for the given webinars (in parallel)
+   * and merge them into state, marking each as loaded. Skips ids already
+   * loaded or in flight, so it's safe to call from mount, expand, and the
+   * Load-more button. */
+  const hydrateWebinars = useCallback(async (ids: string[]) => {
+    const targets = ids.filter(
+      (id) => !loadedWebinarIdsRef.current.has(id) && !loadingWebinarIdsRef.current.has(id),
+    );
+    if (targets.length === 0) return;
+    targets.forEach((id) => loadingWebinarIdsRef.current.add(id));
+    try {
+      const results = await Promise.all(
+        targets.map(async (id) => {
+          try {
+            const { assignments } = await fetchWebinarLists(id);
+            return { id, assignments };
+          } catch {
+            return { id, assignments: [] as ApiAssignment[] };
+          }
+        }),
+      );
+
+      // Fetch copies only for buckets we haven't cached yet.
+      const neededBucketIds = [...new Set(
+        results.flatMap((r) => r.assignments).filter((a) => a.bucket).map((a) => a.bucket!.id),
+      )].filter((id) => !bucketCopiesCacheRef.current[id]);
+      await Promise.all(neededBucketIds.map(async (bucketId) => {
+        try {
+          const copies = await fetchBucketCopies(bucketId);
+          bucketCopiesCacheRef.current[bucketId] = { titles: copies.titles, descriptions: copies.descriptions };
+        } catch { /* no copies yet */ }
+      }));
+
+      const byId = new Map(results.map((r) => [r.id, r.assignments]));
+      setWebinars((prev) => prev.map((w) => {
+        const assignments = byId.get(w.id);
+        if (!assignments) return w;
+        const lists = enrichListsWithCopies(assignments.map(apiAssignmentToList), bucketCopiesCacheRef.current);
+        return { ...w, lists, listsLoaded: true };
+      }));
+      targets.forEach((id) => loadedWebinarIdsRef.current.add(id));
+    } finally {
+      targets.forEach((id) => loadingWebinarIdsRef.current.delete(id));
+    }
+  }, []);
+
+  /* ── Load metadata on mount, then hydrate newest campaigns first ──── */
   useEffect(() => {
     let cancelled = false;
     async function loadData() {
@@ -646,19 +755,11 @@ export function PlanningPage() {
         setBuckets(bucketsRes.buckets);
         setSenders(sendersRes.senders.map(apiSenderToLocal));
 
-        // Load assignments for each webinar
-        const webinarList: Webinar[] = [];
-        const allAssignments: ApiAssignment[] = [];
-        for (const w of webinarsRes.webinars) {
+        // Build campaign rows from metadata only — lists are hydrated lazily.
+        const webinarList: Webinar[] = webinarsRes.webinars.map((w) => {
           const d = new Date(w.date + "T00:00:00");
           const dateStr = d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-          let lists: PlannedList[] = [];
-          try {
-            const { assignments } = await fetchWebinarLists(w.id);
-            allAssignments.push(...assignments);
-            lists = assignments.map(apiAssignmentToList);
-          } catch { /* no lists yet */ }
-          webinarList.push({
+          return {
             id: w.id,
             number: w.number,
             date: dateStr,
@@ -668,67 +769,81 @@ export function PlanningPage() {
             mainTitle: w.main_title || "",
             registrationLink: w.registration_link || "",
             unsubscribeLink: w.unsubscribe_link || "",
-            lists,
+            lists: [],
+            listsLoaded: false,
+            metaVolume: w.total_volume,
+            metaRemaining: w.total_remaining,
+            metaAccounts: w.total_accounts,
+            metaAssignmentCount: w.assignment_count,
             expanded: w.status === "planning",
             variantLabel: w.variant_label,
             webinargeekCredentialId: w.webinargeek_credential_id,
             nonjoinerSourceWebinarId: w.nonjoiner_source_webinar_id,
-          });
-        }
-
-        // Load all copy variants for each unique bucket used in assignments
-        const uniqueBucketIds = [...new Set(allAssignments.filter(a => a.bucket).map(a => a.bucket!.id))];
-        const bucketCopiesMap: Record<string, { titles: ApiCopy[]; descriptions: ApiCopy[] }> = {};
-        await Promise.all(uniqueBucketIds.map(async (bucketId) => {
-          try {
-            const copies = await fetchBucketCopies(bucketId);
-            bucketCopiesMap[bucketId] = { titles: copies.titles, descriptions: copies.descriptions };
-          } catch { /* no copies yet */ }
-        }));
-
-        // Enrich lists with all copy variants from their bucket
-        for (const w of webinarList) {
-          w.lists = w.lists.map((l) => {
-            if (!l.bucketId || !bucketCopiesMap[l.bucketId]) return l;
-            const copies = bucketCopiesMap[l.bucketId];
-            const selectedTitleId = l.titleVariants?.[0]?.id;
-            const selectedDescId = l.descVariants?.[0]?.id;
-            return {
-              ...l,
-              copiesGenerated: copies.titles.length > 0 || copies.descriptions.length > 0,
-              titleVariants: copies.titles.map((c) => ({
-                id: c.id, text: c.text, selected: c.id === selectedTitleId || (!selectedTitleId && c.is_primary), variantIndex: c.variant_index,
-              })),
-              descVariants: copies.descriptions.map((c) => ({
-                id: c.id, text: c.text, selected: c.id === selectedDescId || (!selectedDescId && c.is_primary), variantIndex: c.variant_index,
-              })),
-              title: (() => {
-                if (selectedTitleId) {
-                  const match = copies.titles.find(c => c.id === selectedTitleId);
-                  if (match) return match.text;
-                }
-                const primary = copies.titles.find(c => c.is_primary);
-                return primary?.text || l.title;
-              })(),
-            };
-          });
-        }
-
+          };
+        });
         setWebinars(webinarList);
-        // Assignment form is not auto-opened — user clicks "Assign Lists"
+
+        // Newest-first frontier for lazy hydration.
+        const recency = [...webinarsRes.webinars]
+          .sort((a, b) => b.date.localeCompare(a.date))
+          .map((w) => w.id);
+        recencyOrderRef.current = recency;
+
+        // Load the two most recent campaigns, then reveal the page.
+        await hydrateWebinars(recency.slice(0, INITIAL_LOAD));
+        if (cancelled) return;
+        setLoadedCount(Math.min(recency.length, INITIAL_LOAD));
+        setLoadingData(false);
+
+        // "Go to the past": pull a few more recent campaigns in the
+        // background so history is ready without a click. The long tail
+        // waits for the Load-more button.
+        if (recency.length > INITIAL_LOAD) {
+          await hydrateWebinars(recency.slice(INITIAL_LOAD, INITIAL_LOAD + AUTO_MORE));
+          if (!cancelled) setLoadedCount((c) => Math.max(c, Math.min(recency.length, INITIAL_LOAD + AUTO_MORE)));
+        }
       } catch (err) {
         console.error("Failed to load data:", err);
-      } finally {
         if (!cancelled) setLoadingData(false);
       }
     }
     loadData();
     return () => { cancelled = true; };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hydrateWebinars]);
+
+  /** Load the rest of the campaigns' lists, newest-first, in small parallel
+   * chunks so the DB isn't hammered by one giant burst. */
+  const loadingMoreRef = useRef(false);
+  const handleLoadMore = useCallback(async () => {
+    if (loadingMoreRef.current) return; // avoid overlapping load loops
+    loadingMoreRef.current = true;
+    const recency = recencyOrderRef.current;
+    setLoadingMore(true);
+    try {
+      for (let i = loadedCount; i < recency.length; i += LOAD_MORE_CHUNK) {
+        const batch = recency.slice(i, i + LOAD_MORE_CHUNK);
+        await hydrateWebinars(batch);
+        setLoadedCount(Math.min(recency.length, i + LOAD_MORE_CHUNK));
+      }
+    } finally {
+      setLoadingMore(false);
+      loadingMoreRef.current = false;
+    }
+  }, [loadedCount, hydrateWebinars]);
   const [searchQuery, setSearchQuery] = useState("");
 
   // Sender filter — persisted to localStorage
   const [senderFilterId, setSenderFilterId] = useState<string>("");
+
+  // Search and the sender filter both work against list data, which only
+  // exists once a campaign is hydrated. When either is active, pull the rest
+  // so older campaigns aren't silently excluded from results.
+  useEffect(() => {
+    if (!searchQuery.trim() && !senderFilterId) return;
+    if (recencyOrderRef.current.some((id) => !loadedWebinarIdsRef.current.has(id))) {
+      void handleLoadMore();
+    }
+  }, [searchQuery, senderFilterId, handleLoadMore]);
   useEffect(() => {
     try {
       const stored = localStorage.getItem("planning_sender_filter");
@@ -877,12 +992,29 @@ export function PlanningPage() {
   /* ── Stats ─────────────────────────────────────────────────────────── */
 
   const globalStats = useMemo(() => {
-    const allLists = webinars.flatMap((w) => w.lists.filter((l) => !l.isNonjoiners && !l.isNoListData));
+    // Hydrated campaigns contribute exact list-derived totals; not-yet-loaded
+    // ones fall back to their metadata totals so the header reflects the whole
+    // grand total immediately rather than growing as campaigns lazy-load.
+    let totalLists = 0, totalVolume = 0, totalRemaining = 0, totalAccounts = 0;
+    for (const w of webinars) {
+      if (w.listsLoaded) {
+        const wl = w.lists.filter((l) => !l.isNonjoiners && !l.isNoListData);
+        totalLists += wl.length;
+        totalVolume += wl.reduce((s, l) => s + l.listSize, 0);
+        totalRemaining += w.lists.reduce((s, l) => s + l.listRemain, 0);
+        totalAccounts += wl.reduce((s, l) => s + l.accountsNeeded, 0);
+      } else {
+        totalLists += w.metaAssignmentCount;
+        totalVolume += w.metaVolume;
+        totalRemaining += w.metaRemaining;
+        totalAccounts += w.metaAccounts;
+      }
+    }
     return {
-      totalLists: allLists.length,
-      totalVolume: allLists.reduce((s, l) => s + l.listSize, 0),
-      totalRemaining: allLists.reduce((s, l) => s + l.listRemain, 0),
-      totalAccounts: Math.round(allLists.reduce((s, l) => s + l.accountsNeeded, 0)),
+      totalLists,
+      totalVolume,
+      totalRemaining,
+      totalAccounts: Math.round(totalAccounts),
       availableBuckets: buckets
         .filter((b) => !isDisqualifiedBucket(b))
         .reduce((s, b) => s + (b.remaining_contacts || 0), 0),
@@ -912,6 +1044,8 @@ export function PlanningPage() {
 
   const toggleWebinar = (id: string) => {
     setWebinars((prev) => prev.map((w) => (w.id === id ? { ...w, expanded: !w.expanded } : w)));
+    // Hydrate lists on first expand of a not-yet-loaded campaign.
+    if (!loadedWebinarIdsRef.current.has(id)) void hydrateWebinars([id]);
   };
 
   const toggleAssignForm = (webinarId: string) => {
@@ -1771,11 +1905,21 @@ export function PlanningPage() {
         registrationLink: created.registration_link || "",
         unsubscribeLink: created.unsubscribe_link || "",
         lists: [],
+        listsLoaded: true,
+        metaVolume: 0,
+        metaRemaining: 0,
+        metaAccounts: 0,
+        metaAssignmentCount: 0,
         expanded: true,
         variantLabel: created.variant_label,
         webinargeekCredentialId: created.webinargeek_credential_id,
         nonjoinerSourceWebinarId: created.nonjoiner_source_webinar_id,
       };
+      // A freshly-created campaign has no lists to hydrate — mark it loaded so
+      // lazy hydration and the frontier skip it.
+      loadedWebinarIdsRef.current.add(created.id);
+      recencyOrderRef.current = [created.id, ...recencyOrderRef.current];
+      setLoadedCount((c) => c + 1);
       setWebinars((prev) => [newWebinar, ...prev]);
       // Auto-open assignment form for the new webinar
       toggleAssignForm(created.id);
@@ -1915,9 +2059,11 @@ export function PlanningPage() {
           </thead>
           {filteredWebinars.map((w) => {
               const wLists = w.lists.filter((l) => !l.isNonjoiners && !l.isNoListData);
-              const wTotal = wLists.reduce((s, l) => s + l.listSize, 0);
-              const wRemain = w.lists.reduce((s, l) => s + l.listRemain, 0);
-              const wAccounts = Math.round(wLists.reduce((s, l) => s + l.accountsNeeded, 0));
+              // Before a campaign is hydrated, show the summary totals from
+              // metadata so collapsed rows aren't blank.
+              const wTotal = w.listsLoaded ? wLists.reduce((s, l) => s + l.listSize, 0) : w.metaVolume;
+              const wRemain = w.listsLoaded ? w.lists.reduce((s, l) => s + l.listRemain, 0) : w.metaRemaining;
+              const wAccounts = w.listsLoaded ? Math.round(wLists.reduce((s, l) => s + l.accountsNeeded, 0)) : w.metaAccounts;
               const allInWebinarSelected = wLists.length > 0 && wLists.every((l) => selectedIds.has(l.id));
 
               return (
@@ -2017,7 +2163,7 @@ export function PlanningPage() {
                       <input
                         type="text"
                         defaultValue={w.mainTitle}
-                        placeholder={`${wLists.length} lists assigned`}
+                        placeholder={`${w.listsLoaded ? wLists.length : w.metaAssignmentCount} lists assigned`}
                         onBlur={(e) => {
                           const val = e.target.value.trim();
                           if (val !== w.mainTitle) handleUpdateWebinar(w.id, "main_title", val);
@@ -2092,8 +2238,20 @@ export function PlanningPage() {
                     </td>
                   </tr>
 
+                  {/* ── Lists still loading for a just-expanded campaign ── */}
+                  {w.expanded && !w.listsLoaded && (
+                    <tr>
+                      <td colSpan={15} className="p-0">
+                        <div className="flex items-center justify-center gap-2 bg-zinc-50 dark:bg-zinc-900/40 border-y border-zinc-200 dark:border-zinc-800/30 px-6 py-4">
+                          <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                          <span className="text-xs text-zinc-500">Loading lists…</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+
                   {/* ── Assignment section (only for the active webinar) ── */}
-                  {w.expanded && (assigningWebinarId === w.id || w.lists.length === 0) && (
+                  {w.expanded && w.listsLoaded && (assigningWebinarId === w.id || w.lists.length === 0) && (
                     <tr>
                       <td colSpan={15} className="p-0">
                         <div className="relative z-20 bg-zinc-50 dark:bg-zinc-900/40 border-y border-zinc-200 dark:border-zinc-800/30 px-6 py-4">
@@ -2962,6 +3120,24 @@ export function PlanningPage() {
             })}
         </table>
       </div>}
+
+      {/* ── Load more campaigns ─────────────────────────────────────── */}
+      {!loadingData && (() => {
+        const remaining = webinars.filter((w) => !w.listsLoaded).length;
+        if (remaining === 0) return null;
+        return (
+          <div className="flex justify-center py-6">
+            <button
+              onClick={handleLoadMore}
+              disabled={loadingMore}
+              className="px-5 py-2 rounded-lg text-xs font-semibold border border-zinc-300 dark:border-zinc-700/60 bg-zinc-50 dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-wait"
+            >
+              {loadingMore && <span className="w-3.5 h-3.5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin inline-block" />}
+              {loadingMore ? "Loading campaigns…" : `Load ${remaining} older campaign${remaining > 1 ? "s" : ""}`}
+            </button>
+          </div>
+        );
+      })()}
 
       {/* ── Bulk action bar ─────────────────────────────────────────── */}
       {selectedCount > 0 && (
