@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
-from api.routers.outreach._helpers import LLOYD_USER_ID
+from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
 from db.models import BlocklistEntry, GHLContact, WebinarGeekSubscriber
 from db.session import get_db
 
@@ -119,6 +119,8 @@ async def add_blocklist_entry(
         user_id=LLOYD_USER_ID, email=email, source="manual", reason=body.reason,
     ).on_conflict_do_nothing(index_elements=["user_id", "email"])
     await db.execute(stmt)
+    # Keep the denormalized contact flag in sync.
+    await mark_contacts_blocklisted(db, [email])
 
     row = (await db.execute(
         select(BlocklistEntry).where(
@@ -165,6 +167,8 @@ async def bulk_add_blocklist(
     result = await db.execute(stmt)
     inserted = result.rowcount or 0
     skipped = len(rows) - inserted
+    # Keep the denormalized contact flag in sync for every email in the batch.
+    await mark_contacts_blocklisted(db, [r["email"] for r in rows])
     return {"added": inserted, "skipped": skipped, "invalid": invalid}
 
 
@@ -178,10 +182,15 @@ async def delete_blocklist_entry(
         delete(BlocklistEntry).where(
             BlocklistEntry.id == entry_id,
             BlocklistEntry.user_id == LLOYD_USER_ID,
-        )
+        ).returning(BlocklistEntry.email)
     )
-    if result.rowcount == 0:
+    removed_email = result.scalar_one_or_none()
+    if removed_email is None:
         raise HTTPException(404, "Entry not found")
+    # Clear the denormalized contact flag now the email is no longer blocklisted.
+    # (Email is unique per user in the blocklist, so removing this row fully
+    # un-blocklists it.)
+    await mark_contacts_blocklisted(db, [removed_email], blocklisted=False)
 
 
 @router.post("/backfill")
@@ -245,6 +254,12 @@ async def backfill_blocklist(
         })
     if ghl_payload:
         added_ghl = await _chunked_blocklist_upsert(db, ghl_payload)
+
+    # Keep the denormalized contact flag in sync for everything we just added.
+    if wg_payload or ghl_payload:
+        await mark_contacts_blocklisted(
+            db, [r["email"] for r in (wg_payload + ghl_payload)]
+        )
 
     return {
         "wg_scanned": len(wg_rows),

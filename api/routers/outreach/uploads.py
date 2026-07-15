@@ -17,7 +17,7 @@ from sqlalchemy import pool
 from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID
 from api.schemas import ImportStartCreate
-from db.models import UploadHistory, ContactCustomField, Contact, OutreachBucket
+from db.models import UploadHistory, ContactCustomField, Contact, OutreachBucket, BlocklistEntry
 from db.session import get_db
 
 router = APIRouter()
@@ -83,7 +83,7 @@ def _parse_csv_line(line: str) -> list[str]:
 # outreach_status, custom_data, created_at, updated_at; assigned_date, used_at,
 # assignment_id stay NULL.
 _COPY_COLUMNS: tuple[str, ...] = (
-    "id", "user_id", "upload_id", "bucket_id", "outreach_status",
+    "id", "user_id", "upload_id", "bucket_id", "outreach_status", "is_blocklisted",
     "contact_id", "first_name", "last_name", "email", "company_website",
     "bucket_name", "classification", "confidence", "reasoning", "cost", "status",
     "lead_list_name", "segment_name", "created_date", "industry", "employee_range",
@@ -124,6 +124,7 @@ def _contact_to_copy_tuple(c: dict) -> tuple:
         c.get("upload_id"),
         c.get("bucket_id"),
         c.get("outreach_status", "available"),
+        c.get("is_blocklisted", False),
         c.get("contact_id"),
         c.get("first_name"),
         c.get("last_name"),
@@ -1117,6 +1118,18 @@ async def _process_csv_import(
                     if target:
                         bucket_cache[row.name] = target
 
+        # Preload the blocklist (emails stored lowercased) so each contact can be
+        # stamped is_blocklisted at insert time — no per-row lookup, and the
+        # Planning/Buckets read paths never scan the blocklist again.
+        blocklist_emails: set[str] = set()
+        async with engine.begin() as conn:
+            bl_result = await conn.execute(
+                select(BlocklistEntry.__table__.c.email).where(
+                    BlocklistEntry.__table__.c.user_id == LLOYD_USER_ID
+                )
+            )
+            blocklist_emails = {e for (e,) in bl_result if e}
+
         # Use total_rows from the upload step (newline count) — no need for a counting pass
         # The upload handler already set total_contacts
         total_rows_estimate = 0
@@ -1172,6 +1185,9 @@ async def _process_csv_import(
                 contact["custom_data"] = custom_data
             if contact.get("email"):
                 contact["email"] = contact["email"].lower().strip()
+            # Stamp blocklist membership at write time (email already lowercased,
+            # matching the lowercased blocklist set).
+            contact["is_blocklisted"] = bool(contact.get("email") and contact["email"] in blocklist_emails)
             # Keep employee_range as the single unified size filter: when the source
             # gives a raw headcount but no range, bucket the count into a range label.
             if not contact.get("employee_range") and contact.get("employee_count") is not None:

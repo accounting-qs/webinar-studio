@@ -1,5 +1,7 @@
 """Upload and contact models: UploadHistory, ContactCustomField, Contact."""
 
+from sqlalchemy import text
+
 from db.models._common import (
     Base, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index,
     Integer, JSONB, Mapped, Optional, String, Text, UUID, UniqueConstraint,
@@ -69,6 +71,11 @@ class Contact(Base):
     bucket_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), ForeignKey("outreach_buckets.id", ondelete="SET NULL"))
     assignment_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), ForeignKey("webinar_list_assignments.id", ondelete="SET NULL"))
     outreach_status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="available")
+    # Denormalized blocklist membership: true when this contact's email is on the
+    # user's blocklist. Maintained at write time (import + every blocklist add/
+    # remove) so read paths never scan the blocklist per row. Kept in sync by
+    # `mark_contacts_blocklisted` in api/routers/outreach/_helpers.py.
+    is_blocklisted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     assigned_date: Mapped[Optional[datetime]] = mapped_column(Date)
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
@@ -136,4 +143,13 @@ class Contact(Base):
         Index("ix_contacts_bucket_unassigned", "bucket_id", "assignment_id"),
         Index("ix_contacts_outreach_status", "bucket_id", "outreach_status"),
         Index("ix_contacts_upload_status_bucket", "upload_id", "outreach_status", "bucket_id"),
+        # Partial indexes over only the (few) blocklisted rows so the per-bucket /
+        # per-assignment blocklist counts touch just those, not every contact.
+        Index("ix_contacts_bl_assignment", "assignment_id", "outreach_status",
+              postgresql_where=text("is_blocklisted")),
+        Index("ix_contacts_bl_bucket", "bucket_id", "outreach_status",
+              postgresql_where=text("is_blocklisted")),
+        # Case-insensitive email lookup — powers flag maintenance (stamping
+        # contacts when an email enters/leaves the blocklist) and the backfill.
+        Index("ix_contacts_lower_email", "user_id", func.lower(text("email"))),
     )

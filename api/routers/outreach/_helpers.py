@@ -1,11 +1,11 @@
 """
 Shared constants and serialization helpers for outreach sub-routers.
 """
-from sqlalchemy import and_, func as sa_func, select
+from sqlalchemy import and_, func as sa_func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
-    BlocklistEntry, BucketCopy, Contact, OutreachBucket, OutreachSender,
+    BucketCopy, Contact, OutreachBucket, OutreachSender,
     Webinar, WebinarListAssignment,
 )
 
@@ -14,18 +14,46 @@ LLOYD_USER_ID = "9baf8117-db65-4f30-87a5-a76cf4f23d82"
 
 
 # ── Blocklist helpers ─────────────────────────────────────────────────────
+#
+# Blocklist membership is denormalized onto Contact.is_blocklisted and kept in
+# sync at write time (import + every blocklist add/remove) via
+# `mark_contacts_blocklisted`. Read paths therefore just test the boolean flag
+# instead of scanning the blocklist for every contact — the partial indexes
+# ix_contacts_bl_bucket / ix_contacts_bl_assignment make the counts touch only
+# the (few) blocklisted rows.
 
-def _blocklist_email_subquery():
-    """A scalar subquery yielding every blocklisted email for the current user.
+# Emails per UPDATE when re-stamping contacts — keeps each statement small and
+# well under the 120s statement_timeout. Matches the blocklist upsert chunk.
+_FLAG_CHUNK_SIZE = 1000
 
-    Blocklist emails are stored already lowercased, so callers should
-    compare against LOWER(Contact.email).
+
+async def mark_contacts_blocklisted(
+    db: AsyncSession, emails, *, user_id: str = LLOYD_USER_ID, blocklisted: bool = True
+) -> int:
+    """Set contacts.is_blocklisted for the given emails (case-insensitive match).
+
+    Call this right after an email enters (blocklisted=True) or leaves
+    (blocklisted=False) the blocklist so the denormalized flag stays correct.
+    Only rows whose flag actually differs are written, so it's cheap and
+    idempotent. Returns the number of contacts updated.
     """
-    return (
-        select(BlocklistEntry.email)
-        .where(BlocklistEntry.user_id == LLOYD_USER_ID)
-        .scalar_subquery()
-    )
+    norm = sorted({(e or "").strip().lower() for e in emails if e and e.strip()})
+    if not norm:
+        return 0
+    total = 0
+    for i in range(0, len(norm), _FLAG_CHUNK_SIZE):
+        chunk = norm[i : i + _FLAG_CHUNK_SIZE]
+        result = await db.execute(
+            update(Contact)
+            .where(
+                Contact.user_id == user_id,
+                sa_func.lower(Contact.email).in_(chunk),
+                Contact.is_blocklisted.is_(not blocklisted),
+            )
+            .values(is_blocklisted=blocklisted)
+        )
+        total += result.rowcount or 0
+    return total
 
 
 async def compute_blocklist_counts_per_bucket(
@@ -38,16 +66,15 @@ async def compute_blocklist_counts_per_bucket(
     """
     if not bucket_ids:
         return {}
-    blocklisted_expr = sa_func.lower(Contact.email).in_(_blocklist_email_subquery())
     result = await db.execute(
         select(
             Contact.bucket_id,
-            sa_func.count().filter(blocklisted_expr).label("total"),
+            sa_func.count().filter(Contact.is_blocklisted).label("total"),
             sa_func.count().filter(
-                and_(Contact.outreach_status == "available", blocklisted_expr)
+                and_(Contact.outreach_status == "available", Contact.is_blocklisted)
             ).label("available"),
         )
-        .where(Contact.bucket_id.in_(bucket_ids))
+        .where(Contact.bucket_id.in_(bucket_ids), Contact.is_blocklisted)
         .group_by(Contact.bucket_id)
     )
     return {
@@ -66,16 +93,15 @@ async def compute_blocklist_counts_per_assignment(
     """
     if not assignment_ids:
         return {}
-    blocklisted_expr = sa_func.lower(Contact.email).in_(_blocklist_email_subquery())
     result = await db.execute(
         select(
             Contact.assignment_id,
-            sa_func.count().filter(blocklisted_expr).label("total"),
+            sa_func.count().filter(Contact.is_blocklisted).label("total"),
             sa_func.count().filter(
-                and_(Contact.outreach_status == "assigned", blocklisted_expr)
+                and_(Contact.outreach_status == "assigned", Contact.is_blocklisted)
             ).label("assigned"),
         )
-        .where(Contact.assignment_id.in_(assignment_ids))
+        .where(Contact.assignment_id.in_(assignment_ids), Contact.is_blocklisted)
         .group_by(Contact.assignment_id)
     )
     return {

@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload, undefer
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, _blocklist_email_subquery, assignment_dict,
+    LLOYD_USER_ID, assignment_dict,
     compute_blocklist_counts_per_assignment, copy_dict, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
@@ -278,8 +278,7 @@ async def assign_bucket(
     desc_copy = None
     upload = None
 
-    blocklist_sq = _blocklist_email_subquery()
-    not_blocklisted = sa_func.lower(Contact.email).notin_(blocklist_sq)
+    not_blocklisted = Contact.is_blocklisted.is_(False)
 
     # Optional location filter, applied identically to the availability counts and
     # the claim query so volume validation matches what gets claimed. A contact
@@ -544,7 +543,7 @@ async def assign_countries(
     if bucket_id and upload_id:
         raise HTTPException(400, "Cannot provide both bucket_id and upload_id")
 
-    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+    not_blocklisted = Contact.is_blocklisted.is_(False)
     if upload_id is not None:
         source_where = (
             Contact.upload_id == upload_id,
@@ -735,7 +734,7 @@ async def get_assignment_contacts(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+    not_blocklisted = Contact.is_blocklisted.is_(False)
 
     q = select(Contact).where(
         Contact.assignment_id == assignment_id,
@@ -885,7 +884,7 @@ async def get_group_contacts(
     if len(assignments) != len(assignment_ids):
         raise HTTPException(404, "One or more assignments not found")
 
-    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+    not_blocklisted = Contact.is_blocklisted.is_(False)
 
     q = (
         select(Contact)
@@ -991,7 +990,7 @@ async def stream_group_contacts_csv(
 
     list_name_by_aid = {a.id: _list_name(a) for a in assignments}
 
-    not_blocklisted = sa_func.lower(Contact.email).notin_(_blocklist_email_subquery())
+    not_blocklisted = Contact.is_blocklisted.is_(False)
 
     async def row_iter():
         # CSV header.

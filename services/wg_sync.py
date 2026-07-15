@@ -22,7 +22,7 @@ from typing import Literal
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from api.routers.outreach._helpers import LLOYD_USER_ID
+from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
 from db.models import BlocklistEntry, ConnectorCredential, Webinar, WebinarGeekSubscriber, WebinarGeekWebinar
 from db.session import AsyncSessionLocal
 from integrations import webinargeek_client as wg
@@ -158,6 +158,8 @@ async def _upsert_one_broadcast(db, api_key: str, broadcast_id: str) -> int:
         )
         try:
             await db.execute(bl_stmt)
+            # Keep the denormalized contact flag in sync for newly-unsubscribed emails.
+            await mark_contacts_blocklisted(db, [r["email"] for r in deduped])
         except Exception as exc:
             logger.warning("Failed to upsert blocklist from WG broadcast %s: %s", broadcast_id, exc)
     return len(subs)
