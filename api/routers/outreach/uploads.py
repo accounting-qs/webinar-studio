@@ -85,7 +85,7 @@ def _parse_csv_line(line: str) -> list[str]:
 _COPY_COLUMNS: tuple[str, ...] = (
     "id", "user_id", "upload_id", "bucket_id", "outreach_status", "is_blocklisted",
     "contact_id", "first_name", "last_name", "email", "company_website",
-    "bucket_name", "classification", "confidence", "reasoning", "cost", "status",
+    "bucket_name", "classification",
     "lead_list_name", "segment_name", "created_date", "industry", "employee_range",
     "employee_count", "country", "database_provider", "scraper", "enrichment_classification",
     "primary_identity", "sub_identity", "sector",
@@ -132,10 +132,6 @@ def _contact_to_copy_tuple(c: dict) -> tuple:
         c.get("company_website"),
         c.get("bucket_name"),
         c.get("classification"),
-        c.get("confidence"),
-        c.get("reasoning"),
-        c.get("cost"),
-        c.get("status"),
         c.get("lead_list_name"),
         c.get("segment_name"),
         c.get("created_date"),
@@ -1075,15 +1071,15 @@ async def _process_csv_import(
 
         STANDARD_FIELDS = {
             "contact_id", "first_name", "last_name", "email", "company_website",
-            "bucket_name", "classification", "confidence", "reasoning", "cost",
-            "status", "lead_list_name", "segment_name", "created_date",
+            "bucket_name", "classification",
+            "lead_list_name", "segment_name", "created_date",
             "industry", "employee_range", "employee_count", "country",
             "database_provider", "scraper",
             "enrichment_classification", "primary_identity", "sub_identity", "sector",
             "title", "seniority", "company_founded_year", "company_total_funding",
             "company_annual_revenue", "company_country",
         }
-        FLOAT_FIELDS = {"confidence", "cost"}
+        FLOAT_FIELDS: set[str] = set()
         INT_FIELDS = {"employee_count"}
         is_custom_list = upload_mode == "custom_list"
         if is_custom_list:

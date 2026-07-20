@@ -9,6 +9,7 @@ import {
   type ApiUpload, type UploadFileResponse, type UploadStatusResponse,
 } from "@/lib/api";
 import { COUNTRIES, REGION_ORDER } from "@/lib/locations";
+import { SearchableSelect, type SelectOption } from "@/components/ui/SearchableSelect";
 
 /* ─── Constants ────────────────────────────────────────────────────────── */
 
@@ -21,10 +22,6 @@ const SYSTEM_FIELDS = [
   { value: "company_website", label: "Company Website", group: "identity" },
   { value: "bucket", label: "Bucket", group: "enrichment" },
   { value: "classification", label: "Classification", group: "enrichment" },
-  { value: "confidence", label: "Confidence", group: "enrichment" },
-  { value: "reasoning", label: "Reasoning", group: "enrichment" },
-  { value: "cost", label: "Cost", group: "enrichment" },
-  { value: "status", label: "Status", group: "enrichment" },
   { value: "enrichment_classification", label: "Enrichment Classification", group: "enrichment" },
   { value: "primary_identity", label: "Primary Identity", group: "enrichment" },
   { value: "sub_identity", label: "Sub-Identity", group: "enrichment" },
@@ -53,11 +50,8 @@ const AUTO_MAP: Record<string, string> = {
   email: "email",
   company_website: "company_website",
   bucket: "bucket",
+  bucket_name: "bucket",
   classification: "classification",
-  confidence: "confidence",
-  reasoning: "reasoning",
-  cost: "cost",
-  status: "status",
   proxy_used: "skip",
   lead_list_name: "lead_list_name",
   "list build - segment name": "segment_name",
@@ -76,6 +70,7 @@ const AUTO_MAP: Record<string, string> = {
   // Firmographic export headers (e.g. Apollo / Ampleleads).
   industry: "industry",
   country: "country",
+  contact_country: "country",
   title: "title",
   seniority: "seniority",
   "employees count": "employee_count",
@@ -87,7 +82,10 @@ const AUTO_MAP: Record<string, string> = {
 
 function autoMapHeader(header: string): string {
   const h = header.toLowerCase().trim();
-  return AUTO_MAP[h] ?? "skip";
+  // Export files vary between underscore (employees_count) and space (employees
+  // count) headers. Try both separator forms so either matches the AUTO_MAP keys.
+  const swapped = h.includes("_") ? h.replace(/_/g, " ") : h.replace(/\s+/g, "_");
+  return AUTO_MAP[h] ?? AUTO_MAP[swapped] ?? "skip";
 }
 
 /* ─── Types ────────────────────────────────────────────────────────────── */
@@ -604,8 +602,24 @@ export function UploadPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {uploadResponse.headers.map((header, idx) => {
-                    const isMapped = mappings[header] && mappings[header] !== "skip";
+                  {(() => {
+                    // Fields already mapped on another row — greyed out to block double-mapping.
+                    const usedValues = new Set(Object.values(mappings).filter((v) => v && v !== "skip"));
+                    return uploadResponse.headers.map((header, idx) => {
+                    const current = mappings[header] || "skip";
+                    const isMapped = current !== "skip";
+                    const options: SelectOption[] = [
+                      ...SYSTEM_FIELDS
+                        .filter((f) => uploadMode !== "custom_list" || f.value !== "bucket")
+                        .map((f) => ({
+                          value: f.value, label: f.label,
+                          disabled: f.value !== "skip" && f.value !== current && usedValues.has(f.value),
+                        })),
+                      ...customFields.map((f) => ({
+                        value: `custom:${f}`, label: `🏷️ ${f}`,
+                        disabled: `custom:${f}` !== current && usedValues.has(`custom:${f}`),
+                      })),
+                    ];
                     return (
                     <tr key={header} style={{
                       borderBottom: "1px solid var(--border-subtle)",
@@ -616,28 +630,18 @@ export function UploadPage() {
                         {uploadResponse.preview_rows[0]?.[idx] || "—"}
                       </td>
                       <td style={{ padding: "12px 16px" }}>
-                        <select
-                          value={mappings[header] || "skip"}
-                          onChange={(e) => setMappings((prev) => ({ ...prev, [header]: e.target.value }))}
-                          style={{
-                            background: "var(--card-bg)", color: "var(--foreground)",
-                            border: `1px solid ${isMapped ? "#3b82f6" : "var(--border-subtle)"}`,
-                            borderRadius: 8, padding: "8px 12px", fontSize: 13, width: "100%",
-                            cursor: "pointer", transition: "border-color 200ms",
-                            outline: "none", boxShadow: isMapped ? "0 0 0 1px #3b82f6" : "none",
-                          }}
-                        >
-                          {SYSTEM_FIELDS.filter((f) => uploadMode !== "custom_list" || f.value !== "bucket").map((f) => (
-                            <option key={f.value} value={f.value}>{f.label}</option>
-                          ))}
-                          {customFields.map((f) => (
-                            <option key={f} value={`custom:${f}`}>🏷️ {f}</option>
-                          ))}
-                        </select>
+                        <SearchableSelect
+                          options={options}
+                          value={current}
+                          onChange={(val) => setMappings((prev) => ({ ...prev, [header]: val }))}
+                          placeholder="— Skip —"
+                          className={isMapped ? "rounded-md ring-1 ring-violet-500" : ""}
+                        />
                       </td>
                     </tr>
                     );
-                  })}
+                  });
+                  })()}
                 </tbody>
               </table>
             </div>

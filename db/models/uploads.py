@@ -3,7 +3,7 @@
 from sqlalchemy import text
 
 from db.models._common import (
-    Base, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index,
+    Base, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index,
     Integer, JSONB, Mapped, Optional, String, Text, UUID, UniqueConstraint,
     datetime, func, gen_uuid, mapped_column, relationship,
 )
@@ -89,10 +89,6 @@ class Contact(Base):
     # Enrichment
     bucket_name: Mapped[Optional[str]] = mapped_column(Text)
     classification: Mapped[Optional[str]] = mapped_column(Text)
-    confidence: Mapped[Optional[float]] = mapped_column(Float)
-    reasoning: Mapped[Optional[str]] = mapped_column(Text)
-    cost: Mapped[Optional[float]] = mapped_column(Float)
-    status: Mapped[Optional[str]] = mapped_column(Text)
 
     # Source metadata
     lead_list_name: Mapped[Optional[str]] = mapped_column(Text)
