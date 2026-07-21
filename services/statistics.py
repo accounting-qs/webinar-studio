@@ -318,6 +318,8 @@ def _process_raw_webinar(w: dict[str, Any], source_label: str) -> dict[str, Any]
         # Raw counts, passed through untouched — the frontend derives rates from
         # the sums (same convention as the Segments tab).
         "sourceRows": w.get("sourceRows", []),
+        # Per company-size funnel cells for the Employee count tab.
+        "employeeRows": w.get("employeeRows", []),
     }
 
 
@@ -805,6 +807,127 @@ async def get_statistics_by_source(
         "includedWebinarIds": target_ids,
         "pendingWebinarIds": pending_ids,
         "bySource": by_source,
+        "perWebinar": per_webinar,
+        "totals": totals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# By-employee-size funnel aggregation (Employee count tab)
+# ---------------------------------------------------------------------------
+# Single dimension (company-size bucket) — no nested vintages, unlike the By
+# List Source tab. Reuses _shape_source_funnel / _SOURCE_RAW_KEYS for the shared
+# funnel metric set so the columns stay identical across tabs.
+
+def _accumulate_employee_rows(agg: dict[str, dict[str, Any]], employee_rows: list[dict[str, Any]]) -> None:
+    """Fold a webinar's employeeRows cells into `agg` keyed by size bucket."""
+    for cell in employee_rows or []:
+        bucket = cell.get("bucket") or "(no size)"
+        metrics = cell.get("metrics") or {}
+        slot = agg.get(bucket)
+        if slot is None:
+            slot = {k: 0.0 for k in _SOURCE_RAW_KEYS}
+            agg[bucket] = slot
+        for k in _SOURCE_RAW_KEYS:
+            v = metrics.get(k)
+            if v is not None:
+                slot[k] += float(v)
+
+
+def _shape_employee_agg(agg: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn the {bucket: {...}} accumulator into flat bucket rows (invites desc)."""
+    rows = [{"bucket": bucket, **_shape_source_funnel(raw)} for bucket, raw in agg.items()]
+    rows.sort(key=lambda r: r["invites"], reverse=True)
+    return rows
+
+
+async def get_statistics_by_employee(
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-webinar employeeRows into a by-company-size funnel — the
+    data behind the "Employee count" tab.
+
+    Returns a cross-webinar aggregate (`byEmployee`, flat bucket rows) plus a
+    `perWebinar` breakdown (same shape per webinar), over the selected webinars
+    (default: all passed). Reads snapshots only — no live compute — exactly like
+    get_statistics_by_source; webinars without a snapshot (or a snapshot
+    predating this feature, i.e. no employeeRows) are reported as
+    `pendingWebinarIds`. Only raw counts are returned; the frontend derives the
+    funnel percentages from the summed counts.
+    """
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    passed.sort(key=lambda s: (s.get("date") or "", s.get("variantLabel") or ""), reverse=True)
+
+    webinar_options = [
+        {
+            "webinarId": s.get("webinarId"),
+            "number": s.get("number"),
+            "variantLabel": s.get("variantLabel"),
+            "date": s.get("date"),
+            "title": s.get("title"),
+            "label": _segment_webinar_label(s),
+        }
+        for s in passed
+        if s.get("webinarId")
+    ]
+
+    all_ids = [o["webinarId"] for o in webinar_options]
+    if webinar_ids:
+        wanted = set(webinar_ids)
+        target_ids = [i for i in all_ids if i in wanted]
+    else:
+        target_ids = all_ids
+
+    try:
+        from services import statistics_snapshot as snap
+        payloads = await snap.read_all_payloads(source)
+    except Exception:
+        payloads = {}
+
+    option_by_id = {o["webinarId"]: o for o in webinar_options}
+    overall: dict[str, dict[str, Any]] = {}
+    per_webinar: list[dict[str, Any]] = []
+    pending_ids: list[str] = []
+    for wid in target_ids:
+        webinar = payloads.get(wid)
+        if not webinar:
+            pending_ids.append(wid)
+            continue
+        emp_rows = webinar.get("employeeRows")
+        if emp_rows is None:
+            # Snapshot predates the Employee count feature — no employeeRows until
+            # a recompute rebuilds it. Treat as pending so the UI prompts a rebuild
+            # instead of silently showing empty tables.
+            pending_ids.append(wid)
+            continue
+        _accumulate_employee_rows(overall, emp_rows)
+        one: dict[str, dict[str, Any]] = {}
+        _accumulate_employee_rows(one, emp_rows)
+        opt = option_by_id.get(wid, {})
+        per_webinar.append({
+            "webinarId": wid,
+            "number": opt.get("number"),
+            "variantLabel": opt.get("variantLabel"),
+            "date": opt.get("date"),
+            "label": opt.get("label"),
+            "byEmployee": _shape_employee_agg(one),
+        })
+
+    by_employee = _shape_employee_agg(overall)
+    _total_count_keys = (
+        "invites", "regs", "attendees10m", "bookings",
+        "confirmed", "shows", "noShows", "canceled", "won",
+        "disqualified", "qualified",
+        "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+    )
+    totals = {"bucket": "Total", **{k: sum(r[k] for r in by_employee) for k in _total_count_keys}}
+    return {
+        "webinars": webinar_options,
+        "includedWebinarIds": target_ids,
+        "pendingWebinarIds": pending_ids,
+        "byEmployee": by_employee,
         "perWebinar": per_webinar,
         "totals": totals,
     }

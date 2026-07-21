@@ -724,6 +724,9 @@ class GoHighLevelStatisticsSource:
             # Source tab. Additive: rides the cached snapshot payload.
             source_rows = await self._compute_per_source_cells(db, w)
 
+            # Per company-size funnel cells — powers the Employee count tab.
+            employee_rows = await self._compute_per_employee_cells(db, w)
+
         return {
             "number": w.number,
             "variantLabel": w.variant_label,
@@ -733,6 +736,7 @@ class GoHighLevelStatisticsSource:
             "workbookRow": 0,
             "rows": rows,
             "sourceRows": source_rows,
+            "employeeRows": employee_rows,
             "summary": summary,
             "status": w.status,
             # Operators read this on the stats page to know whether
@@ -1781,6 +1785,127 @@ class GoHighLevelStatisticsSource:
                 if v is not None:
                     cm[k] += int(v)
         return list(cells.values())
+
+
+    async def _compute_per_employee_cells(
+        self, db: AsyncSession, w: Webinar,
+    ) -> list[dict[str, Any]]:
+        """Per company-size funnel cells for a webinar's cold lists — the data
+        behind the "Employee count" tab.
+
+        A trimmed clone of _compute_per_source_cells: same three funnel queries
+        (invited / WebinarGeek regs+attended / opportunity bookings+quality),
+        same cold filter and metric set, but groups by contacts.employee_range
+        (the canonical bucketed size key: "1 - 10", "11 - 50", … "10000+")
+        instead of lead_list_name. Contacts with no size land in "(no size)".
+        Single dimension, so one cell per bucket — no source/vintage rollup.
+        """
+        from sqlalchemy import text as sa_text
+
+        wid = w.id
+        N = w.number
+        bid = w.broadcast_id
+        cold = (
+            "COALESCE(wla.is_nonjoiners, false) = false "
+            "AND COALESCE(wla.is_no_list_data, false) = false"
+        )
+        bucket_expr = "COALESCE(NULLIF(c.employee_range, ''), '(no size)')"
+
+        # {bucket: {raw metric: count}} — merged across the batches.
+        raw: dict[str, dict[str, int]] = {}
+
+        # invited: distinct cold contacts per size bucket.
+        inv_sql = f"""
+            SELECT {bucket_expr} AS bucket, COUNT(DISTINCT LOWER(c.email)) AS invited
+            FROM contacts c
+            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            GROUP BY 1
+        """
+        r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
+        for row in r.mappings().all():
+            raw.setdefault(row["bucket"], {})["invited"] = int(row["invited"] or 0)
+
+        # regs / attended / 10m: WebinarGeek subscriber join (needs a broadcast).
+        if bid:
+            wg_sql = f"""
+                SELECT {bucket_expr} AS bucket,
+                    COUNT(DISTINCT LOWER(c.email)) AS total_regs,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (
+                        WHERE wgs.watched_live = TRUE OR wgs.minutes_viewing > 0
+                    ) AS total_attended,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (
+                        WHERE (wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)
+                        AND wgs.minutes_viewing >= 10
+                    ) AS total_10m
+                FROM contacts c
+                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                JOIN webinargeek_subscribers wgs
+                    ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
+                WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+                GROUP BY 1
+            """
+            r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
+            for row in r.mappings().all():
+                slot = raw.setdefault(row["bucket"], {})
+                slot["totalRegs"] = int(row["total_regs"] or 0)
+                slot["totalAttended"] = int(row["total_attended"] or 0)
+                slot["total10MinPlus"] = int(row["total_10m"] or 0)
+
+        # booked + sales/quality: opportunity join, matched to this webinar
+        # series number (mirrors _compute_per_source_cells' Batch C predicates).
+        qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
+        bk_sql = f"""
+            SELECT {bucket_expr} AS bucket,
+                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'cancelled') AS canceled,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :won_stage) AS won,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :dq_stage) AS disqualified,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed' AND o.lead_quality IN {qual_in}) AS qualified,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
+            FROM contacts c
+            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+              AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
+            GROUP BY 1
+        """
+        r = await db.execute(sa_text(bk_sql).bindparams(
+            wid=wid, N=N,
+            won_stage=DEAL_WON_STAGE_ID, dq_stage=DISQUALIFIED_STAGE_ID,
+            lq_great=LEAD_QUALITY_GREAT, lq_ok=LEAD_QUALITY_OK,
+            lq_barely=LEAD_QUALITY_BARELY, lq_dq=LEAD_QUALITY_BAD_DQ,
+        ))
+        for row in r.mappings().all():
+            slot = raw.setdefault(row["bucket"], {})
+            slot["totalBookings"] = int(row["total_bookings"] or 0)
+            slot["confirmed"] = int(row["confirmed"] or 0)
+            slot["shows"] = int(row["shows"] or 0)
+            slot["noShows"] = int(row["no_shows"] or 0)
+            slot["canceled"] = int(row["canceled"] or 0)
+            slot["won"] = int(row["won"] or 0)
+            slot["disqualified"] = int(row["disqualified"] or 0)
+            slot["qualified"] = int(row["qualified"] or 0)
+            slot["leadQualityGreat"] = int(row["lq_great"] or 0)
+            slot["leadQualityOk"] = int(row["lq_ok"] or 0)
+            slot["leadQualityBarelyPassable"] = int(row["lq_barely"] or 0)
+            slot["leadQualityBadDq"] = int(row["lq_dq"] or 0)
+
+        # One cell per size bucket.
+        cells: list[dict[str, Any]] = []
+        for bucket, metrics in raw.items():
+            cells.append({
+                "bucket": bucket,
+                "metrics": {k: int(metrics.get(k) or 0) for k in SOURCE_FUNNEL_RAW_KEYS},
+            })
+        return cells
 
 
     async def _compute_webinar_summary(

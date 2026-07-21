@@ -1796,6 +1796,87 @@ export async function fetchStatisticsListSource(
   return res.json();
 }
 
+/* ── By-employee-size funnel (Employee count tab) ────────────────────────── */
+
+export interface EmployeeFunnelRow {
+  /** Company-size bucket, e.g. "1 - 10" / "11 - 50" / … / "(no size)". */
+  bucket: string;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+  /** Sales + quality counts (mirrors SourceFunnelRow). Rates are derived from
+   * these sums in the table (never averaged per-webinar). */
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
+}
+
+export interface EmployeeFunnelWebinarBreakdown {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  date: string | null;
+  label: string | null;
+  byEmployee: EmployeeFunnelRow[];
+}
+
+export interface EmployeeFunnelTotals {
+  bucket: string;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
+}
+
+export interface EmployeeFunnelResponse {
+  /** All passed webinars — the filter options for the multi-select. */
+  webinars: SegmentFunnelWebinar[];
+  includedWebinarIds: string[];
+  /** Selected webinars with no stored snapshot yet (excluded from totals). */
+  pendingWebinarIds: string[];
+  /** Cross-webinar aggregate by company size (invites desc). */
+  byEmployee: EmployeeFunnelRow[];
+  /** Per-webinar breakdown (newest first), same by-employee shape. */
+  perWebinar: EmployeeFunnelWebinarBreakdown[];
+  totals: EmployeeFunnelTotals;
+  meta: StatisticsMeta;
+}
+
+/** By-company-size funnel rollup (+ per-webinar) across the selected webinars.
+ * Pass webinar UUIDs to scope; omit for all passed. */
+export async function fetchStatisticsEmployeeCount(
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<EmployeeFunnelResponse> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(`${API_URL}/statistics/by-employee-count?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch employee-count funnel");
+  return res.json();
+}
+
 /* ── Precomputed snapshot store (recompute trigger + status) ─────────────── */
 
 export interface StatisticsRecomputeStatus {

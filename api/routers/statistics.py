@@ -790,6 +790,83 @@ async def get_statistics_by_list_source(source: str = "auto", webinars: str | No
 
 
 # ---------------------------------------------------------------------------
+# By-employee-size funnel (Employee count tab)
+# ---------------------------------------------------------------------------
+
+class EmployeeFunnelRow(BaseModel):
+    """One company-size bucket ("1 - 10" / "11 - 50" / … / "(no size)"). Raw
+    counts — the frontend derives the funnel percentages from these sums."""
+    bucket: str
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
+
+
+class EmployeeFunnelWebinarBreakdown(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    label: str | None = None
+    byEmployee: list[EmployeeFunnelRow]
+
+
+class EmployeeFunnelTotals(BaseModel):
+    bucket: str = "Total"
+    invites: int
+    regs: int
+    attendees10m: int
+    bookings: int
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
+
+
+class EmployeeFunnelResponse(BaseModel):
+    webinars: list[SegmentFunnelWebinar]  # all passed webinars (filter options)
+    includedWebinarIds: list[str]
+    pendingWebinarIds: list[str] = []
+    byEmployee: list[EmployeeFunnelRow]  # cross-webinar aggregate (invites desc)
+    perWebinar: list[EmployeeFunnelWebinarBreakdown]  # newest first
+    totals: EmployeeFunnelTotals
+    meta: StatisticsMetaResponse
+
+
+@router.get("/by-employee-count", response_model=EmployeeFunnelResponse)
+async def get_statistics_by_employee_count(source: str = "auto", webinars: str | None = None):
+    """By-company-size funnel (grouped by contacts.employee_range buckets) with a
+    per-webinar breakdown. `webinars` is a comma-separated list of Webinar UUIDs
+    to include; omit (or pass empty) to include all passed webinars. Reads the
+    precomputed snapshots only — instant once they're built
+    (POST /statistics/recompute)."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_by_employee(source=source, webinar_ids=ids or None)
+    meta = await _resolve_meta(source)
+    return {**data, "meta": meta}
+
+
+# ---------------------------------------------------------------------------
 # Precomputed snapshot store — manual recompute trigger + status
 # ---------------------------------------------------------------------------
 

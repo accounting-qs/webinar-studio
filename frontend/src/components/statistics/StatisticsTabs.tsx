@@ -4,12 +4,13 @@ import { useState } from "react";
 import { StatisticsPage } from "./StatisticsPage";
 import { SegmentsTab } from "./SegmentsTab";
 import { ListSourceTab } from "./ListSourceTab";
+import { EmployeeCountTab } from "./EmployeeCountTab";
 import { CalendarUploadsTab } from "./CalendarUploadsTab";
 import { BookingCalendarsTab } from "./BookingCalendarsTab";
 import { AccountHealthTab } from "./AccountHealthTab";
 import { DayOfWeekTab } from "./DayOfWeekTab";
 
-type Tab = "statistics" | "segments" | "by-list-source" | "calendar-uploads" | "booking-calendars" | "account-health" | "send-day";
+type Tab = "statistics" | "segments" | "by-list-source" | "employee-count" | "calendar-uploads" | "booking-calendars" | "account-health" | "send-day";
 
 export function StatisticsTabs() {
   const [tab, setTab] = useState<Tab>("statistics");
@@ -26,6 +27,9 @@ export function StatisticsTabs() {
           </TabButton>
           <TabButton active={tab === "by-list-source"} onClick={() => setTab("by-list-source")}>
             By List Source
+          </TabButton>
+          <TabButton active={tab === "employee-count"} onClick={() => setTab("employee-count")}>
+            Employee count
           </TabButton>
           <TabButton active={tab === "account-health"} onClick={() => setTab("account-health")}>
             Account Health
@@ -48,6 +52,8 @@ export function StatisticsTabs() {
           <SegmentsTab />
         ) : tab === "by-list-source" ? (
           <ListSourceTab />
+        ) : tab === "employee-count" ? (
+          <EmployeeCountTab />
         ) : tab === "calendar-uploads" ? (
           <CalendarUploadsTab />
         ) : tab === "booking-calendars" ? (
