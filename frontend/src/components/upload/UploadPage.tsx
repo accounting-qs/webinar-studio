@@ -88,6 +88,15 @@ function autoMapHeader(header: string): string {
   return AUTO_MAP[h] ?? AUTO_MAP[swapped] ?? "skip";
 }
 
+// List-location choices: an explicit "none" (per-contact country only), then the
+// regions (flagged so they read distinctly from countries), then every country.
+// Values stay the exact region/country string the import + assign filter expect.
+const LIST_LOCATION_OPTIONS: SelectOption[] = [
+  { value: "", label: "None — per-contact country only" },
+  ...REGION_ORDER.map((r) => ({ value: r, label: `${r} — Region` })),
+  ...COUNTRIES.map((c) => ({ value: c, label: c })),
+];
+
 /* ─── Types ────────────────────────────────────────────────────────────── */
 
 type Step = "idle" | "uploading" | "mapping" | "importing";
@@ -570,22 +579,13 @@ export function UploadPage() {
                 from the per-contact Country column; used as a fallback when it's blank) */}
             <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "16px 0 0" }}>
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted-foreground)", textTransform: "uppercase", letterSpacing: "0.5px", whiteSpace: "nowrap" }}>List Location:</span>
-              <input
-                type="text"
-                list="list-location-options"
+              <SearchableSelect
+                options={LIST_LOCATION_OPTIONS}
                 value={listLocation}
-                onChange={(e) => setListLocation(e.target.value)}
-                placeholder="Search region or country… (none = per-contact country only)"
-                style={{
-                  padding: "6px 12px", borderRadius: 8, border: "1px solid var(--border-subtle)",
-                  background: "var(--card-bg)", color: "var(--foreground)", fontSize: 13,
-                  outline: "none", minWidth: 320,
-                }}
+                onChange={setListLocation}
+                placeholder="Search region or country…"
+                className="min-w-[320px]"
               />
-              <datalist id="list-location-options">
-                {REGION_ORDER.map((r) => <option key={r} value={r}>Region</option>)}
-                {COUNTRIES.map((c) => <option key={c} value={c} />)}
-              </datalist>
               <span style={{ fontSize: 11, color: "var(--muted-foreground)" }}>
                 Applied to all {uploadResponse ? formatNumber(uploadResponse.total_rows) : ""} contacts in this import
               </span>
