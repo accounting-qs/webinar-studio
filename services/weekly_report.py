@@ -5,8 +5,19 @@ Pipeline (shared by the scheduler job and POST /reports/send-test):
     render_report_html() → resend_client.send_email()
 
 Report scope: the latest *passed* webinar (Statistics-page definition) vs the
-previous webinar number, with per-bucket segments, A/B variant comparison,
-copy-variant and sender aggregations folded from the per-list stats rows.
+previous webinar number. Design mirrors the legacy "Webinar Intelligence
+Report" (dark cards, letter-spaced section headers):
+
+  Header → Anomaly Flags → Summary & Actions (AI)
+  Section 1 — Campaign Performance: overview + retention funnel,
+      week-over-week, A/B variants, sender performance (with vs-W-1 deltas),
+      segment leaderboards (current ranked 3 ways + all-time top/bottom)
+  Section 2 — Copy Performance: best/worst highlight cards + full tables
+  Section 3 — Sales Call Outcomes (current webinar, 1-week lag)
+  Section 4 — Previous webinar final pipeline status (2-week lag)
+
+Each section carries a one-line AI insight; the synthetic Nonjoiners /
+No List Data cohorts are shown separately from real buckets.
 """
 from __future__ import annotations
 
@@ -38,10 +49,14 @@ VALID_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 # (settings PATCH re-registers the cron job; APScheduler may re-fire).
 DOUBLE_SEND_GUARD_MINUTES = 30
 
-NARRATIVE_MAX_TOKENS = 900
-NARRATIVE_TIMEOUT_SECONDS = 90.0
+NARRATIVE_MAX_TOKENS = 1400
+NARRATIVE_TIMEOUT_SECONDS = 120.0
 
 STATISTICS_PAGE_URL = "https://competeiq-frontend.onrender.com/statistics"
+
+# All-time segment leaderboards ignore buckets below this invite volume so a
+# 3-reg / 500-invite fluke can't top the table.
+ALL_TIME_MIN_INVITES = 3000
 
 
 # ---------------------------------------------------------------------------
@@ -230,19 +245,20 @@ _SPECIAL_KIND_LABELS = (
 )
 
 
+def _new_seg_slot(label: str) -> dict[str, Any]:
+    return {"label": label, "quality": None,
+            "invites": 0.0, "regs": 0.0, "attendees10m": 0.0, "bookings": 0.0}
+
+
+def _acc_seg(slot: dict[str, Any], metrics: dict[str, Any]) -> None:
+    for out_key, src_key in _SEGMENT_COUNT_KEYS:
+        v = metrics.get(src_key)
+        if v is not None:
+            slot[out_key] += float(v)
+
+
 async def _fold_segment_rows(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Fold stats rows into {special: [...], buckets: [...], totals: {...}}."""
-
-    def _new_slot(label: str) -> dict[str, Any]:
-        return {"label": label, "quality": None,
-                "invites": 0.0, "regs": 0.0, "attendees10m": 0.0, "bookings": 0.0}
-
-    def _acc(slot: dict[str, Any], metrics: dict[str, Any]) -> None:
-        for out_key, src_key in _SEGMENT_COUNT_KEYS:
-            v = metrics.get(src_key)
-            if v is not None:
-                slot[out_key] += float(v)
-
     special_slots: dict[str, dict[str, Any]] = {}
     bucket_slots: dict[str, dict[str, Any]] = {}
     other: dict[str, Any] | None = None
@@ -252,20 +268,20 @@ async def _fold_segment_rows(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
         kind = row.get("kind")
         metrics = row.get("metrics") or {}
         if kind in label_by_kind:
-            slot = special_slots.setdefault(kind, _new_slot(label_by_kind[kind]))
-            _acc(slot, metrics)
+            slot = special_slots.setdefault(kind, _new_seg_slot(label_by_kind[kind]))
+            _acc_seg(slot, metrics)
         elif kind == "list":
             bucket_id = row.get("bucketId")
             if bucket_id:
                 slot = bucket_slots.get(bucket_id)
                 if slot is None:
-                    slot = _new_slot(row.get("bucketName") or "—")
+                    slot = _new_seg_slot(row.get("bucketName") or "—")
                     bucket_slots[bucket_id] = slot
-                _acc(slot, metrics)
+                _acc_seg(slot, metrics)
             else:
                 if other is None:
-                    other = _new_slot("Other (no bucket)")
-                _acc(other, metrics)
+                    other = _new_seg_slot("Other (no bucket)")
+                _acc_seg(other, metrics)
 
     # Manual quality labels (good/medium/bad) for the named buckets, same
     # lookup the Segments dashboard does.
@@ -285,12 +301,56 @@ async def _fold_segment_rows(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
         buckets.append(other)
     special = [special_slots[k] for k, _ in _SPECIAL_KIND_LABELS if k in special_slots]
 
-    totals = _new_slot("Total")
+    totals = _new_seg_slot("Total")
     for slot in special + buckets:
         for out_key, _ in _SEGMENT_COUNT_KEYS:
             totals[out_key] += slot[out_key]
 
     return {"special": special, "buckets": buckets, "totals": totals}
+
+
+async def _fold_all_time_buckets() -> dict[str, Any] | None:
+    """All-time per-bucket invites/regs across every passed webinar's snapshot.
+    Returns {"top": [...], "bottom": [...]} ranked by reg rate (min-volume
+    gated), or None if the snapshot store is empty/unavailable."""
+    try:
+        from services import statistics_snapshot as snap
+        summaries = await get_statistics_webinar_list("auto")
+        passed_ids = {
+            s["webinarId"] for s in summaries
+            if s.get("webinarId") and _is_passed_webinar(s.get("date"), s.get("status"))
+        }
+        payloads = await snap.read_all_payloads("auto")
+    except Exception as exc:
+        logger.warning("Weekly report: all-time segment fold unavailable: %s", exc)
+        return None
+
+    slots: dict[str, dict[str, Any]] = {}
+    for wid, payload in payloads.items():
+        if wid not in passed_ids:
+            continue
+        for row in payload.get("rows") or []:
+            if row.get("kind") != "list" or not row.get("bucketId"):
+                continue
+            m = row.get("metrics") or {}
+            slot = slots.get(row["bucketId"])
+            if slot is None:
+                slot = {"label": row.get("bucketName") or "—", "invites": 0.0, "regs": 0.0}
+                slots[row["bucketId"]] = slot
+            for key, src in (("invites", "invited"), ("regs", "totalRegs")):
+                v = m.get(src)
+                if v is not None:
+                    slot[key] += float(v)
+
+    ranked = [
+        {**s, "rate": (s["regs"] / s["invites"]) if s["invites"] else 0.0}
+        for s in slots.values()
+        if s["invites"] >= ALL_TIME_MIN_INVITES
+    ]
+    if not ranked:
+        return None
+    ranked.sort(key=lambda s: s["rate"], reverse=True)
+    return {"top": ranked[:5], "bottom": ranked[-5:][::-1]}
 
 
 # ---------------------------------------------------------------------------
@@ -331,18 +391,33 @@ async def build_report_data(webinar_id: str | None = None) -> dict[str, Any] | N
         logger.warning("Weekly report: segments unavailable: %s", exc)
         segments = None
 
+    all_time = await _fold_all_time_buckets()
+
+    senders = _fold_rows(
+        all_rows,
+        lambda r: r.get("sendInfo"),
+        lambda r: r.get("sendInfo") or "Unknown",
+    )
+    # Previous webinar's per-sender fold — powers the "vs W-1" delta column.
+    senders_prev: dict[str, dict[str, Any]] = {}
+    if previous:
+        for g in _fold_rows(
+            previous.get("rows") or [],
+            lambda r: r.get("sendInfo"),
+            lambda r: r.get("sendInfo") or "Unknown",
+        ):
+            senders_prev[g["label"]] = g["metrics"]
+
     return {
         "current": current,
         "previous": previous,
         "variants": variants,  # empty when no A/B siblings
         "segments": segments,
+        "allTime": all_time,
         "titleCopies": _fold_rows(all_rows, _copy_key("titleCopy"), _copy_label("titleCopy")),
         "descCopies": _fold_rows(all_rows, _copy_key("descCopy"), _copy_label("descCopy")),
-        "senders": _fold_rows(
-            all_rows,
-            lambda r: r.get("sendInfo"),
-            lambda r: r.get("sendInfo") or "Unknown",
-        ),
+        "senders": senders,
+        "sendersPrev": senders_prev,
     }
 
 
@@ -350,7 +425,7 @@ async def build_report_data(webinar_id: str | None = None) -> dict[str, Any] | N
 # AI narrative
 # ---------------------------------------------------------------------------
 
-# Headline metrics shared by the narrative prompt and the email table.
+# Headline metrics shared by the narrative prompt and the week-over-week table.
 _HEADLINE_METRICS: list[tuple[str, str, str]] = [
     # (key, label, format: "int" | "pct" | "ratio")
     ("invited", "Invited (planned)", "int"),
@@ -375,7 +450,14 @@ _HEADLINE_METRICS: list[tuple[str, str, str]] = [
 def _metric_snapshot(summary: dict[str, Any] | None) -> dict[str, Any]:
     if not summary:
         return {}
-    return {key: summary.get(key) for key, _, _ in _HEADLINE_METRICS}
+    keys = [k for k, _, _ in _HEADLINE_METRICS] + [
+        "total30MinPlus", "attend10MinPercent", "attend30MinPercent",
+        "totalCallsDatePassed", "confirmed", "shows", "noShows", "canceled",
+        "won", "disqualified", "qualified", "showPercent", "closeRatePercent",
+        "qualPercent", "selfRegMarked", "selfRegAttended", "selfReg10MinPlus",
+        "bookingsPerPast10Min",
+    ]
+    return {key: summary.get(key) for key in keys}
 
 
 def _narrative_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -391,6 +473,7 @@ def _narrative_payload(data: dict[str, Any]) -> dict[str, Any]:
         },
         "previousWebinar": None,
         "segments": None,
+        "allTimeSegments": data.get("allTime"),
         "variants": [
             {
                 "variantLabel": v.get("variantLabel") or "(primary)",
@@ -430,12 +513,13 @@ def _narrative_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 _NARRATIVE_SYSTEM = """You are the analytics assistant for a cold-outreach webinar operation.
 You get the stats JSON of the most recent webinar (plus the previous one for
-comparison, per-bucket segments, A/B variants, copy variants and senders).
+comparison, per-bucket segments incl. all-time leaderboards, A/B variants,
+copy variants and senders).
 Metric conventions: keys ending in Percent are FRACTIONS (0.031 = 3.1%);
 /1k metrics are per 1000 invited.
 
 Write the weekly report narrative as plain text (no markdown, no HTML) in
-exactly four sections, each opened by its header line (exact words, all caps):
+exactly five sections, each opened by its header line (exact words, all caps):
 
 FLAGS
 0-3 bullet lines starting with "- ": anomalies that need attention — a metric
@@ -458,7 +542,13 @@ scale up because it's working, what to close out or stop, and what to watch.
 Tie each to a number. If sample sizes are small, say so instead of
 over-claiming.
 
-Keep the whole thing under 300 words. Numbers with at most 1 decimal."""
+SECTION INSIGHTS
+Exactly five bullet lines, one per report section, each formatted
+"- <Key>: <insight>" using exactly these keys: Overview, Senders, Segments,
+Copies, Sales. Each insight is one sentence (max 25 words), the single most
+useful observation for that section, tied to a number.
+
+Keep the whole thing under 420 words. Numbers with at most 1 decimal."""
 
 
 async def generate_narrative(data: dict[str, Any]) -> str | None:
@@ -484,14 +574,57 @@ async def generate_narrative(data: dict[str, Any]) -> str | None:
         return None
 
 
+_NARRATIVE_HEADERS = ("FLAGS", "HIGHLIGHTS", "MEANINGFUL CHANGES", "ACTIONS", "SECTION INSIGHTS")
+
+_INSIGHT_KEYS = ("Overview", "Senders", "Segments", "Copies", "Sales")
+
+
+def _parse_narrative(narrative: str) -> dict[str, Any]:
+    """Split the model's plain-text output into {section: [bullet, ...]} plus
+    an "insights" dict keyed by report-section name."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in narrative.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        upper = line.rstrip(":").upper()
+        if upper in _NARRATIVE_HEADERS:
+            current = upper
+            sections[current] = []
+            continue
+        if current is None:
+            continue
+        sections[current].append(line[2:] if line.startswith("- ") else line)
+
+    insights: dict[str, str] = {}
+    for bullet in sections.get("SECTION INSIGHTS") or []:
+        for key in _INSIGHT_KEYS:
+            prefix = f"{key}:"
+            if bullet.lower().startswith(prefix.lower()):
+                insights[key] = bullet[len(prefix):].strip()
+                break
+    return {**sections, "insights": insights}
+
+
 # ---------------------------------------------------------------------------
-# HTML rendering (email-client-safe: tables + inline CSS only)
+# HTML rendering — dark "Intelligence Report" theme, tables + inline CSS only
 # ---------------------------------------------------------------------------
 
-_GREEN = "#16a34a"
-_RED = "#dc2626"
-_MUTED = "#6b7280"
-_BORDER = "#e5e7eb"
+_BG = "#0d0d10"
+_CARD = "#17171b"
+_CARD_BORDER = "#2a2a31"
+_ROW_BORDER = "#26262c"
+_TEXT = "#e7e7ea"
+_MUTED = "#9aa0a8"
+_GREEN = "#34d399"
+_RED = "#f87171"
+_AMBER = "#fbbf24"
+_PURPLE = "#a78bfa"
+_BLUE = "#60a5fa"
+_CYAN = "#2dd4bf"
+
+_SPECIAL_ROW_BG = "#1d1d23"
 
 # Metrics where a decrease is good (delta colored green when negative).
 _LOWER_IS_BETTER = {"unsubPercent"}
@@ -513,10 +646,10 @@ def _fmt(value: float | None, fmt: str) -> str:
 
 def _fmt_delta(cur: float | None, prev: float | None, fmt: str, key: str = "") -> str:
     if cur is None or prev is None:
-        return "<span style='color:%s'>—</span>" % _MUTED
+        return f"<span style='color:{_MUTED}'>—</span>"
     diff = cur - prev
     mag = abs(diff)
-    # Collapse deltas that would display as 0 (e.g. "−0.0pp") into ±0.
+    # Collapse deltas that would display as 0 (e.g. "▼0.0pp") into ±0.
     if fmt == "pct":
         rounded_zero = round(mag * 100, 1) == 0
     elif fmt == "ratio":
@@ -524,24 +657,76 @@ def _fmt_delta(cur: float | None, prev: float | None, fmt: str, key: str = "") -
     else:
         rounded_zero = int(round(mag)) == 0
     if rounded_zero:
-        return "<span style='color:%s'>±0</span>" % _MUTED
+        return f"<span style='color:{_MUTED}'>±0</span>"
     good = diff < 0 if key in _LOWER_IS_BETTER else diff > 0
     color = _GREEN if good else _RED
-    sign = "+" if diff > 0 else "−"
+    arrow = "&#9650;" if diff > 0 else "&#9660;"
     if fmt == "pct":
-        text = f"{sign}{mag * 100:.1f}pp"
+        text = f"{mag * 100:.1f}pp"
     elif fmt == "ratio":
-        text = f"{sign}{mag:.1f}"
+        text = f"{mag:.1f}"
     else:
-        text = f"{sign}{int(round(mag)):,}"
-    return f"<span style='color:{color};font-weight:600'>{text}</span>"
+        text = f"{int(round(mag)):,}"
+    return f"<span style='color:{color};font-weight:600'>{arrow}{text}</span>"
+
+
+def _eyebrow(text: str, color: str, size: int = 11) -> str:
+    return (
+        f"<div style='font-size:{size}px;font-weight:700;letter-spacing:2px;"
+        f"text-transform:uppercase;color:{color};margin:0 0 12px 0'>{text}</div>"
+    )
+
+
+def _card(inner: str) -> str:
+    return (
+        f"<div style='background:{_CARD};border:1px solid {_CARD_BORDER};"
+        f"border-radius:10px;padding:16px 18px;margin:0 0 16px 0'>{inner}</div>"
+    )
+
+
+def _section_header(text: str, color: str) -> str:
+    return (
+        f"<div style='font-size:12px;font-weight:700;letter-spacing:2px;"
+        f"text-transform:uppercase;color:{color};margin:26px 0 12px 2px'>{text}</div>"
+    )
+
+
+def _kv(label: str, value: str, note: str | None = None, value_color: str = _TEXT) -> str:
+    note_html = (
+        f" <span style='font-size:11px;color:{_MUTED};font-weight:600'>{note}</span>"
+        if note else ""
+    )
+    return (
+        f"<table cellpadding='0' cellspacing='0' style='width:100%;border-collapse:collapse'>"
+        f"<tr><td style='padding:7px 0;font-size:13px;color:{_MUTED};"
+        f"border-bottom:1px solid {_ROW_BORDER}'>{label}</td>"
+        f"<td style='padding:7px 0;font-size:13px;color:{value_color};font-weight:700;"
+        f"text-align:right;border-bottom:1px solid {_ROW_BORDER};white-space:nowrap'>"
+        f"{value}{note_html}</td></tr></table>"
+    )
+
+
+def _insight_line(text: str | None) -> str:
+    if not text:
+        return ""
+    return (
+        f"<div style='margin-top:12px;padding:8px 12px;border-left:3px solid {_CYAN};"
+        f"background:#1a1f1f;border-radius:0 6px 6px 0;font-size:12px;"
+        f"line-height:1.5;color:{_TEXT}'>"
+        f"<span style='color:{_CYAN};font-weight:700;letter-spacing:1px;font-size:10px'>"
+        f"AI INSIGHT&nbsp;&nbsp;</span>{_esc(text)}</div>"
+    )
 
 
 _TH = (
-    "padding:6px 10px;text-align:left;font-size:12px;color:%s;"
-    "border-bottom:2px solid %s;white-space:nowrap" % (_MUTED, _BORDER)
+    f"padding:6px 10px;text-align:left;font-size:10px;color:{_MUTED};font-weight:700;"
+    f"letter-spacing:1px;text-transform:uppercase;border-bottom:2px solid {_CARD_BORDER};"
+    "white-space:nowrap"
 )
-_TD = "padding:6px 10px;font-size:13px;border-bottom:1px solid %s;white-space:nowrap" % _BORDER
+_TD = (
+    f"padding:7px 10px;font-size:13px;color:{_TEXT};"
+    f"border-bottom:1px solid {_ROW_BORDER};white-space:nowrap"
+)
 
 
 def _table(headers: list[str], rows: list[Any]) -> str:
@@ -560,28 +745,135 @@ def _table(headers: list[str], rows: list[Any]) -> str:
     )
 
 
-def _section(title: str, inner: str) -> str:
-    return (
-        f"<h2 style='font-size:16px;margin:28px 0 10px'>{title}</h2>"
-        f"<div style='overflow-x:auto'>{inner}</div>"
-    )
+def _scroll(inner: str) -> str:
+    return f"<div style='overflow-x:auto'>{inner}</div>"
 
 
 def _webinar_label(w: dict[str, Any] | None) -> str:
     if not w:
         return "—"
-    label = f"Webinar #{w.get('number')}"
+    label = f"W{w.get('number')}"
     if w.get("variantLabel"):
         label += f" · {w['variantLabel']}"
     if w.get("date"):
-        label += f" · {w['date']}"
+        label += f" ({w['date']})"
     return _esc(label)
 
 
-def _headline_table(current: dict[str, Any], previous: dict[str, Any] | None) -> str:
+def _rate(a: float | None, b: float | None) -> float | None:
+    if a is None or not b:
+        return None
+    return a / b
+
+
+# ── Header / flags / summary ───────────────────────────────────────────────
+
+_DAY_NAMES = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
+              "fri": "Friday", "sat": "Saturday", "sun": "Sunday"}
+
+
+def _brand_header(schedule: dict[str, Any] | None) -> str:
+    generated = datetime.now(dt_timezone.utc).strftime("%B %d, %Y")
+    sub = f"Generated {generated}"
+    if schedule:
+        day = _DAY_NAMES.get(schedule.get("day_of_week", ""), "")
+        if day:
+            sub += (f" &middot; Sent every {day} "
+                    f"{schedule.get('hour_local', 0):02d}:{schedule.get('minute_local', 0):02d} "
+                    f"{_esc(schedule.get('timezone', ''))}")
+    return (
+        f"<div style='font-size:11px;font-weight:700;letter-spacing:4px;color:{_MUTED};"
+        "text-transform:uppercase;margin:0 0 6px 0'>Quantum Scaling</div>"
+        f"<h1 style='font-size:22px;margin:0 0 6px;color:{_TEXT}'>Webinar Intelligence Report</h1>"
+        f"<div style='font-size:12px;color:{_MUTED};margin-bottom:22px'>{sub}</div>"
+    )
+
+
+def _flags_card(flags: list[str]) -> str:
+    real = [f for f in flags if f.strip().lower() not in ("none", "- none")]
+    if not real:
+        return ""
+    bullets = "".join(
+        f"<div style='font-size:13px;line-height:1.6;margin:0 0 8px 0;color:{_AMBER}'>"
+        f"&#9888;&#65039;&nbsp;{_esc(f)}</div>"
+        for f in real
+    )
+    return _card(_eyebrow("Anomaly Flags", _AMBER) + bullets)
+
+
+def _bullet(text: str) -> str:
+    return (
+        f"<div style='font-size:13px;line-height:1.55;margin:0 0 7px 0;color:{_TEXT}'>"
+        f"<span style='color:{_MUTED}'>&bull;&nbsp;</span>{_esc(text)}</div>"
+    )
+
+
+def _summary_card(sections: dict[str, Any]) -> str:
+    blocks: list[str] = []
+    styling = [
+        ("HIGHLIGHTS", "Highlights", _GREEN),
+        ("MEANINGFUL CHANGES", "Meaningful Changes", _BLUE),
+        ("ACTIONS", "Actions for Next Week", _PURPLE),
+    ]
+    for key, title, color in styling:
+        bullets = sections.get(key) or []
+        if not bullets:
+            continue
+        margin = "0 0 8px 0" if not blocks else "16px 0 8px 0"
+        blocks.append(
+            f"<div style='font-size:11px;font-weight:700;letter-spacing:2px;color:{color};"
+            f"text-transform:uppercase;margin:{margin}'>{title}</div>"
+            + "".join(_bullet(b) for b in bullets)
+        )
+    if not blocks:
+        return ""
+    return _card("".join(blocks))
+
+
+# ── Section 1 — campaign performance ───────────────────────────────────────
+
+def _overview_card(current: dict[str, Any], insight: str | None) -> str:
+    m = current.get("summary") or {}
+    regs = m.get("totalRegs")
+    att10 = m.get("total10MinPlus")
+    att30 = m.get("total30MinPlus")
+    bookings = m.get("totalBookings")
+    rows = [
+        _kv("Webinar Date", _esc(current.get("date") or "—")),
+        _kv("Total Registrations", _fmt(regs, "int")),
+        _kv("Total Attended (live)", _fmt(m.get("totalAttended"), "int")),
+        _kv("10min+ Att Rate", _fmt(_rate(att10, regs), "pct"),
+            note=f"{_fmt(att10, 'int')} stayed 10min+", value_color=_GREEN),
+        _kv("30min+ Att Rate", _fmt(_rate(att30, regs), "pct"),
+            note=f"{_fmt(att30, 'int')} stayed 30min+", value_color=_GREEN),
+        _kv("30m Retention (of 10m viewers)", _fmt(_rate(att30, att10), "pct"),
+            value_color=_AMBER),
+        _kv("Booking Rate (of 10m+)", _fmt(_rate(bookings, att10), "pct"),
+            note=f"{_fmt(bookings, 'int')} booked &divide; {_fmt(att10, 'int')} stayed 10min+",
+            value_color=_GREEN),
+    ]
+    # Self-reg vs outreach attendance quality (10m+ of regs per cohort).
+    sr_marked, sr_10m = m.get("selfRegMarked"), m.get("selfReg10MinPlus")
+    footnote = ""
+    if sr_marked and regs:
+        sr_rate = _rate(sr_10m, sr_marked)
+        out_rate = _rate((att10 or 0) - (sr_10m or 0), regs - sr_marked)
+        footnote = (
+            f"<div style='margin-top:10px;font-size:11px;color:{_MUTED}'>"
+            f"Self-reg 10min+ rate: <span style='color:{_GREEN};font-weight:700'>{_fmt(sr_rate, 'pct')}</span>"
+            f" &middot; Outreach 10min+ rate: <span style='color:{_CYAN};font-weight:700'>{_fmt(out_rate, 'pct')}</span>"
+            "</div>"
+        )
+    return _card(
+        _eyebrow("Webinar Overview + Retention Funnel", _GREEN)
+        + "".join(rows) + footnote + _insight_line(insight)
+    )
+
+
+def _wow_card(current: dict[str, Any], previous: dict[str, Any] | None) -> str:
     cur_m = current.get("summary") or {}
     prev_m = (previous or {}).get("summary") or {}
-    cur_col = f"W{current.get('number')} <span style='color:{_GREEN};font-size:10px'>(latest)</span>"
+    cur_col = f"W{current.get('number')} <span style='color:{_GREEN};font-size:9px'>(latest)</span>"
     prev_col = f"W{previous.get('number')}" if previous else "Previous"
     rows = []
     for key, label, fmt in _HEADLINE_METRICS:
@@ -591,91 +883,46 @@ def _headline_table(current: dict[str, Any], previous: dict[str, Any] | None) ->
             _fmt(prev_m.get(key), fmt) if previous else "—",
             _fmt_delta(cur_m.get(key), prev_m.get(key), fmt, key) if previous else "—",
         ])
-    return _table(["Metric", cur_col, prev_col, "Δ"], rows)
+    title = f"Week-over-week: {_webinar_label(previous)} &rarr; {_webinar_label(current)}" if previous \
+        else f"Headline stats: {_webinar_label(current)}"
+    return _card(_eyebrow(title, _GREEN) + _scroll(_table(["Metric", cur_col, prev_col, "Change"], rows)))
 
 
-_NARRATIVE_HEADERS = ("FLAGS", "HIGHLIGHTS", "MEANINGFUL CHANGES", "ACTIONS")
+def _variants_card(variants: list[dict[str, Any]]) -> str:
+    headers = ["Metric"] + [_esc(v.get("variantLabel") or "Primary") for v in variants]
+    rows = []
+    for key, label, fmt in _HEADLINE_METRICS:
+        row = [_esc(label)]
+        for v in variants:
+            row.append(_fmt((v.get("summary") or {}).get(key), fmt))
+        rows.append(row)
+    return _card(_eyebrow("A/B Variants", _GREEN) + _scroll(_table(headers, rows)))
 
 
-def _parse_narrative(narrative: str) -> dict[str, list[str]]:
-    """Split the model's plain-text output into {section: [bullet, ...]}."""
-    sections: dict[str, list[str]] = {}
-    current: str | None = None
-    for line in narrative.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        upper = line.rstrip(":").upper()
-        if upper in _NARRATIVE_HEADERS:
-            current = upper
-            sections[current] = []
-            continue
-        if current is None:
-            continue
-        sections[current].append(line[2:] if line.startswith("- ") else line)
-    return sections
-
-
-def _bullet(text: str, color: str = "#111827") -> str:
-    return (
-        f"<div style='font-size:13px;line-height:1.5;margin:0 0 6px 0;color:{color}'>"
-        f"<span style='color:{_MUTED}'>&bull;&nbsp;</span>{_esc(text)}</div>"
+def _senders_card(senders: list[dict[str, Any]], senders_prev: dict[str, dict[str, Any]],
+                  insight: str | None) -> str:
+    rows = []
+    for g in senders:
+        m = g["metrics"]
+        prev_m = senders_prev.get(g["label"])
+        reg_rate = m.get("invitedToRegPercent")
+        rows.append([
+            _esc(g["label"]),
+            _fmt(m.get("invited"), "int"),
+            _fmt(m.get("totalRegs"), "int"),
+            f"<span style='color:{_GREEN};font-weight:700'>{_fmt(reg_rate, 'pct')}</span>",
+            _fmt_delta(reg_rate, prev_m.get("invitedToRegPercent") if prev_m else None, "pct"),
+            _fmt(_rate(m.get("total10MinPlus"), m.get("totalRegs")), "pct"),
+            _fmt(m.get("totalBookings"), "int"),
+        ])
+    table = _table(
+        ["Sender", "Invited", "Regs", "Reg %", "vs W-1", "Att% 10m+", "Bookings"], rows
     )
+    return _card(_eyebrow("Sender Performance", _GREEN) + _scroll(table) + _insight_line(insight))
 
 
-def _flags_box(flags: list[str]) -> str:
-    """Amber anomaly-flags callout, shown at the top when the AI raises any."""
-    real = [f for f in flags if f.strip().lower() not in ("none", "- none")]
-    if not real:
-        return ""
-    bullets = "".join(
-        f"<div style='font-size:13px;line-height:1.5;margin:0 0 6px 0;color:#92400e'>&#9888;&#65039;&nbsp;{_esc(f)}</div>"
-        for f in real
-    )
-    return (
-        "<div style='border:1px solid #f59e0b66;background:#fffbeb;border-radius:8px;"
-        "padding:12px 16px;margin:0 0 18px 0'>"
-        "<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:#b45309;"
-        "text-transform:uppercase;margin-bottom:8px'>Anomaly Flags</div>"
-        f"{bullets}</div>"
-    )
-
-
-def _summary_card(sections: dict[str, list[str]]) -> str:
-    """Highlights / meaningful changes / actions as one clean card."""
-    blocks: list[str] = []
-    styling = [
-        ("HIGHLIGHTS", "Highlights", "#4f46e5"),
-        ("MEANINGFUL CHANGES", "Meaningful Changes", "#0891b2"),
-        ("ACTIONS", "Actions for Next Week", "#16a34a"),
-    ]
-    for key, title, color in styling:
-        bullets = sections.get(key) or []
-        if not bullets:
-            continue
-        blocks.append(
-            f"<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:{color};"
-            f"text-transform:uppercase;margin:14px 0 8px 0'>{title}</div>"
-            + "".join(_bullet(b) for b in bullets)
-        )
-    if not blocks:
-        return ""
-    inner = "".join(blocks).replace("margin:14px 0 8px 0", "margin:0 0 8px 0", 1)
-    return (
-        "<div style='border:1px solid %s;border-left:4px solid #4f46e5;"
-        "border-radius:8px;padding:14px 18px;margin:6px 0'>%s</div>"
-        % (_BORDER, inner)
-    )
-
-
-_SPECIAL_ROW_BG = "#f8fafc"
-
-
-def _segment_tables(segments: dict[str, Any]) -> list[tuple[str, str]]:
-    """Three ranked views of the bucket rows: registrations, attendance,
-    bookings — each sorted best-first on its own metric. The synthetic
-    Nonjoiners / No List Data cohorts sit on top, visually separated, since
-    they have no invite attribution and their rates aren't comparable."""
+def _segment_leaderboard_card(segments: dict[str, Any], all_time: dict[str, Any] | None,
+                              current: dict[str, Any], insight: str | None) -> str:
     special = list(segments.get("special") or [])
     buckets = list(segments.get("buckets") or [])
     totals = segments.get("totals")
@@ -692,62 +939,114 @@ def _segment_tables(segments: dict[str, Any]) -> list[tuple[str, str]]:
             cell += f" <span style='color:{_MUTED};font-size:11px'>({_esc(quality)})</span>"
         return cell
 
-    def _rate(a: float, b: float) -> float | None:
-        return a / b if b else None
-
     def _build(headers: list[str], row_fn, sort_key) -> str:
-        rows: list[Any] = [
-            (row_fn(s, muted=True), _SPECIAL_ROW_BG) for s in special
-        ]
+        rows: list[Any] = [(row_fn(s, muted=True), _SPECIAL_ROW_BG) for s in special]
         rows.extend(row_fn(s) for s in sorted(buckets, key=sort_key, reverse=True))
         if totals:
             rows.append(row_fn(totals, bold=True))
-        return _table(headers, rows)
+        return _scroll(_table(headers, rows))
 
-    def _reg_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
+    def _reg_row(s, *, bold=False, muted=False):
         inv, regs = s.get("invites") or 0, s.get("regs") or 0
         return [_name_cell(s, bold=bold, muted=muted), f"{int(inv):,}", f"{int(regs):,}",
                 _fmt(_rate(regs, inv), "pct") if not muted else "—"]
 
-    def _att_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
+    def _att_row(s, *, bold=False, muted=False):
         regs, att10 = s.get("regs") or 0, s.get("attendees10m") or 0
         return [_name_cell(s, bold=bold, muted=muted), f"{int(regs):,}", f"{int(att10):,}",
                 _fmt(_rate(att10, regs), "pct")]
 
-    def _book_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
+    def _book_row(s, *, bold=False, muted=False):
         att10, bookings = s.get("attendees10m") or 0, s.get("bookings") or 0
         return [_name_cell(s, bold=bold, muted=muted), f"{int(att10):,}", f"{int(bookings):,}",
                 _fmt(_rate(bookings, att10), "pct")]
 
-    return [
-        (
-            "Segments — by Registrations",
-            _build(
-                ["Bucket", "Invites", "Regs", "Inv>Reg %"],
-                _reg_row,
-                lambda s: (_rate(s.get("regs") or 0, s.get("invites") or 0) or 0, s.get("regs") or 0),
-            ),
-        ),
-        (
-            "Segments — by Attendance",
-            _build(
-                ["Bucket", "Regs", "10m+", "Att 10m+ %"],
-                _att_row,
-                lambda s: (_rate(s.get("attendees10m") or 0, s.get("regs") or 0) or 0, s.get("attendees10m") or 0),
-            ),
-        ),
-        (
-            "Segments — by Bookings",
-            _build(
-                ["Bucket", "10m+", "Bookings", "Book/10m %"],
-                _book_row,
-                lambda s: (s.get("bookings") or 0, _rate(s.get("bookings") or 0, s.get("attendees10m") or 0) or 0),
-            ),
-        ),
+    parts = [_eyebrow("Segment Leaderboard", _GREEN)]
+    sub = f"<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:{_CYAN};text-transform:uppercase;margin:%s 0 8px 0'>%s</div>"
+    parts.append(sub % ("0", f"{_webinar_label(current)} — by Registrations"))
+    parts.append(_build(["Segment", "Invites", "Regs", "Inv&gt;Reg %"], _reg_row,
+                        lambda s: (_rate(s.get("regs") or 0, s.get("invites") or 0) or 0, s.get("regs") or 0)))
+    parts.append(sub % ("16px", "By Attendance (10m+ of Regs)"))
+    parts.append(_build(["Segment", "Regs", "10m+", "Att 10m+ %"], _att_row,
+                        lambda s: (_rate(s.get("attendees10m") or 0, s.get("regs") or 0) or 0, s.get("attendees10m") or 0)))
+    parts.append(sub % ("16px", "By Bookings"))
+    parts.append(_build(["Segment", "10m+", "Bookings", "Book/10m %"], _book_row,
+                        lambda s: (s.get("bookings") or 0, _rate(s.get("bookings") or 0, s.get("attendees10m") or 0) or 0)))
+
+    if special:
+        parts.append(
+            f"<div style='font-size:11px;color:{_MUTED};margin-top:8px'>"
+            "Nonjoiners / No List Data are synthetic cohorts without invite attribution — "
+            "shown separately because their rates aren't comparable to bucket rates.</div>"
+        )
+
+    if all_time:
+        def _at_rows(entries):
+            return [[_esc(e["label"]), f"{int(e['invites']):,}", f"{int(e['regs']):,}",
+                     _fmt(e["rate"], "pct")] for e in entries]
+        parts.append(
+            f"<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:{_GREEN};"
+            "text-transform:uppercase;margin:16px 0 8px 0'>&#9650; Top Segments (All-Time)</div>"
+        )
+        parts.append(_scroll(_table(["Segment", "Invited", "Regs", "Reg %"], _at_rows(all_time["top"]))))
+        parts.append(
+            f"<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:{_RED};"
+            "text-transform:uppercase;margin:16px 0 8px 0'>&#9660; Bottom Segments (All-Time)</div>"
+        )
+        parts.append(_scroll(_table(["Segment", "Invited", "Regs", "Reg %"], _at_rows(all_time["bottom"]))))
+        parts.append(
+            f"<div style='font-size:11px;color:{_MUTED};margin-top:6px'>"
+            f"All-time tables include buckets with &ge;{ALL_TIME_MIN_INVITES:,} invites.</div>"
+        )
+
+    parts.append(_insight_line(insight))
+    return _card("".join(parts))
+
+
+# ── Section 2 — copy performance ───────────────────────────────────────────
+
+def _copy_highlight(title: str, color: str, symbol: str, g: dict[str, Any]) -> str:
+    m = g["metrics"]
+    att10_rate = _rate(m.get("total10MinPlus"), m.get("totalRegs"))
+    stat = (
+        f"Inv: <b>{_fmt(m.get('invited'), 'int')}</b> &middot; "
+        f"Regs: <b>{_fmt(m.get('totalRegs'), 'int')}</b> &middot; "
+        f"Reg%: <span style='color:{color};font-weight:700'>{_fmt(m.get('invitedToRegPercent'), 'pct')}</span> &middot; "
+        f"Att 10m: <b>{_fmt(att10_rate, 'pct')}</b> &middot; "
+        f"Bookings: <b>{_fmt(m.get('totalBookings'), 'int')}</b>"
+    )
+    return (
+        f"<div style='font-size:10px;font-weight:700;letter-spacing:1px;color:{color};"
+        f"text-transform:uppercase;margin:14px 0 6px 0'>{symbol} {title}</div>"
+        f"<div style='border:1px solid {_ROW_BORDER};border-radius:8px;padding:10px 14px'>"
+        f"<div style='font-size:13px;font-weight:700;color:{_TEXT};margin-bottom:4px'>{_esc(g['label'])}</div>"
+        f"<div style='font-size:11px;color:{_MUTED}'>{stat}</div></div>"
+    )
+
+
+def _copy_cards(title_copies: list[dict[str, Any]], insight: str | None) -> str:
+    if not title_copies:
+        return ""
+    with_volume = [g for g in title_copies if (g["metrics"].get("invited") or 0) >= 1000]
+    pool = with_volume or title_copies
+    best_reg = max(pool, key=lambda g: g["metrics"].get("invitedToRegPercent") or 0)
+    best_att = max(pool, key=lambda g: _rate(g["metrics"].get("total10MinPlus"),
+                                             g["metrics"].get("totalRegs")) or 0)
+    worst = min(pool, key=lambda g: g["metrics"].get("invitedToRegPercent") or 0)
+    parts = [
+        _eyebrow("Title Copy — Reg Rate + Attendance Quality", _PURPLE),
+        _copy_highlight("Best Registration Rate", _GREEN, "&#9650;", best_reg).replace("margin:14px", "margin:0px", 1),
+        _copy_highlight("Best Attendance Quality (10m+ rate)", _CYAN, "&#9733;", best_att),
     ]
+    if worst is not best_reg:
+        parts.append(_copy_highlight("Weakest Performer", _RED, "&#9660;", worst))
+    parts.append(_insight_line(insight))
+    return _card("".join(parts))
 
 
-def _group_table(groups: list[dict[str, Any]], first_col: str) -> str:
+def _group_table_card(title: str, groups: list[dict[str, Any]], first_col: str) -> str:
+    if not groups:
+        return ""
     rows = []
     for g in groups:
         m = g["metrics"]
@@ -761,83 +1060,132 @@ def _group_table(groups: list[dict[str, Any]], first_col: str) -> str:
             _fmt(m.get("maybeMarked"), "int"),
             _fmt(m.get("totalBookings"), "int"),
         ])
-    return _table(
-        [first_col, "Lists", "Invited", "Regs", "Inv>Reg %", "Yes", "Maybe", "Bookings"],
-        rows,
+    table = _table(
+        [first_col, "Lists", "Invited", "Regs", "Inv&gt;Reg %", "Yes", "Maybe", "Bookings"], rows
     )
+    return _card(_eyebrow(title, _PURPLE) + _scroll(table))
 
 
-def _variants_table(variants: list[dict[str, Any]]) -> str:
-    headers = ["Metric"] + [
-        _esc(v.get("variantLabel") or "Primary") for v in variants
+# ── Sections 3 + 4 — sales pipeline ────────────────────────────────────────
+
+def _sales_card(current: dict[str, Any], insight: str | None) -> str:
+    m = current.get("summary") or {}
+    att10 = m.get("total10MinPlus")
+    bookings = m.get("totalBookings")
+    rows = [
+        _kv("Bookings (attributed)", _fmt(bookings, "int")),
+        _kv("Calls with date passed", _fmt(m.get("totalCallsDatePassed"), "int")),
+        _kv("Confirmed", _fmt(m.get("confirmed"), "int")),
+        _kv("Showed", _fmt(m.get("shows"), "int"),
+            note=f"{_fmt(m.get('showPercent'), 'pct')} show rate", value_color=_GREEN),
+        _kv("No-Show", _fmt(m.get("noShows"), "int"), value_color=_AMBER),
+        _kv("Cancelled", _fmt(m.get("canceled"), "int"), value_color=_AMBER),
+        _kv("Deals Won", _fmt(m.get("won"), "int"),
+            note=f"{_fmt(m.get('closeRatePercent'), 'pct')} close rate", value_color=_GREEN),
+        _kv("Disqualified", _fmt(m.get("disqualified"), "int"), value_color=_RED),
+        _kv("Qualified", _fmt(m.get("qualified"), "int"),
+            note=f"{_fmt(m.get('qualPercent'), 'pct')} of shows"),
     ]
-    rows = []
-    for key, label, fmt in _HEADLINE_METRICS:
-        row = [_esc(label)]
-        for v in variants:
-            row.append(_fmt((v.get("summary") or {}).get(key), fmt))
-        rows.append(row)
-    return _table(headers, rows)
+    retention = (
+        f"<div style='margin-top:12px;font-size:12px;color:{_MUTED}'>Retention &rarr; Booking:<br>"
+        f"<span style='color:{_TEXT};font-weight:700'>{_fmt(att10, 'int')} stayed 10min+ &rarr; "
+        f"{_fmt(bookings, 'int')} booked = "
+        f"<span style='color:{_GREEN}'>{_fmt(_rate(bookings, att10), 'pct')}</span></span></div>"
+    )
+    note = (
+        f"<div style='font-size:11px;color:{_MUTED};font-style:italic;margin-bottom:10px'>"
+        "Pipeline numbers are ~1 week behind the webinar — calls are still being scheduled and held.</div>"
+    )
+    return _card(_eyebrow("GHL Pipeline — 1 Week Lag", _BLUE) + note + "".join(rows)
+                 + retention + _insight_line(insight))
 
 
-def render_report_html(data: dict[str, Any], narrative: str | None) -> str:
+def _prev_pipeline_card(previous: dict[str, Any]) -> str:
+    m = previous.get("summary") or {}
+    rows = [
+        _kv("Total Bookings (attributed)", _fmt(m.get("totalBookings"), "int")),
+        _kv("Showed", _fmt(m.get("shows"), "int"),
+            note=f"{_fmt(m.get('showPercent'), 'pct')} show rate"),
+        _kv("No-Show", _fmt(m.get("noShows"), "int"), value_color=_AMBER),
+        _kv("Cancelled", _fmt(m.get("canceled"), "int"), value_color=_AMBER),
+        _kv("Deals Won", _fmt(m.get("won"), "int"), value_color=_GREEN),
+        _kv("Disqualified", _fmt(m.get("disqualified"), "int"), value_color=_RED),
+        _kv("Qualified", _fmt(m.get("qualified"), "int")),
+    ]
+    return _card(_eyebrow("Close Data — 2 Week Lag", _AMBER) + "".join(rows))
+
+
+# ── Assembly ───────────────────────────────────────────────────────────────
+
+def render_report_html(data: dict[str, Any], narrative: str | None,
+                       schedule: dict[str, Any] | None = None) -> str:
     current = data["current"]
     previous = data["previous"]
 
-    sections: list[str] = []
+    parsed: dict[str, Any] = _parse_narrative(narrative) if narrative else {}
+    insights: dict[str, str] = parsed.get("insights") or {}
 
-    header = (
-        f"<h1 style='font-size:20px;margin:0 0 4px'>Weekly Webinar Report — {_webinar_label(current)}</h1>"
-        f"<div style='font-size:13px;color:{_MUTED};margin-bottom:18px'>"
-        + (f"Compared to {_webinar_label(previous)}" if previous else "No previous webinar to compare against")
-        + "</div>"
-    )
-    sections.append(header)
+    body: list[str] = [_brand_header(schedule)]
 
-    if narrative:
-        parsed = _parse_narrative(narrative)
-        flags_html = _flags_box(parsed.get("FLAGS") or [])
-        if flags_html:
-            sections.append(flags_html)
-        summary_html = _summary_card(parsed)
-        if summary_html:
-            sections.append(_section("Summary &amp; Actions", summary_html))
+    flags_html = _flags_card(parsed.get("FLAGS") or [])
+    if flags_html:
+        body.append(flags_html)
+    summary_html = _summary_card(parsed)
+    if summary_html:
+        body.append(summary_html)
 
-    sections.append(_section("Headline Stats", _headline_table(current, previous)))
-
+    # Section 1 — campaign performance
+    body.append(_section_header(
+        f"Section 1 — {_webinar_label(current)} Campaign Performance", _GREEN))
+    body.append(_overview_card(current, insights.get("Overview")))
+    body.append(_wow_card(current, previous))
+    if data["variants"]:
+        body.append(_variants_card(data["variants"]))
+    if data["senders"]:
+        body.append(_senders_card(data["senders"], data.get("sendersPrev") or {},
+                                  insights.get("Senders")))
     seg = data["segments"]
     if seg and (seg.get("buckets") or seg.get("special")):
-        for title, table_html in _segment_tables(seg):
-            sections.append(_section(title, table_html))
-        if seg.get("special"):
-            sections.append(
-                f"<div style='font-size:11px;color:{_MUTED};margin-top:4px'>"
-                "Nonjoiners / No List Data are synthetic cohorts without invite attribution — "
-                "shown separately because their rates aren't comparable to bucket rates.</div>"
-            )
+        body.append(_segment_leaderboard_card(seg, data.get("allTime"), current,
+                                              insights.get("Segments")))
 
-    if data["variants"]:
-        sections.append(_section("A/B Variants", _variants_table(data["variants"])))
+    # Section 2 — copy performance
+    if data["titleCopies"] or data["descCopies"]:
+        body.append(_section_header(
+            f"Section 2 — Copy Performance ({_webinar_label(current)})", _PURPLE))
+        body.append(_copy_cards(data["titleCopies"], insights.get("Copies")))
+        body.append(_group_table_card("Title Copy Variants", data["titleCopies"], "Title copy"))
+        body.append(_group_table_card("Description Copy Variants", data["descCopies"], "Description copy"))
 
-    if data["titleCopies"]:
-        sections.append(_section("Title Copy Variants", _group_table(data["titleCopies"], "Title copy")))
-    if data["descCopies"]:
-        sections.append(_section("Description Copy Variants", _group_table(data["descCopies"], "Description copy")))
-    if data["senders"]:
-        sections.append(_section("Sender Performance", _group_table(data["senders"], "Sender")))
+    # Section 3 — sales call outcomes (current webinar)
+    body.append(_section_header(
+        f"Section 3 — {_webinar_label(current)} Sales Call Outcomes", _BLUE))
+    body.append(_sales_card(current, insights.get("Sales")))
 
-    generated = datetime.now(dt_timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # Section 4 — previous webinar's final pipeline status
+    if previous:
+        body.append(_section_header(
+            f"Section 4 — {_webinar_label(previous)} Final Pipeline Status", _AMBER))
+        body.append(_prev_pipeline_card(previous))
+
     footer = (
-        f"<div style='font-size:11px;color:{_MUTED};margin-top:28px;border-top:1px solid {_BORDER};"
-        f"padding-top:10px'>Generated {generated} · "
-        f"<a href='{STATISTICS_PAGE_URL}' style='color:#4f46e5'>Open the Statistics dashboard</a></div>"
+        f"<div style='text-align:center;font-size:11px;color:{_MUTED};margin-top:26px;"
+        f"padding-top:14px;border-top:1px solid {_CARD_BORDER}'>"
+        "Quantum Scaling &middot; Webinar Studio &middot; Weekly Intelligence Report<br>"
+        f"Auto-generated &middot; <a href='{STATISTICS_PAGE_URL}' "
+        f"style='color:{_BLUE}'>Open the Statistics dashboard</a></div>"
     )
-    sections.append(footer)
+    body.append(footer)
 
-    return (
-        "<div style='max-width:680px;margin:0 auto;padding:24px;"
+    inner = (
+        "<div style='max-width:700px;margin:0 auto;padding:28px 22px;"
         "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
-        "color:#111827'>" + "".join(sections) + "</div>"
+        f"color:{_TEXT}'>" + "".join(body) + "</div>"
+    )
+    # Dark canvas: bgcolor attribute + inline style for broad email-client support.
+    return (
+        f"<table width='100%' cellpadding='0' cellspacing='0' bgcolor='{_BG}' "
+        f"style='background:{_BG}'><tr><td>{inner}</td></tr></table>"
     )
 
 
@@ -889,13 +1237,13 @@ async def send_weekly_report(*, test: bool = False, webinar_id: str | None = Non
         return await _fail("No passed webinar found to report on")
 
     narrative = await generate_narrative(data)
-    html = render_report_html(data, narrative)
+    html = render_report_html(data, narrative, schedule=settings)
 
     current = data["current"]
     # ASCII-only subject: non-ASCII chars (em dashes etc.) get RFC2047-encoded
     # in the header, which trips Gmail's "abnormal characters" spoof warning
     # on a young sending domain.
-    subject = f"Weekly Webinar Report - W{current.get('number')}"
+    subject = f"Webinar Intelligence Report - W{current.get('number')}"
     if current.get("date"):
         subject += f" ({current['date']})"
     if test:
