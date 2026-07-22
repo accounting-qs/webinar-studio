@@ -18,14 +18,13 @@ from typing import Any
 
 from sqlalchemy import select
 
-from db.models import ConnectorCredential, ReportSettings
+from db.models import ConnectorCredential, OutreachBucket, ReportSettings
 from db.session import AsyncSessionLocal
 from integrations import resend_client
 from services.statistics import (
     _SUM_KEYS,
     _is_passed_webinar,
     compute_derived_metrics,
-    get_statistics_segments,
     get_statistics_webinar_list,
     get_statistics_webinar_one,
 )
@@ -212,6 +211,89 @@ def _copy_label(field: str):
 
 
 # ---------------------------------------------------------------------------
+# Segment folding (from the per-list rows, so kind info survives)
+# ---------------------------------------------------------------------------
+# The Segments dashboard endpoint rolls every bucket-less row into one
+# "Other (no bucket)" line; the report instead keeps the synthetic Nonjoiners /
+# No List Data rows separate so they can be shown apart from the real buckets.
+
+_SEGMENT_COUNT_KEYS = (
+    ("invites", "invited"),
+    ("regs", "totalRegs"),
+    ("attendees10m", "total10MinPlus"),
+    ("bookings", "totalBookings"),
+)
+
+_SPECIAL_KIND_LABELS = (
+    ("nonjoiners", "Nonjoiners"),
+    ("no_list_data", "No List Data"),
+)
+
+
+async def _fold_segment_rows(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold stats rows into {special: [...], buckets: [...], totals: {...}}."""
+
+    def _new_slot(label: str) -> dict[str, Any]:
+        return {"label": label, "quality": None,
+                "invites": 0.0, "regs": 0.0, "attendees10m": 0.0, "bookings": 0.0}
+
+    def _acc(slot: dict[str, Any], metrics: dict[str, Any]) -> None:
+        for out_key, src_key in _SEGMENT_COUNT_KEYS:
+            v = metrics.get(src_key)
+            if v is not None:
+                slot[out_key] += float(v)
+
+    special_slots: dict[str, dict[str, Any]] = {}
+    bucket_slots: dict[str, dict[str, Any]] = {}
+    other: dict[str, Any] | None = None
+    label_by_kind = dict(_SPECIAL_KIND_LABELS)
+
+    for row in all_rows:
+        kind = row.get("kind")
+        metrics = row.get("metrics") or {}
+        if kind in label_by_kind:
+            slot = special_slots.setdefault(kind, _new_slot(label_by_kind[kind]))
+            _acc(slot, metrics)
+        elif kind == "list":
+            bucket_id = row.get("bucketId")
+            if bucket_id:
+                slot = bucket_slots.get(bucket_id)
+                if slot is None:
+                    slot = _new_slot(row.get("bucketName") or "—")
+                    bucket_slots[bucket_id] = slot
+                _acc(slot, metrics)
+            else:
+                if other is None:
+                    other = _new_slot("Other (no bucket)")
+                _acc(other, metrics)
+
+    # Manual quality labels (good/medium/bad) for the named buckets, same
+    # lookup the Segments dashboard does.
+    if bucket_slots:
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(OutreachBucket.id, OutreachBucket.quality).where(
+                    OutreachBucket.id.in_(list(bucket_slots))
+                )
+            )
+            quality_by_id = {r[0]: r[1] for r in res.all()}
+        for bucket_id, slot in bucket_slots.items():
+            slot["quality"] = quality_by_id.get(bucket_id)
+
+    buckets = list(bucket_slots.values())
+    if other is not None:
+        buckets.append(other)
+    special = [special_slots[k] for k, _ in _SPECIAL_KIND_LABELS if k in special_slots]
+
+    totals = _new_slot("Total")
+    for slot in special + buckets:
+        for out_key, _ in _SEGMENT_COUNT_KEYS:
+            totals[out_key] += slot[out_key]
+
+    return {"special": special, "buckets": buckets, "totals": totals}
+
+
+# ---------------------------------------------------------------------------
 # Data assembly
 # ---------------------------------------------------------------------------
 
@@ -238,19 +320,16 @@ async def build_report_data(webinar_id: str | None = None) -> dict[str, Any] | N
             if full:
                 variants.append(full)
 
-    # Segments cover the whole webinar number (all variants) so bucket totals
-    # tie out to what the Segments tab shows for this webinar.
-    group_ids = [current_id] + [s["webinarId"] for s in selection["siblings"]]
-    try:
-        segments = await get_statistics_segments("auto", group_ids)
-    except Exception as exc:
-        logger.warning("Weekly report: segments unavailable: %s", exc)
-        segments = None
-
-    # Copy + sender folds across the whole variant group's list rows.
+    # Copy + sender + segment folds across the whole variant group's list rows.
     all_rows: list[dict[str, Any]] = []
     for w in (variants or [current]):
         all_rows.extend(w.get("rows") or [])
+
+    try:
+        segments = await _fold_segment_rows(all_rows)
+    except Exception as exc:
+        logger.warning("Weekly report: segments unavailable: %s", exc)
+        segments = None
 
     return {
         "current": current,
@@ -340,7 +419,12 @@ def _narrative_payload(data: dict[str, Any]) -> dict[str, Any]:
             "metrics": _metric_snapshot(previous.get("summary")),
         }
     if data["segments"]:
-        payload["segments"] = data["segments"].get("segments")
+        payload["segments"] = {
+            "note": ("'special' rows (Nonjoiners / No List Data) are synthetic cohorts "
+                     "without invite attribution — their rates are not comparable to buckets"),
+            "special": data["segments"]["special"],
+            "buckets": data["segments"]["buckets"],
+        }
     return payload
 
 
@@ -460,15 +544,19 @@ _TH = (
 _TD = "padding:6px 10px;font-size:13px;border-bottom:1px solid %s;white-space:nowrap" % _BORDER
 
 
-def _table(headers: list[str], rows: list[list[str]]) -> str:
+def _table(headers: list[str], rows: list[Any]) -> str:
+    """rows: list of cell-lists, or (cell-list, bg-color) tuples for tinted rows."""
     head = "".join(f"<th style='{_TH}'>{h}</th>" for h in headers)
-    body = "".join(
-        "<tr>" + "".join(f"<td style='{_TD}'>{c}</td>" for c in row) + "</tr>"
-        for row in rows
-    )
+    body_parts = []
+    for row in rows:
+        bg = None
+        if isinstance(row, tuple):
+            row, bg = row
+        td = _TD + (f";background:{bg}" if bg else "")
+        body_parts.append("<tr>" + "".join(f"<td style='{td}'>{c}</td>" for c in row) + "</tr>")
     return (
         "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%'>"
-        f"<tr>{head}</tr>{body}</table>"
+        f"<tr>{head}</tr>{''.join(body_parts)}</table>"
     )
 
 
@@ -580,17 +668,27 @@ def _summary_card(sections: dict[str, list[str]]) -> str:
     )
 
 
+_SPECIAL_ROW_BG = "#f8fafc"
+
+
 def _segment_tables(segments: dict[str, Any]) -> list[tuple[str, str]]:
-    """Three ranked views of the same bucket rows: registrations, attendance,
-    bookings — each sorted best-first on its own metric."""
-    seg_rows = list(segments.get("segments") or [])
+    """Three ranked views of the bucket rows: registrations, attendance,
+    bookings — each sorted best-first on its own metric. The synthetic
+    Nonjoiners / No List Data cohorts sit on top, visually separated, since
+    they have no invite attribution and their rates aren't comparable."""
+    special = list(segments.get("special") or [])
+    buckets = list(segments.get("buckets") or [])
     totals = segments.get("totals")
 
-    def _name_cell(s: dict[str, Any], bold: bool = False) -> str:
-        name = s.get("bucketName") or "—"
-        cell = f"<b>{_esc(name)}</b>" if bold else _esc(name)
+    def _name_cell(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> str:
+        name = s.get("label") or "—"
+        if bold:
+            return f"<b>{_esc(name)}</b>"
+        if muted:
+            return f"<i style='color:{_MUTED}'>{_esc(name)}</i>"
+        cell = _esc(name)
         quality = s.get("quality")
-        if quality and not bold:
+        if quality:
             cell += f" <span style='color:{_MUTED};font-size:11px'>({_esc(quality)})</span>"
         return cell
 
@@ -598,23 +696,28 @@ def _segment_tables(segments: dict[str, Any]) -> list[tuple[str, str]]:
         return a / b if b else None
 
     def _build(headers: list[str], row_fn, sort_key) -> str:
-        ranked = sorted(seg_rows, key=sort_key, reverse=True)
-        rows = [row_fn(s, False) for s in ranked]
+        rows: list[Any] = [
+            (row_fn(s, muted=True), _SPECIAL_ROW_BG) for s in special
+        ]
+        rows.extend(row_fn(s) for s in sorted(buckets, key=sort_key, reverse=True))
         if totals:
-            rows.append(row_fn(totals, True))
+            rows.append(row_fn(totals, bold=True))
         return _table(headers, rows)
 
-    def _reg_row(s: dict[str, Any], bold: bool) -> list[str]:
+    def _reg_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
         inv, regs = s.get("invites") or 0, s.get("regs") or 0
-        return [_name_cell(s, bold), f"{inv:,}", f"{regs:,}", _fmt(_rate(regs, inv), "pct")]
+        return [_name_cell(s, bold=bold, muted=muted), f"{int(inv):,}", f"{int(regs):,}",
+                _fmt(_rate(regs, inv), "pct") if not muted else "—"]
 
-    def _att_row(s: dict[str, Any], bold: bool) -> list[str]:
+    def _att_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
         regs, att10 = s.get("regs") or 0, s.get("attendees10m") or 0
-        return [_name_cell(s, bold), f"{regs:,}", f"{att10:,}", _fmt(_rate(att10, regs), "pct")]
+        return [_name_cell(s, bold=bold, muted=muted), f"{int(regs):,}", f"{int(att10):,}",
+                _fmt(_rate(att10, regs), "pct")]
 
-    def _book_row(s: dict[str, Any], bold: bool) -> list[str]:
+    def _book_row(s: dict[str, Any], *, bold: bool = False, muted: bool = False) -> list[str]:
         att10, bookings = s.get("attendees10m") or 0, s.get("bookings") or 0
-        return [_name_cell(s, bold), f"{att10:,}", f"{bookings:,}", _fmt(_rate(bookings, att10), "pct")]
+        return [_name_cell(s, bold=bold, muted=muted), f"{int(att10):,}", f"{int(bookings):,}",
+                _fmt(_rate(bookings, att10), "pct")]
 
     return [
         (
@@ -702,14 +805,15 @@ def render_report_html(data: dict[str, Any], narrative: str | None) -> str:
 
     sections.append(_section("Headline Stats", _headline_table(current, previous)))
 
-    if data["segments"] and (data["segments"].get("segments") or []):
-        for title, table_html in _segment_tables(data["segments"]):
+    seg = data["segments"]
+    if seg and (seg.get("buckets") or seg.get("special")):
+        for title, table_html in _segment_tables(seg):
             sections.append(_section(title, table_html))
-        pending = data["segments"].get("pendingWebinarIds") or []
-        if pending:
+        if seg.get("special"):
             sections.append(
                 f"<div style='font-size:11px;color:{_MUTED};margin-top:4px'>"
-                f"Note: {len(pending)} webinar snapshot(s) pending — totals may undercount.</div>"
+                "Nonjoiners / No List Data are synthetic cohorts without invite attribution — "
+                "shown separately because their rates aren't comparable to bucket rates.</div>"
             )
 
     if data["variants"]:
