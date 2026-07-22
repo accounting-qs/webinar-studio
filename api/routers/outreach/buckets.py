@@ -10,13 +10,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func as sa_func, update
+from sqlalchemy import and_, or_, select, func as sa_func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, bucket_dict, compute_blocklist_counts_per_bucket, copy_dict,
+    LLOYD_USER_ID, bucket_dict, claimable_conditions,
+    compute_blocklist_counts_per_bucket, copy_dict, reuse_cutoff_to_ts,
 )
 from api.schemas import (
     BucketCreate, BucketMergeRequest, BucketUpdate, CopyBulkGenerateRequest,
@@ -24,7 +25,7 @@ from api.schemas import (
 )
 from db.models import (
     BucketCopy, BucketCopyGenerationJob, Contact, OutreachBucket,
-    WebinarListAssignment,
+    WebinarContactMembership, WebinarListAssignment,
 )
 from db.session import AsyncSessionLocal, get_db
 from services.generation import generate_bucket_copies, regenerate_bucket_copy
@@ -61,11 +62,19 @@ async def list_buckets(
     # Compute actual total/remaining from contacts table
     bucket_ids = [b.id for b in buckets]
     if bucket_ids:
+        # `remaining` is the fresh baseline — contacts never invited and not
+        # in-flight on any unsent list (assigned_membership_count = 0). This
+        # replaces the old outreach_status='available' notion now that a contact
+        # can hold memberships across several webinars. The live, reuse-filter-
+        # aware remaining is served by GET /outreach/buckets/eligible.
         count_result = await db.execute(
             select(
                 Contact.bucket_id,
                 sa_func.count().label("total"),
-                sa_func.count().filter(Contact.outreach_status == "available").label("available"),
+                sa_func.count().filter(and_(
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
+                )).label("available"),
             )
             .where(Contact.bucket_id.in_(bucket_ids))
             .group_by(Contact.bucket_id)
@@ -107,6 +116,56 @@ async def list_buckets(
         )
         for b in buckets
     ]}
+
+
+@router.get("/buckets/eligible")
+async def bucket_eligible_counts(
+    reuse_cutoff: str | None = Query(None),
+    reuse_before: str | None = Query(None),
+    webinar_id: str | None = Query(None),
+    country: list[str] | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Per-bucket claimable-remaining under the current reuse filter.
+
+    Powers the "remaining" the Planning assign panel shows above the bucket list:
+    bucket TOTAL is unchanged, but REMAINING reflects the reuse cutoff. Uses the
+    exact same predicate the claim uses (via `claimable_conditions`) so the number
+    ties out to what an assign would actually grab. Blocklisted contacts are
+    excluded; `country` mirrors the assign-form country filter.
+    """
+    from datetime import date as _date
+
+    parsed_before = None
+    if reuse_before:
+        try:
+            parsed_before = _date.fromisoformat(reuse_before)
+        except ValueError:
+            raise HTTPException(400, "reuse_before must be an ISO date (YYYY-MM-DD)")
+    cutoff_ts = reuse_cutoff_to_ts(reuse_cutoff, parsed_before)
+    claimable = claimable_conditions(cutoff_ts, webinar_id)
+
+    conds = [
+        Contact.user_id == LLOYD_USER_ID,
+        Contact.bucket_id.isnot(None),
+        Contact.is_blocklisted.is_(False),
+        *claimable,
+    ]
+    if country:
+        blank_country = or_(Contact.country.is_(None), Contact.country == "")
+        conds.append(or_(
+            Contact.country.in_(country),
+            and_(blank_country, Contact.list_location.in_(country)),
+        ))
+
+    result = await db.execute(
+        select(Contact.bucket_id, sa_func.count())
+        .where(*conds)
+        .group_by(Contact.bucket_id)
+    )
+    counts = {row[0]: int(row[1] or 0) for row in result}
+    return {"buckets": counts, "total": sum(counts.values())}
 
 
 @router.post("/buckets", status_code=201)
@@ -847,6 +906,17 @@ async def merge_buckets(
     )
     contacts_moved = contacts_moved_result.rowcount or 0
 
+    # Repoint any membership rows whose source-bucket snapshot was a merged
+    # bucket, so per-bucket membership reads follow the moved contacts.
+    await db.execute(
+        update(WebinarContactMembership)
+        .where(
+            WebinarContactMembership.bucket_id.in_(src_ids),
+            WebinarContactMembership.user_id == LLOYD_USER_ID,
+        )
+        .values(bucket_id=keeper.id)
+    )
+
     # Soft-delete source copies
     await db.execute(
         update(BucketCopy)
@@ -863,11 +933,14 @@ async def merge_buckets(
 
     await db.flush()
 
-    # Recompute keeper's counts from contacts table
+    # Recompute keeper's counts from contacts table (fresh baseline for remaining)
     count_result = await db.execute(
         select(
             sa_func.count().label("total"),
-            sa_func.count().filter(Contact.outreach_status == "available").label("available"),
+            sa_func.count().filter(and_(
+                Contact.last_invited_at.is_(None),
+                Contact.assigned_membership_count == 0,
+            )).label("available"),
         ).where(Contact.bucket_id == keeper.id)
     )
     row = count_result.one()
@@ -901,7 +974,9 @@ def _bucket_contacts_conditions(bucket_id: str, scope: str):
     `total` = every contact in the bucket; `remaining` = the available ones."""
     conds = [Contact.bucket_id == bucket_id, Contact.user_id == LLOYD_USER_ID]
     if scope == "remaining":
-        conds.append(Contact.outreach_status == "available")
+        # Fresh baseline — matches the bucket's displayed "remaining".
+        conds.append(Contact.last_invited_at.is_(None))
+        conds.append(Contact.assigned_membership_count == 0)
     return conds
 
 

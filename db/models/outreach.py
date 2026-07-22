@@ -269,6 +269,49 @@ class ContactReleaseLog(Base):
     )
 
 
+class WebinarContactMembership(Base):
+    """One row per (contact, webinar-list) — the many-to-many that lets a contact
+    be invited to multiple webinars over time, each tracked independently.
+
+    Replaces the single denormalized invitation slot on `contacts`
+    (assignment_id / outreach_status / assigned_date / used_at), which could only
+    represent one webinar at a time. `webinar_id` is denormalized onto the row so
+    the (many) webinar-scoped read paths join here directly and so a membership
+    survives its list being deleted (assignment_id → NULL, webinar_id stays).
+
+    Release = hard-DELETE the row (audit is preserved in contact_release_log), so
+    "released" literally means "not a member" and drops out of every read for free.
+    """
+    __tablename__ = "webinar_contact_memberships"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    contact_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False)
+    webinar_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("webinars.id", ondelete="CASCADE"), nullable=False)
+    assignment_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), ForeignKey("webinar_list_assignments.id", ondelete="SET NULL"))
+    # Snapshot of the source bucket at claim time (NULL for custom_list sources).
+    bucket_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), ForeignKey("outreach_buckets.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="assigned")
+    assigned_date: Mapped[Optional[datetime]] = mapped_column(Date)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        # Natural key: a contact belongs to at most one list per webinar. This is
+        # the ON CONFLICT target for the chunked-claim double-click guard, the
+        # anti-join key for "exclude contacts already in the target webinar", and
+        # it keeps webinar-scoped statistics joins 1:1 per contact.
+        UniqueConstraint("webinar_id", "contact_id", name="uq_wcm_webinar_contact"),
+        CheckConstraint("status IN ('assigned', 'used')", name="ck_wcm_status"),
+        Index("ix_wcm_assignment", "assignment_id"),
+        Index("ix_wcm_contact", "contact_id"),
+        Index("ix_wcm_webinar_status", "webinar_id", "status"),
+        Index("ix_wcm_bucket", "bucket_id"),
+        Index("ix_wcm_user", "user_id"),
+    )
+
+
 class WebinarListExportJob(Base):
     """Tracks async CSV export of a webinar's assigned-lists contacts.
 

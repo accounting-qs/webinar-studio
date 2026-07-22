@@ -754,6 +754,8 @@ export async function assignBucketToWebinar(
     countries_override?: string;
     emp_range_override?: string;
     filter_countries?: string[];
+    reuse_cutoff?: string;
+    reuse_before?: string;
   }
 ): Promise<ApiAssignment> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}/assign`, {
@@ -792,6 +794,25 @@ export async function fetchAssignCountries(
   return [...merged.entries()]
     .map(([country, count]) => ({ country, count }))
     .sort((a, b) => b.count - a.count);
+}
+
+/** Per-bucket claimable-remaining under a reuse filter. Returns { bucketId: count }.
+ *  Used by the Planning assign panel to show a reuse-aware "remaining" above the
+ *  bucket list (bucket TOTAL is unchanged; only remaining reflects the filter). */
+export async function fetchBucketEligible(
+  params: { reuse_cutoff?: string; reuse_before?: string; webinar_id?: string; country?: string[] }
+): Promise<Record<string, number>> {
+  const qs = new URLSearchParams();
+  if (params.reuse_cutoff) qs.set("reuse_cutoff", params.reuse_cutoff);
+  if (params.reuse_before) qs.set("reuse_before", params.reuse_before);
+  if (params.webinar_id) qs.set("webinar_id", params.webinar_id);
+  for (const c of params.country ?? []) qs.append("country", c);
+  const res = await fetch(`${API_URL}/outreach/buckets/eligible?${qs.toString()}`, {
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) return {};
+  const data = await res.json();
+  return data.buckets ?? {};
 }
 
 export async function updateAssignment(

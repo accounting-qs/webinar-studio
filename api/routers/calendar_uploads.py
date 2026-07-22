@@ -35,8 +35,8 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID
 from db.models import (
     CalendarAccountSender, Contact, OutreachSender, Webinar,
-    WebinarCalendarInvite, WebinarCalendarUpload, WebinarListAssignment,
-    WebinarNonjoinerInvite,
+    WebinarCalendarInvite, WebinarCalendarUpload, WebinarContactMembership,
+    WebinarListAssignment, WebinarNonjoinerInvite,
 )
 from db.session import get_db
 
@@ -1256,16 +1256,16 @@ async def _process_calendar_csv(
                             select(
                                 sa_func.lower(Contact.__table__.c.email).label("email"),
                                 Contact.__table__.c.id.label("contact_id"),
-                                WebinarListAssignment.__table__.c.id.label("assignment_id"),
+                                WebinarContactMembership.__table__.c.assignment_id.label("assignment_id"),
                             )
                             .select_from(
                                 Contact.__table__.join(
-                                    WebinarListAssignment.__table__,
-                                    Contact.__table__.c.assignment_id == WebinarListAssignment.__table__.c.id,
+                                    WebinarContactMembership.__table__,
+                                    WebinarContactMembership.__table__.c.contact_id == Contact.__table__.c.id,
                                 )
                             )
                             .where(
-                                WebinarListAssignment.__table__.c.webinar_id == webinar_id,
+                                WebinarContactMembership.__table__.c.webinar_id == webinar_id,
                                 Contact.__table__.c.user_id == LLOYD_USER_ID,
                                 sa_func.lower(Contact.__table__.c.email).in_(emails),
                             )

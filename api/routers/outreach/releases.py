@@ -16,13 +16,14 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, func as sa_func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
-from api.routers.outreach._helpers import LLOYD_USER_ID
+from api.routers.outreach._helpers import LLOYD_USER_ID, recompute_contact_caches
 from db.models import (
-    Contact, ContactReleaseLog, OutreachBucket, Webinar, WebinarListAssignment,
+    Contact, ContactReleaseLog, OutreachBucket, Webinar,
+    WebinarContactMembership, WebinarListAssignment,
 )
 from db.session import get_db
 
@@ -129,33 +130,38 @@ async def release_contacts(
     if not normalized:
         raise HTTPException(400, "No valid emails provided")
 
-    # Find every matching contact, chunked to stay under asyncpg's 32,767-param
-    # limit on a single query. We fetch only the columns we need (no full ORM
-    # load) so a 30k-row CSV doesn't materialize 30k hydrated Contact objects.
-    by_email: dict[str, list[dict]] = {}
-    assignment_id_set = set(assignment_ids)
+    # Match against THIS webinar's membership rows (not the single legacy slot),
+    # so a reused contact can be released from this webinar even though its legacy
+    # slot points at an earlier one. UNIQUE(webinar_id, contact_id) ⇒ at most one
+    # membership per email here. Keyed by lowercased email.
+    by_email: dict[str, dict] = {}
     for chunk in _chunked(normalized, _DB_CHUNK_SIZE):
         c_result = await db.execute(
             select(
-                Contact.id,
-                Contact.email,
-                Contact.outreach_status,
-                Contact.assignment_id,
-                Contact.bucket_id,
-                Contact.used_at,
-            ).where(
-                Contact.user_id == LLOYD_USER_ID,
-                Contact.email.in_(chunk),
+                WebinarContactMembership.contact_id,
+                sa_func.lower(Contact.email).label("email"),
+                WebinarContactMembership.status,
+                WebinarContactMembership.assignment_id,
+                WebinarContactMembership.bucket_id,
+                WebinarContactMembership.used_at,
+                Contact.assignment_id.label("legacy_assignment_id"),
+            )
+            .join(Contact, Contact.id == WebinarContactMembership.contact_id)
+            .where(
+                WebinarContactMembership.webinar_id == webinar_id,
+                WebinarContactMembership.user_id == LLOYD_USER_ID,
+                sa_func.lower(Contact.email).in_(chunk),
             )
         )
         for row in c_result.all():
-            by_email.setdefault(row.email, []).append({
-                "id": row.id,
-                "status": row.outreach_status,
+            by_email[row.email] = {
+                "id": row.contact_id,
+                "status": row.status,
                 "assignment_id": row.assignment_id,
                 "bucket_id": row.bucket_id,
                 "used_at": row.used_at,
-            })
+                "legacy_assignment_id": row.legacy_assignment_id,
+            }
 
     release_batch_id = body.release_batch_id or str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -166,28 +172,13 @@ async def release_contacts(
     touched_bucket_ids: set[str] = set()
     log_rows: list[dict] = []
     contact_ids_to_release: list[str] = []
+    legacy_reset_ids: list[str] = []
 
     for email in normalized:
-        candidates = by_email.get(email)
-        if not candidates:
-            not_found.append(email)
-            continue
-
-        target = next(
-            (
-                c for c in candidates
-                if c["assignment_id"] in assignment_id_set
-                and c["status"] in ("assigned", "used")
-            ),
-            None,
-        )
+        target = by_email.get(email)
         if target is None:
-            # Email exists for the user but not in this webinar's pool — either
-            # already available, or assigned/used in a different webinar.
-            if any(c["status"] == "available" for c in candidates):
-                already_available.append(email)
-            else:
-                not_found.append(email)
+            # No membership in this webinar — nothing to release here.
+            not_found.append(email)
             continue
 
         log_rows.append({
@@ -207,6 +198,11 @@ async def release_contacts(
         by_status_count[target["status"]] += 1
         if target["bucket_id"]:
             touched_bucket_ids.add(target["bucket_id"])
+        # Only reset the legacy slot when it actually represents THIS webinar's
+        # membership; a reused contact's slot points at another webinar and must
+        # be left intact.
+        if target["legacy_assignment_id"] and target["legacy_assignment_id"] == target["assignment_id"]:
+            legacy_reset_ids.append(target["id"])
 
         # `assignment.remaining` tracks "claimed but not yet marked used"
         # (mark_contacts_used decrements it). Releasing an `assigned` contact
@@ -217,9 +213,8 @@ async def release_contacts(
             if asn:
                 asn.remaining = max(0, (asn.remaining or 0) - 1)
 
-    # Bulk UPDATE all released contacts in one (or a few) statements rather
-    # than 30k individual ORM flushes.
-    for chunk in _chunked(contact_ids_to_release, _DB_CHUNK_SIZE):
+    # Legacy slot dual-write — only contacts whose slot represents this webinar.
+    for chunk in _chunked(legacy_reset_ids, _DB_CHUNK_SIZE):
         await db.execute(
             update(Contact)
             .where(Contact.id.in_(chunk))
@@ -237,17 +232,29 @@ async def release_contacts(
     for chunk in _chunked(log_rows, LOG_CHUNK):
         await db.execute(insert(ContactReleaseLog), chunk)
 
-    # Reconcile bucket.remaining_contacts from the live available count rather
-    # than incrementing — keeps the field self-healing if it ever drifts.
+    # Remove this webinar's membership rows for the released contacts (release =
+    # "never scheduled for this webinar" → drops out of its metrics and stops
+    # counting toward times_invited), then recompute the affected caches.
+    for chunk in _chunked(contact_ids_to_release, _DB_CHUNK_SIZE):
+        await db.execute(
+            delete(WebinarContactMembership).where(
+                WebinarContactMembership.webinar_id == webinar_id,
+                WebinarContactMembership.contact_id.in_(chunk),
+            )
+        )
+    await recompute_contact_caches(db, contact_ids_to_release)
+
+    # Reconcile bucket.remaining_contacts from the live fresh baseline (never
+    # invited, not in-flight) — keeps the field self-healing if it ever drifts.
     bucket_updates: dict[str, int] = {}
     if touched_bucket_ids:
-        await db.flush()  # so the status updates are visible to the count query
-        from sqlalchemy import func as sa_func
+        await db.flush()  # so the cache updates are visible to the count query
         for bucket_id in touched_bucket_ids:
             cnt_result = await db.execute(
                 select(sa_func.count()).where(
                     Contact.bucket_id == bucket_id,
-                    Contact.outreach_status == "available",
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
                 )
             )
             available_count = int(cnt_result.scalar() or 0)
@@ -337,42 +344,46 @@ async def release_contacts_by_id(
     if not contact_ids:
         raise HTTPException(400, "No contact_ids provided")
 
-    # Load contacts + their current assignment+webinar in chunked queries.
-    rows_by_id: dict[str, dict] = {}
+    scope_assignment_ids: set[str] | None = (
+        set(body.assignment_ids) if body.assignment_ids else None
+    )
+
+    # Load the membership rows for these contacts (optionally restricted to the
+    # assignment(s) the operator is viewing). The membership carries webinar_id
+    # and the authoritative status — so a reused contact is released from the
+    # viewed webinar, not whatever its legacy slot happens to point at.
+    m = WebinarContactMembership
+    mem_by_contact: dict[str, dict] = {}
     for chunk in _chunked(contact_ids, _DB_CHUNK_SIZE):
+        conds = [m.user_id == LLOYD_USER_ID, m.contact_id.in_(chunk)]
+        if scope_assignment_ids is not None:
+            conds.append(m.assignment_id.in_(scope_assignment_ids))
         c_result = await db.execute(
             select(
-                Contact.id,
-                Contact.email,
-                Contact.outreach_status,
-                Contact.assignment_id,
-                Contact.bucket_id,
-                Contact.used_at,
-                WebinarListAssignment.webinar_id,
+                m.contact_id,
+                sa_func.lower(Contact.email).label("email"),
+                m.status, m.webinar_id, m.assignment_id, m.bucket_id, m.used_at,
+                Contact.assignment_id.label("legacy_assignment_id"),
             )
-            .outerjoin(
-                WebinarListAssignment,
-                Contact.assignment_id == WebinarListAssignment.id,
-            )
-            .where(
-                Contact.user_id == LLOYD_USER_ID,
-                Contact.id.in_(chunk),
-            )
+            .join(Contact, Contact.id == m.contact_id)
+            .where(*conds)
         )
         for row in c_result.all():
-            rows_by_id[row.id] = {
-                "id": row.id,
+            # One membership per contact for the viewed page (scope narrows it).
+            mem_by_contact.setdefault(row.contact_id, {
+                "id": row.contact_id,
                 "email": row.email,
-                "status": row.outreach_status,
+                "status": row.status,
+                "webinar_id": row.webinar_id,
                 "assignment_id": row.assignment_id,
                 "bucket_id": row.bucket_id,
                 "used_at": row.used_at,
-                "webinar_id": row.webinar_id,
-            }
+                "legacy_assignment_id": row.legacy_assignment_id,
+            })
 
     # Touched assignments — load once so we can decrement remaining counters.
     touched_assignment_ids = [
-        r["assignment_id"] for r in rows_by_id.values()
+        r["assignment_id"] for r in mem_by_contact.values()
         if r["assignment_id"] and r["status"] == "assigned"
     ]
     assignments_by_id: dict[str, WebinarListAssignment] = {}
@@ -388,10 +399,6 @@ async def release_contacts_by_id(
     release_batch_id = body.release_batch_id or str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
-    scope_assignment_ids: set[str] | None = (
-        set(body.assignment_ids) if body.assignment_ids else None
-    )
-
     not_found: list[str] = []
     already_available: list[str] = []
     out_of_scope: list[str] = []
@@ -399,28 +406,13 @@ async def release_contacts_by_id(
     touched_bucket_ids: set[str] = set()
     log_rows: list[dict] = []
     contact_ids_to_release: list[str] = []
+    legacy_reset_ids: list[str] = []
 
     for cid in contact_ids:
-        row = rows_by_id.get(cid)
+        row = mem_by_contact.get(cid)
         if row is None:
+            # No membership (in scope) → nothing to release for this contact.
             not_found.append(cid)
-            continue
-        if row["status"] == "available":
-            already_available.append(cid)
-            continue
-        if row["status"] not in ("assigned", "used"):
-            not_found.append(cid)
-            continue
-        # A contact without a current webinar/assignment shouldn't reach status
-        # assigned/used in practice; skip defensively so we never insert a
-        # ContactReleaseLog row with NULL webinar_id.
-        if not row["webinar_id"]:
-            not_found.append(cid)
-            continue
-        # Visible-scope guard: ignore anything not in the assignment(s) the
-        # operator is currently viewing.
-        if scope_assignment_ids is not None and row["assignment_id"] not in scope_assignment_ids:
-            out_of_scope.append(cid)
             continue
 
         log_rows.append({
@@ -440,13 +432,16 @@ async def release_contacts_by_id(
         by_status_count[row["status"]] += 1
         if row["bucket_id"]:
             touched_bucket_ids.add(row["bucket_id"])
+        if row["legacy_assignment_id"] and row["legacy_assignment_id"] == row["assignment_id"]:
+            legacy_reset_ids.append(row["id"])
 
         if row["status"] == "assigned" and row["assignment_id"]:
             asn = assignments_by_id.get(row["assignment_id"])
             if asn:
                 asn.remaining = max(0, (asn.remaining or 0) - 1)
 
-    for chunk in _chunked(contact_ids_to_release, _DB_CHUNK_SIZE):
+    # Legacy slot reset — only where the slot represents the released membership.
+    for chunk in _chunked(legacy_reset_ids, _DB_CHUNK_SIZE):
         await db.execute(
             update(Contact)
             .where(Contact.id.in_(chunk))
@@ -462,15 +457,32 @@ async def release_contacts_by_id(
     for chunk in _chunked(log_rows, LOG_CHUNK):
         await db.execute(insert(ContactReleaseLog), chunk)
 
+    # Remove the membership rows for exactly the (contact, webinar) pairs being
+    # released (webinar_id came from each contact's viewed assignment), so a
+    # reused contact loses only the membership for THIS webinar. Then recompute
+    # the affected caches.
+    release_by_webinar: dict[str, list[str]] = {}
+    for lr in log_rows:
+        release_by_webinar.setdefault(lr["webinar_id"], []).append(lr["contact_id"])
+    for wid, cids in release_by_webinar.items():
+        for chunk in _chunked(cids, _DB_CHUNK_SIZE):
+            await db.execute(
+                delete(WebinarContactMembership).where(
+                    WebinarContactMembership.webinar_id == wid,
+                    WebinarContactMembership.contact_id.in_(chunk),
+                )
+            )
+    await recompute_contact_caches(db, contact_ids_to_release)
+
     bucket_updates: dict[str, int] = {}
     if touched_bucket_ids:
         await db.flush()
-        from sqlalchemy import func as sa_func
         for bucket_id in touched_bucket_ids:
             cnt_result = await db.execute(
                 select(sa_func.count()).where(
                     Contact.bucket_id == bucket_id,
-                    Contact.outreach_status == "available",
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
                 )
             )
             available_count = int(cnt_result.scalar() or 0)

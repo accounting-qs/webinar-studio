@@ -79,6 +79,16 @@ class Contact(Base):
     assigned_date: Mapped[Optional[datetime]] = mapped_column(Date)
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # Reusable-contacts caches, denormalized from webinar_contact_memberships and
+    # maintained at write time (like is_blocklisted). Let the reuse filter and the
+    # dashboards read per-contact invite history without scanning memberships.
+    #   assigned_membership_count — # current 'assigned' memberships (any webinar) = in-flight guard
+    #   times_invited             — # current 'used' memberships = the dashboard metric
+    #   last_invited_at           — MAX(used_at) over current 'used' memberships; NULL = never invited
+    assigned_membership_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    times_invited: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_invited_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     # Core identity
     contact_id: Mapped[Optional[str]] = mapped_column(Text)
     first_name: Mapped[Optional[str]] = mapped_column(Text)

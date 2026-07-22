@@ -8,19 +8,21 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, func as sa_func, delete, update, or_, and_
+from sqlalchemy import select, func as sa_func, delete, update, or_, and_, text as sa_text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, undefer
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, assignment_dict,
-    compute_blocklist_counts_per_assignment, copy_dict, webinar_dict,
+    LLOYD_USER_ID, assignment_dict, claimable_conditions,
+    compute_blocklist_counts_per_assignment, copy_dict,
+    recompute_contact_caches, reuse_cutoff_to_ts, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
 from db.models import (
     OutreachBucket, OutreachSender, Webinar, WebinarListAssignment, CopyUsageLog,
-    Contact, WebinarListExportJob,
+    Contact, WebinarContactMembership, WebinarListExportJob,
 )
 from db.session import AsyncSessionLocal, get_db
 
@@ -159,8 +161,20 @@ async def delete_webinar(
     if not webinar:
         raise HTTPException(404, "Webinar not found")
 
-    # Release 'assigned' contacts back to 'available' for all assignments
     assignment_ids = [a.id for a in (webinar.assignments or [])]
+    touched_bucket_ids = {a.bucket_id for a in (webinar.assignments or []) if a.bucket_id}
+
+    # Deleting the webinar treats all its invites as un-happened — every
+    # membership for this webinar is removed (webinar_id FK is ON DELETE CASCADE),
+    # so its past invites stop counting toward times_invited. Capture the affected
+    # contacts now (before the cascade) so we can recompute their caches after.
+    affected_ids = (await db.execute(
+        select(WebinarContactMembership.contact_id)
+        .where(WebinarContactMembership.webinar_id == webinar_id)
+    )).scalars().all()
+
+    # Legacy slot dual-write: release 'assigned' contacts, clear assignment_id on
+    # 'used' ones. `released` is the count of not-yet-sent contacts freed.
     total_released = 0
     if assignment_ids:
         release_result = await db.execute(
@@ -170,39 +184,36 @@ async def delete_webinar(
         )
         total_released = release_result.rowcount
 
-        # Clear assignment_id on 'used' contacts (keep status as 'used')
         await db.execute(
             update(Contact)
             .where(Contact.assignment_id.in_(assignment_ids), Contact.outreach_status == "used")
             .values(assignment_id=None)
         )
 
-    # Restore bucket remaining counts
-    if total_released > 0:
-        # Group released by bucket
-        for a in (webinar.assignments or []):
-            if a.bucket_id:
-                b_result = await db.execute(
-                    select(sa_func.count()).where(
-                        Contact.bucket_id == a.bucket_id,
-                        Contact.outreach_status == "available",
-                    )
-                )
-                actual_available = b_result.scalar() or 0
-                await db.execute(
-                    update(OutreachBucket)
-                    .where(OutreachBucket.id == a.bucket_id)
-                    .values(remaining_contacts=actual_available)
-                )
-
-    # Delete copy usage logs for all assignments
-    if assignment_ids:
         await db.execute(
             delete(CopyUsageLog).where(CopyUsageLog.assignment_id.in_(assignment_ids))
         )
 
-    # Delete webinar (CASCADE will delete assignments)
+    # Delete webinar (CASCADE deletes assignments AND memberships)
     await db.delete(webinar)
+    await db.flush()
+
+    # Recompute caches for affected contacts (their memberships are now gone) and
+    # restore each touched bucket's fresh-baseline remaining.
+    await recompute_contact_caches(db, affected_ids)
+    for bucket_id in touched_bucket_ids:
+        fresh_remaining = (await db.execute(
+            select(sa_func.count()).where(
+                Contact.bucket_id == bucket_id,
+                Contact.last_invited_at.is_(None),
+                Contact.assigned_membership_count == 0,
+            )
+        )).scalar() or 0
+        await db.execute(
+            update(OutreachBucket)
+            .where(OutreachBucket.id == bucket_id)
+            .values(remaining_contacts=fresh_remaining)
+        )
     await db.flush()
 
     return {"deleted": True, "released": total_released}
@@ -280,6 +291,14 @@ async def assign_bucket(
 
     not_blocklisted = Contact.is_blocklisted.is_(False)
 
+    # Reuse filter: fresh-only by default ("never"), or include contacts whose
+    # last sent-invite is older than the cutoff. Applied identically to the
+    # availability count and the claim so volume validation matches what gets
+    # claimed. `claimable` also excludes in-flight contacts and contacts already
+    # a member of this webinar.
+    cutoff_ts = reuse_cutoff_to_ts(getattr(body, "reuse_cutoff", None), getattr(body, "reuse_before", None))
+    claimable = claimable_conditions(cutoff_ts, webinar_id)
+
     # Optional location filter, applied identically to the availability counts and
     # the claim query so volume validation matches what gets claimed. A contact
     # matches if its per-contact `country` is in the selected set, OR — as a
@@ -314,8 +333,8 @@ async def assign_bucket(
             select(sa_func.count()).where(
                 Contact.upload_id == body.upload_id,
                 Contact.bucket_id.is_(None),
-                Contact.outreach_status == "available",
                 not_blocklisted,
+                *claimable,
                 *country_filter,
             )
         )
@@ -357,8 +376,8 @@ async def assign_bucket(
         available_count_result = await db.execute(
             select(sa_func.count()).where(
                 Contact.bucket_id == body.bucket_id,
-                Contact.outreach_status == "available",
                 not_blocklisted,
+                *claimable,
                 *country_filter,
             )
         )
@@ -437,42 +456,71 @@ async def assign_bucket(
         claim_where = (
             Contact.upload_id == body.upload_id,
             Contact.bucket_id.is_(None),
-            Contact.outreach_status == "available",
             not_blocklisted,
+            *claimable,
             *country_filter,
         )
     else:
         claim_where = (
             Contact.bucket_id == body.bucket_id,
-            Contact.outreach_status == "available",
             not_blocklisted,
+            *claimable,
             *country_filter,
         )
 
-    # Re-check `outreach_status == 'available'` on each outer UPDATE so PostgreSQL's
-    # EvalPlanQual re-evaluates against the row's current state under READ COMMITTED.
-    # Without this predicate, a concurrent assign request (double-click race) would
-    # silently overwrite the first request's assignment_id on the same rows once it
-    # acquired the row locks — leaving the first assignment with volume>0 but zero
-    # contacts attached. See https://www.postgresql.org/docs/current/transaction-iso.html
+    # Claim by inserting one membership per contact into this webinar's list.
+    # UNIQUE(webinar_id, contact_id) + ON CONFLICT DO NOTHING makes a double-click
+    # race idempotent (the second request inserts 0). Bumping
+    # assigned_membership_count on the just-claimed rows drops them out of the
+    # next chunk's `claimable` candidate set (they're no longer in-flight-free),
+    # the membership-model analog of the old outreach_status re-check. The legacy
+    # single-slot columns are dual-written only for still-fresh contacts (guarded
+    # WHERE outreach_status='available') so reused contacts keep their prior
+    # 'used' slot for any read path not yet migrated to memberships.
+    membership_source_bucket = body.bucket_id if not is_custom_list else None
     CLAIM_CHUNK = 5000
     claimed = 0
     while claimed < body.volume:
         chunk_limit = min(CLAIM_CHUNK, body.volume - claimed)
-        chunk_subq = select(Contact.id).where(*claim_where).limit(chunk_limit)
-        chunk_result = await db.execute(
-            update(Contact)
-            .where(
-                Contact.id.in_(chunk_subq),
-                Contact.outreach_status == "available",
+        candidate_ids = (await db.execute(
+            select(Contact.id).where(*claim_where).limit(chunk_limit)
+        )).scalars().all()
+        if not candidate_ids:
+            break
+        inserted_ids = (await db.execute(
+            pg_insert(WebinarContactMembership)
+            .values([
+                {
+                    "user_id": LLOYD_USER_ID,
+                    "contact_id": cid,
+                    "webinar_id": webinar_id,
+                    "assignment_id": assignment.id,
+                    "bucket_id": membership_source_bucket,
+                    "status": "assigned",
+                    "assigned_date": webinar.date,
+                }
+                for cid in candidate_ids
+            ])
+            .on_conflict_do_nothing(index_elements=["webinar_id", "contact_id"])
+            .returning(WebinarContactMembership.contact_id)
+        )).scalars().all()
+        n = len(inserted_ids)
+        if n:
+            await db.execute(
+                update(Contact)
+                .where(Contact.id.in_(inserted_ids))
+                .values(assigned_membership_count=Contact.assigned_membership_count + 1)
             )
-            .values(
-                assignment_id=assignment.id,
-                outreach_status="assigned",
-                assigned_date=webinar.date,
+            # Legacy slot dual-write — fresh contacts only.
+            await db.execute(
+                update(Contact)
+                .where(Contact.id.in_(inserted_ids), Contact.outreach_status == "available")
+                .values(
+                    assignment_id=assignment.id,
+                    outreach_status="assigned",
+                    assigned_date=webinar.date,
+                )
             )
-        )
-        n = chunk_result.rowcount or 0
         claimed += n
         if n < chunk_limit:
             # Fewer rows than requested → the bucket/list is exhausted (or a concurrent
@@ -498,9 +546,20 @@ async def assign_bucket(
         assignment.remaining = claimed
         await db.flush()
 
-    # Update bucket remaining counter (only for bucket assignments)
+    # Update bucket remaining counter (only for bucket assignments) to the fresh
+    # baseline — never-invited, not-in-flight contacts. Recomputed from live
+    # counts rather than `available_count - claimed`, since available_count was
+    # the reuse-filtered pool (may include previously-used contacts) and doesn't
+    # equal the fresh remaining.
     if bucket:
-        bucket.remaining_contacts = max(0, available_count - claimed)
+        fresh_remaining = (await db.execute(
+            select(sa_func.count()).where(
+                Contact.bucket_id == bucket.id,
+                Contact.last_invited_at.is_(None),
+                Contact.assigned_membership_count == 0,
+            )
+        )).scalar() or 0
+        bucket.remaining_contacts = fresh_remaining
 
     # Log copy usage
     if title_copy:
@@ -552,7 +611,15 @@ async def assign_countries(
     else:
         source_where = (Contact.bucket_id == bucket_id,)
 
-    base_where = (*source_where, Contact.outreach_status == "available", not_blocklisted)
+    # Country options reflect the fresh baseline (never invited, not in-flight) —
+    # the default "fresh only" pool. The claim still applies the chosen country
+    # filter to whatever reuse cutoff is active.
+    base_where = (
+        *source_where,
+        Contact.last_invited_at.is_(None),
+        Contact.assigned_membership_count == 0,
+        not_blocklisted,
+    )
 
     # Per-contact countries.
     country_res = await db.execute(
@@ -630,30 +697,54 @@ async def delete_assignment(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    # Release 'assigned' contacts back to 'available' (not 'used' — those stay used)
-    release_result = await db.execute(
+    # Contacts touched by this assignment (for cache recompute).
+    affected_ids = (await db.execute(
+        select(WebinarContactMembership.contact_id)
+        .where(WebinarContactMembership.assignment_id == assignment_id)
+    )).scalars().all()
+
+    # Delete the 'assigned' (not-yet-sent) memberships — these contacts are
+    # released. 'used' memberships are KEPT so those contacts stay in the
+    # webinar's stats; the assignment FK is ON DELETE SET NULL, so deleting the
+    # assignment below nulls their assignment_id while preserving webinar_id.
+    # (We must explicitly delete the 'assigned' ones — the cascade would only
+    # SET NULL them, leaving an orphan in-flight membership.)
+    released = (await db.execute(
+        delete(WebinarContactMembership).where(
+            WebinarContactMembership.assignment_id == assignment_id,
+            WebinarContactMembership.status == "assigned",
+        )
+    )).rowcount or 0
+
+    # Legacy slot dual-write (existing behavior): release 'assigned' contacts,
+    # clear assignment_id on 'used' ones.
+    await db.execute(
         update(Contact)
         .where(Contact.assignment_id == assignment_id, Contact.outreach_status == "assigned")
         .values(assignment_id=None, outreach_status="available", assigned_date=None)
     )
-    released = release_result.rowcount
-
-    # Clear assignment_id on 'used' contacts too (assignment is being deleted)
-    # but keep their outreach_status as 'used'
     await db.execute(
         update(Contact)
         .where(Contact.assignment_id == assignment_id, Contact.outreach_status == "used")
         .values(assignment_id=None)
     )
 
-    # Restore bucket remaining — only the released (previously assigned, not yet used) ones
+    await recompute_contact_caches(db, affected_ids)
+
+    # Restore bucket remaining to the fresh baseline.
     bucket_id = assignment.bucket_id
     bucket_remaining = None
-    if bucket_id and released > 0:
+    if bucket_id:
         b_result = await db.execute(select(OutreachBucket).where(OutreachBucket.id == bucket_id))
         bucket = b_result.scalar_one_or_none()
         if bucket:
-            bucket.remaining_contacts += released
+            bucket.remaining_contacts = (await db.execute(
+                select(sa_func.count()).where(
+                    Contact.bucket_id == bucket.id,
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
+                )
+            )).scalar() or 0
             bucket_remaining = bucket.remaining_contacts
 
     # Delete usage logs + assignment in parallel deletes
@@ -735,26 +826,35 @@ async def get_assignment_contacts(
         raise HTTPException(404, "Assignment not found")
 
     not_blocklisted = Contact.is_blocklisted.is_(False)
+    m = WebinarContactMembership
 
-    q = select(Contact).where(
-        Contact.assignment_id == assignment_id,
-        Contact.user_id == LLOYD_USER_ID,
-        not_blocklisted,
+    # Membership rows scope which contacts belong to THIS assignment; status /
+    # used_at come from the membership (a contact may be in other webinars too).
+    q = (
+        select(Contact, m.status, m.used_at)
+        .join(m, m.contact_id == Contact.id)
+        .where(
+            m.assignment_id == assignment_id,
+            Contact.user_id == LLOYD_USER_ID,
+            not_blocklisted,
+        )
     )
     if status != "all":
-        q = q.where(Contact.outreach_status == status)
+        q = q.where(m.status == status)
     q = q.order_by(Contact.first_name, Contact.email)
 
     result = await db.execute(q)
-    contacts = result.scalars().all()
+    rows = result.all()
 
     # Count by status for the filter badges — excludes blocklisted
     count_result = await db.execute(
-        select(Contact.outreach_status, sa_func.count()).where(
-            Contact.assignment_id == assignment_id,
+        select(m.status, sa_func.count())
+        .join(Contact, Contact.id == m.contact_id)
+        .where(
+            m.assignment_id == assignment_id,
             Contact.user_id == LLOYD_USER_ID,
             not_blocklisted,
-        ).group_by(Contact.outreach_status)
+        ).group_by(m.status)
     )
     counts = {row[0]: row[1] for row in count_result}
 
@@ -782,10 +882,10 @@ async def get_assignment_contacts(
                 "id": c.id,
                 "email": c.email,
                 "first_name": c.first_name,
-                "outreach_status": c.outreach_status,
-                "used_at": c.used_at.isoformat() if c.used_at else None,
+                "outreach_status": m_status,
+                "used_at": m_used_at.isoformat() if m_used_at else None,
             }
-            for c in contacts
+            for (c, m_status, m_used_at) in rows
         ],
         "counts": {
             "assigned": counts.get("assigned", 0),
@@ -818,7 +918,21 @@ async def mark_contacts_used(
         raise HTTPException(404, "Assignment not found")
 
     now = datetime.now(timezone.utc)
-    result = await db.execute(
+    # Mark this assignment's memberships used (authoritative) — an invite was sent.
+    used_ids = (await db.execute(
+        update(WebinarContactMembership)
+        .where(
+            WebinarContactMembership.assignment_id == assignment_id,
+            WebinarContactMembership.contact_id.in_(body.contact_ids),
+            WebinarContactMembership.status == "assigned",
+        )
+        .values(status="used", used_at=now)
+        .returning(WebinarContactMembership.contact_id)
+    )).scalars().all()
+    marked = len(used_ids)
+    # Legacy slot dual-write — only contacts whose slot still points at this
+    # assignment (fresh-origin); reused contacts keep their prior slot.
+    await db.execute(
         update(Contact)
         .where(
             Contact.id.in_(body.contact_ids),
@@ -828,8 +942,8 @@ async def mark_contacts_used(
         )
         .values(outreach_status="used", used_at=now)
     )
-    marked = result.rowcount or 0
     if marked:
+        await recompute_contact_caches(db, used_ids)
         assignment.remaining = max(0, (assignment.remaining or 0) - marked)
     await db.flush()
 
@@ -885,30 +999,33 @@ async def get_group_contacts(
         raise HTTPException(404, "One or more assignments not found")
 
     not_blocklisted = Contact.is_blocklisted.is_(False)
+    m = WebinarContactMembership
 
     q = (
-        select(Contact)
+        select(Contact, m.status, m.used_at)
+        .join(m, m.contact_id == Contact.id)
         .where(
-            Contact.assignment_id.in_(assignment_ids),
+            m.assignment_id.in_(assignment_ids),
             Contact.user_id == LLOYD_USER_ID,
             not_blocklisted,
         )
     )
     if status != "all":
-        q = q.where(Contact.outreach_status == status)
+        q = q.where(m.status == status)
     q = q.order_by(Contact.first_name, Contact.email).limit(limit).offset(offset)
 
     result = await db.execute(q)
-    contacts = result.scalars().all()
+    rows = result.all()
 
     count_result = await db.execute(
-        select(Contact.outreach_status, sa_func.count())
+        select(m.status, sa_func.count())
+        .join(Contact, Contact.id == m.contact_id)
         .where(
-            Contact.assignment_id.in_(assignment_ids),
+            m.assignment_id.in_(assignment_ids),
             Contact.user_id == LLOYD_USER_ID,
             not_blocklisted,
         )
-        .group_by(Contact.outreach_status)
+        .group_by(m.status)
     )
     counts = {row[0]: row[1] for row in count_result}
 
@@ -940,10 +1057,10 @@ async def get_group_contacts(
                 "id": c.id,
                 "email": c.email,
                 "first_name": c.first_name,
-                "outreach_status": c.outreach_status,
-                "used_at": c.used_at.isoformat() if c.used_at else None,
+                "outreach_status": m_status,
+                "used_at": m_used_at.isoformat() if m_used_at else None,
             }
-            for c in contacts
+            for (c, m_status, m_used_at) in rows
         ],
         "counts": {
             "assigned": counts.get("assigned", 0),
@@ -953,7 +1070,7 @@ async def get_group_contacts(
         "pagination": {
             "limit": limit,
             "offset": offset,
-            "returned": len(contacts),
+            "returned": len(rows),
             "filtered_total": filtered_total,
         },
     }
@@ -998,22 +1115,24 @@ async def stream_group_contacts_csv(
         csv.writer(header_buf).writerow(["email", "first_name", "list_name", "outreach_status", "used_at"])
         yield header_buf.getvalue()
 
+        m = WebinarContactMembership
         q = (
             select(
                 Contact.email,
                 Contact.first_name,
-                Contact.assignment_id,
-                Contact.outreach_status,
-                Contact.used_at,
+                m.assignment_id,
+                m.status,
+                m.used_at,
             )
+            .join(m, m.contact_id == Contact.id)
             .where(
-                Contact.assignment_id.in_(assignment_ids),
+                m.assignment_id.in_(assignment_ids),
                 Contact.user_id == LLOYD_USER_ID,
                 not_blocklisted,
             )
         )
         if status != "all":
-            q = q.where(Contact.outreach_status == status)
+            q = q.where(m.status == status)
         q = q.order_by(Contact.first_name, Contact.email).execution_options(yield_per=2000)
 
         buf = io.StringIO()
@@ -1059,31 +1178,40 @@ async def mark_group_contacts_used(
 
     now = datetime.now(timezone.utc)
 
-    # Find the contacts (filtered by user) and their source assignments before
-    # the update so we know which assignment counters to decrement.
-    src_result = await db.execute(
-        select(Contact.id, Contact.assignment_id)
+    # Mark this user's 'assigned' memberships for these contacts as used
+    # (authoritative), capturing which assignment each belonged to so we can
+    # decrement its remaining counter.
+    rows = (await db.execute(
+        update(WebinarContactMembership)
         .where(
-            Contact.id.in_(body.contact_ids),
+            WebinarContactMembership.user_id == LLOYD_USER_ID,
+            WebinarContactMembership.contact_id.in_(body.contact_ids),
+            WebinarContactMembership.status == "assigned",
+        )
+        .values(status="used", used_at=now)
+        .returning(WebinarContactMembership.contact_id, WebinarContactMembership.assignment_id)
+    )).all()
+    if not rows:
+        return {"marked": 0, "by_assignment": {}}
+
+    used_ids = [r.contact_id for r in rows]
+    marked = len(used_ids)
+    per_assignment: dict[str, int] = {}
+    for r in rows:
+        if r.assignment_id:
+            per_assignment[r.assignment_id] = per_assignment.get(r.assignment_id, 0) + 1
+
+    # Legacy slot dual-write — fresh-origin contacts only.
+    await db.execute(
+        update(Contact)
+        .where(
+            Contact.id.in_(used_ids),
             Contact.user_id == LLOYD_USER_ID,
             Contact.outreach_status == "assigned",
         )
-    )
-    rows = src_result.all()
-    target_ids = [r.id for r in rows]
-    if not target_ids:
-        return {"marked": 0, "by_assignment": {}}
-
-    per_assignment: dict[str, int] = {}
-    for r in rows:
-        per_assignment[r.assignment_id] = per_assignment.get(r.assignment_id, 0) + 1
-
-    update_result = await db.execute(
-        update(Contact)
-        .where(Contact.id.in_(target_ids))
         .values(outreach_status="used", used_at=now)
     )
-    marked = update_result.rowcount or 0
+    await recompute_contact_caches(db, used_ids)
 
     # Decrement each affected assignment's remaining counter atomically in the
     # same transaction. Bound at zero to mirror the single-assignment endpoint.
@@ -1165,15 +1293,17 @@ async def _run_webinar_list_export_job(job_id: str) -> None:
 
             total = 0
             if list_name_by_aid:
+                m = WebinarContactMembership
                 stream = await db.stream(
-                    select(Contact.email, Contact.assignment_id)
+                    select(Contact.email, m.assignment_id)
+                    .join(m, m.contact_id == Contact.id)
                     .where(
-                        Contact.assignment_id.in_(list(list_name_by_aid.keys())),
+                        m.assignment_id.in_(list(list_name_by_aid.keys())),
                         Contact.user_id == job.user_id,
-                        Contact.outreach_status.in_(("assigned", "used")),
+                        m.status.in_(("assigned", "used")),
                         Contact.email.is_not(None),
                     )
-                    .order_by(Contact.assignment_id, Contact.email)
+                    .order_by(m.assignment_id, Contact.email)
                     .execution_options(yield_per=5000)
                 )
                 async for email, aid in stream:

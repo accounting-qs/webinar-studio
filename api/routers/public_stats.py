@@ -62,7 +62,8 @@ async def contact_counts(
             select(sa_func.count())
             .select_from(Contact)
             .where(
-                Contact.outreach_status == "available",
+                Contact.last_invited_at.is_(None),
+                Contact.assigned_membership_count == 0,
                 Contact.bucket_id.in_(non_dq_bucket_ids),
             )
         )

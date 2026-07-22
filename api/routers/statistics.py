@@ -491,7 +491,11 @@ async def list_name_distribution(
 
         if assignment is not None:
             scope = "assignment"
-            from_where = "FROM contacts c WHERE c.assignment_id = CAST(:aid AS uuid)"
+            from_where = (
+                "FROM contacts c "
+                "JOIN webinar_contact_memberships m ON m.contact_id = c.id "
+                "WHERE m.assignment_id = CAST(:aid AS uuid)"
+            )
             params: dict = {"aid": assignment}
             resp_webinar_id = w.id if w else None
             resp_webinar_number = w.number if w else None
@@ -507,8 +511,8 @@ async def list_name_distribution(
             resp_webinar_number = w.number
             from_where = (
                 "FROM contacts c "
-                "JOIN webinar_list_assignments wla ON c.assignment_id = wla.id "
-                "WHERE wla.webinar_id = CAST(:wid AS uuid) AND wla.bucket_id = CAST(:bid AS uuid)"
+                "JOIN webinar_contact_memberships m ON m.contact_id = c.id "
+                "WHERE m.webinar_id = CAST(:wid AS uuid) AND m.bucket_id = CAST(:bid AS uuid)"
             )
             params = {"wid": w.id, "bid": bucket}
         else:
@@ -523,8 +527,8 @@ async def list_name_distribution(
             resp_webinar_number = w.number
             from_where = (
                 "FROM contacts c "
-                "JOIN webinar_list_assignments wla ON c.assignment_id = wla.id "
-                "WHERE wla.webinar_id = CAST(:wid AS uuid)"
+                "JOIN webinar_contact_memberships m ON m.contact_id = c.id "
+                "WHERE m.webinar_id = CAST(:wid AS uuid)"
             )
             params = {"wid": w.id}
 

@@ -1,16 +1,116 @@
 """
 Shared constants and serialization helpers for outreach sub-routers.
 """
-from sqlalchemy import and_, func as sa_func, select, update
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import and_, func as sa_func, or_, select, text as sa_text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
     BucketCopy, Contact, OutreachBucket, OutreachSender,
-    Webinar, WebinarListAssignment,
+    Webinar, WebinarContactMembership, WebinarListAssignment,
 )
 
 # Hardcoded to Lloyd's user_id — single-tenant for now
 LLOYD_USER_ID = "9baf8117-db65-4f30-87a5-a76cf4f23d82"
+
+
+# ── Reusable-contacts helpers ─────────────────────────────────────────────
+#
+# Invitation state lives in webinar_contact_memberships (one row per contact ↔
+# webinar-list). Three cache columns on contacts are denormalized from it and
+# maintained at write time so the reuse filter / dashboards never scan the
+# junction: assigned_membership_count, times_invited, last_invited_at.
+
+# Bounded set of contact ids per cache-reconcile statement (mirrors the claim /
+# blocklist chunking, well under the 120s statement_timeout).
+_CACHE_CHUNK_SIZE = 5000
+
+# Preset reuse cutoffs → how far back "last invited" must be. "never" (or None)
+# means fresh-only (no reusable contacts). Keep in sync with the Planning UI.
+_REUSE_PRESETS: dict[str, timedelta] = {
+    "1d": timedelta(days=1),
+    "3d": timedelta(days=3),
+    "1w": timedelta(weeks=1),
+    "2w": timedelta(weeks=2),
+    "1mo": timedelta(days=30),
+    "2mo": timedelta(days=60),
+    "3mo": timedelta(days=90),
+    "6mo": timedelta(days=180),
+}
+
+
+def reuse_cutoff_to_ts(reuse_cutoff: str | None, reuse_before=None) -> datetime | None:
+    """Map a reuse-filter selection to the cutoff timestamp `T`.
+
+    Returns None for fresh-only ("never"/None/"fresh") — the claimable pool is
+    then just never-invited contacts. Otherwise contacts whose last invite is
+    older than `T` become reusable. `reuse_before` (a date/datetime) supports the
+    custom "invited before <date>" option and wins when provided.
+    """
+    if reuse_before is not None:
+        if isinstance(reuse_before, datetime):
+            return reuse_before if reuse_before.tzinfo else reuse_before.replace(tzinfo=timezone.utc)
+        # a date → midnight UTC
+        return datetime(reuse_before.year, reuse_before.month, reuse_before.day, tzinfo=timezone.utc)
+    if not reuse_cutoff or reuse_cutoff in ("never", "fresh", "fresh_only"):
+        return None
+    delta = _REUSE_PRESETS.get(reuse_cutoff)
+    if delta is None:
+        return None
+    return datetime.now(timezone.utc) - delta
+
+
+def claimable_conditions(cutoff_ts: datetime | None, target_webinar_id: str | None):
+    """WHERE predicates (list) for the reuse-aware claimable pool.
+
+    A contact is claimable when it is not in-flight on any unsent list and either
+    is fresh (never invited) or its last invite is older than the cutoff — and,
+    when a target webinar is given, it is not already a member of that webinar.
+    Blocklist and per-source (bucket/upload) predicates are applied by the caller.
+    """
+    conds = [Contact.assigned_membership_count == 0]
+    if cutoff_ts is None:
+        conds.append(Contact.last_invited_at.is_(None))
+    else:
+        conds.append(or_(
+            Contact.last_invited_at.is_(None),
+            Contact.last_invited_at < cutoff_ts,
+        ))
+    if target_webinar_id is not None:
+        conds.append(~select(WebinarContactMembership.id).where(
+            WebinarContactMembership.contact_id == Contact.id,
+            WebinarContactMembership.webinar_id == target_webinar_id,
+        ).exists())
+    return conds
+
+
+async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> None:
+    """Full reconcile of the three cache columns from memberships for these ids.
+
+    Self-healing (sets 0/0/NULL where a contact has no memberships), so callers
+    can invoke it after any membership mutation without off-by-one bookkeeping.
+    Chunked to stay under the statement timeout. Does NOT commit/flush.
+    """
+    ids = [c for c in dict.fromkeys(contact_ids) if c]
+    if not ids:
+        return
+    for i in range(0, len(ids), _CACHE_CHUNK_SIZE):
+        chunk = ids[i : i + _CACHE_CHUNK_SIZE]
+        await db.execute(sa_text(
+            "UPDATE contacts c SET "
+            "  assigned_membership_count = COALESCE(agg.a, 0), "
+            "  times_invited = COALESCE(agg.u, 0), "
+            "  last_invited_at = agg.mx "
+            "FROM unnest(CAST(:ids AS uuid[])) AS k(cid) "
+            "LEFT JOIN LATERAL ( "
+            "  SELECT count(*) FILTER (WHERE m.status='assigned') AS a, "
+            "         count(*) FILTER (WHERE m.status='used') AS u, "
+            "         max(m.used_at) FILTER (WHERE m.status='used') AS mx "
+            "  FROM webinar_contact_memberships m WHERE m.contact_id = k.cid "
+            ") agg ON true "
+            "WHERE c.id = k.cid"
+        ), {"ids": chunk})
 
 
 # ── Blocklist helpers ─────────────────────────────────────────────────────
@@ -62,16 +162,21 @@ async def compute_blocklist_counts_per_bucket(
     """Return {bucket_id: {"total": N, "available": M}} of blocklisted contacts.
 
     - total: blocklisted contacts in the bucket, any status.
-    - available: blocklisted contacts still in outreach_status='available'.
+    - available: blocklisted contacts still fresh (never invited, not in-flight)
+      — matches the bucket "remaining" fresh baseline.
     """
     if not bucket_ids:
         return {}
+    _fresh = and_(
+        Contact.last_invited_at.is_(None),
+        Contact.assigned_membership_count == 0,
+    )
     result = await db.execute(
         select(
             Contact.bucket_id,
             sa_func.count().filter(Contact.is_blocklisted).label("total"),
             sa_func.count().filter(
-                and_(Contact.outreach_status == "available", Contact.is_blocklisted)
+                and_(_fresh, Contact.is_blocklisted)
             ).label("available"),
         )
         .where(Contact.bucket_id.in_(bucket_ids), Contact.is_blocklisted)
@@ -89,20 +194,22 @@ async def compute_blocklist_counts_per_assignment(
     """Return {assignment_id: {"total": N, "assigned": M}} of blocklisted contacts.
 
     - total: blocklisted contacts ever claimed by the assignment (any status).
-    - assigned: blocklisted contacts still in outreach_status='assigned'.
+    - assigned: blocklisted contacts still in membership status 'assigned'.
     """
     if not assignment_ids:
         return {}
+    m = WebinarContactMembership
     result = await db.execute(
         select(
-            Contact.assignment_id,
+            m.assignment_id,
             sa_func.count().filter(Contact.is_blocklisted).label("total"),
             sa_func.count().filter(
-                and_(Contact.outreach_status == "assigned", Contact.is_blocklisted)
+                and_(m.status == "assigned", Contact.is_blocklisted)
             ).label("assigned"),
         )
-        .where(Contact.assignment_id.in_(assignment_ids), Contact.is_blocklisted)
-        .group_by(Contact.assignment_id)
+        .join(Contact, Contact.id == m.contact_id)
+        .where(m.assignment_id.in_(assignment_ids), Contact.is_blocklisted)
+        .group_by(m.assignment_id)
     )
     return {
         row.assignment_id: {"total": row.total or 0, "assigned": row.assigned or 0}

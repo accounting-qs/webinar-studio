@@ -14,6 +14,7 @@ import {
   downloadWebinarListExport,
   fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
   fetchAssignCountries,
+  fetchBucketEligible,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
   type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
   type AssignCountry,
@@ -932,6 +933,16 @@ export function PlanningPage() {
   // Empty = no filter. `assignAvailCountries` are the options for the selected source.
   const [assignFilterCountries, setAssignFilterCountries] = useState<string[]>([]);
   const [assignAvailCountries, setAssignAvailCountries] = useState<AssignCountry[]>([]);
+  // Reuse filter (shown above the bucket list). "never" = fresh contacts only
+  // (the default, same as before). Other values also include contacts whose last
+  // sent-invite is older than the cutoff. `assignEligible` holds the reuse-aware
+  // per-bucket "remaining" the panel shows; bucket TOTAL is unchanged.
+  const [assignReuseCutoff, setAssignReuseCutoff] = useState<string>("never");
+  // Custom "invited before <date>" (ISO yyyy-mm-dd); used when cutoff === "custom".
+  const [assignReuseBefore, setAssignReuseBefore] = useState<string>("");
+  const [assignEligible, setAssignEligible] = useState<Record<string, number>>({});
+  // Bumped after an assign so the reuse-aware remaining refetches.
+  const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
   const [assignSendPerAcct, setAssignSendPerAcct] = useState(0);
   const [assignDays, setAssignDays] = useState(5);
@@ -948,6 +959,34 @@ export function PlanningPage() {
       .catch(() => { if (!cancelled) setAssignAvailCountries([]); });
     return () => { cancelled = true; };
   }, [assignSource, assignTab]);
+
+  // Reuse-aware per-bucket "remaining": refetched whenever the reuse cutoff, the
+  // country filter, or the webinar being assigned changes. Only meaningful while
+  // an assign panel is open. When cutoff = "never" this equals the fresh baseline
+  // already on each bucket, so the panel falls back to bucket.remaining_contacts.
+  useEffect(() => {
+    if (!assigningWebinarId) { setAssignEligible({}); return; }
+    // Custom mode needs a date before it can query.
+    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible({}); return; }
+    let cancelled = false;
+    fetchBucketEligible({
+      reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
+      reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
+      webinar_id: assigningWebinarId,
+      country: assignFilterCountries.length ? assignFilterCountries : undefined,
+    })
+      .then((m) => { if (!cancelled) setAssignEligible(m); })
+      .catch(() => { if (!cancelled) setAssignEligible({}); });
+    return () => { cancelled = true; };
+  }, [assigningWebinarId, assignReuseCutoff, assignReuseBefore, assignFilterCountries, eligibleRefresh]);
+
+  // Reuse-aware remaining for a bucket: the eligible count under the current
+  // filter if we have it, else the bucket's stored fresh remaining.
+  const bucketRemaining = useCallback(
+    (b: { id: string; remaining_contacts: number }) =>
+      assignEligible[b.id] ?? b.remaining_contacts,
+    [assignEligible],
+  );
 
   // Full option set for the filter: countries present in the source (with counts,
   // shown first) followed by every other country so any location is selectable/searchable.
@@ -1063,6 +1102,9 @@ export function PlanningPage() {
       setAssignAccounts(0);
       setAssignSendPerAcct(0);
       setAssignDays(5);
+      setAssignReuseCutoff("never");
+      setAssignReuseBefore("");
+      setAssignEligible({});
       // Load custom lists
       fetchCustomLists().then(({ lists }) => setCustomLists(lists)).catch(() => {});
     }
@@ -1338,7 +1380,8 @@ export function PlanningPage() {
     } else {
       const bucket = buckets.find((b) => b.id === assignBucket);
       if (!bucket) return;
-      const volume = Math.min(assignVolume, bucket.remaining_contacts);
+      // Cap to the reuse-aware eligible remaining (falls back to fresh baseline).
+      const volume = Math.min(assignVolume, bucketRemaining(bucket));
       const countries = assignCountries || (bucket.countries || []).join(", ");
       const empRange = assignEmpRange || bucket.emp_range || "";
       requestData = {
@@ -1351,6 +1394,8 @@ export function PlanningPage() {
         countries_override: countries,
         emp_range_override: empRange,
         filter_countries: filterCountries,
+        reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
+        reuse_before: assignReuseCutoff === "custom" ? (assignReuseBefore || undefined) : undefined,
       };
     }
 
@@ -1370,6 +1415,9 @@ export function PlanningPage() {
         setBuckets((prev) => prev.map((b) =>
           b.id === assignBucket ? { ...b, remaining_contacts: assignment.bucket_remaining! } : b
         ));
+        // Refetch the reuse-aware eligible counts (a reuse claim can also consume
+        // previously-invited contacts, which the stored fresh remaining doesn't reflect).
+        setEligibleRefresh((n) => n + 1);
       }
 
       // Refresh custom lists if we assigned from one
@@ -2278,11 +2326,53 @@ export function PlanningPage() {
                               </div>
                             </div>
                             {assignTab === "buckets" ? (
-                              <span className="text-[10px] text-zinc-500">{buckets.filter((b) => b.remaining_contacts > 0).length} buckets available · {buckets.reduce((s, b) => s + (b.remaining_contacts || 0), 0).toLocaleString()} contacts</span>
+                              <span className="text-[10px] text-zinc-500">{buckets.filter((b) => bucketRemaining(b) > 0).length} buckets available · {buckets.reduce((s, b) => s + (bucketRemaining(b) || 0), 0).toLocaleString()} contacts</span>
                             ) : (
                               <span className="text-[10px] text-zinc-500">{customLists.length} custom lists available</span>
                             )}
                           </div>
+
+                          {/* Assignment form — reuse filter (above the bucket list).
+                              Controls which contacts are eligible: fresh-only by
+                              default, or also those last invited before the cutoff.
+                              Bucket TOTAL is unchanged; only "remaining" reflects this. */}
+                          {assignTab === "buckets" && (
+                            <div className="flex items-end gap-3 mb-2">
+                              <div className="w-72">
+                                <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Contacts to include</label>
+                                <Dropdown
+                                  value={assignReuseCutoff}
+                                  onChange={setAssignReuseCutoff}
+                                  options={[
+                                    { value: "never", label: "Fresh only (never invited)" },
+                                    { value: "1w", label: "+ invited over 1 week ago" },
+                                    { value: "2w", label: "+ invited over 2 weeks ago" },
+                                    { value: "1mo", label: "+ invited over 1 month ago" },
+                                    { value: "2mo", label: "+ invited over 2 months ago" },
+                                    { value: "3mo", label: "+ invited over 3 months ago" },
+                                    { value: "6mo", label: "+ invited over 6 months ago" },
+                                    { value: "custom", label: "+ invited before a date…" },
+                                  ]}
+                                />
+                              </div>
+                              {assignReuseCutoff === "custom" && (
+                                <div className="w-44">
+                                  <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Invited before</label>
+                                  <input
+                                    type="date"
+                                    value={assignReuseBefore}
+                                    onChange={(e) => setAssignReuseBefore(e.target.value)}
+                                    className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                                  />
+                                </div>
+                              )}
+                              <span className="text-[10px] text-zinc-500 mt-4">
+                                {assignReuseCutoff === "never"
+                                  ? "Only contacts never invited"
+                                  : "Includes previously-invited contacts past the cutoff"}
+                              </span>
+                            </div>
+                          )}
 
                           {/* Assignment form — row 1: source + sender + volume */}
                           <div className="flex items-end gap-3 mb-2">
@@ -2297,7 +2387,7 @@ export function PlanningPage() {
                                   setAssignBucket(val);
                                   const b = buckets.find((b) => b.id === val);
                                   if (b) {
-                                    let vol = b.remaining_contacts;
+                                    let vol = bucketRemaining(b);
                                     setAssignCountries((b.countries || []).join(", "));
                                     setAssignEmpRange(b.emp_range || "");
                                     setAssignAccounts(0);
@@ -2315,9 +2405,9 @@ export function PlanningPage() {
                                     setAssignVolume(vol);
                                   }
                                 }}
-                                options={buckets.filter((b) => b.remaining_contacts > 0).map((b) => ({
+                                options={buckets.filter((b) => bucketRemaining(b) > 0).map((b) => ({
                                   value: b.id,
-                                  label: `${b.name} (${b.remaining_contacts.toLocaleString()} remaining)`,
+                                  label: `${b.name} (${bucketRemaining(b).toLocaleString()} remaining)`,
                                   badge: b.copies_count.titles > 0 && b.copies_count.descriptions > 0 ? "Copy ✓" : undefined,
                                   dot: b.quality ? QUALITY_DOT[b.quality] : undefined,
                                 }))}
@@ -2483,9 +2573,9 @@ export function PlanningPage() {
                                 <>
                                   <thead>
                                     {(() => {
-                                      const availBuckets = buckets.filter((b) => b.remaining_contacts > 0 && !isDisqualifiedBucket(b));
+                                      const availBuckets = buckets.filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b));
                                       const totalSum = availBuckets.reduce((s, b) => s + b.total_contacts, 0);
-                                      const remainSum = availBuckets.reduce((s, b) => s + b.remaining_contacts, 0);
+                                      const remainSum = availBuckets.reduce((s, b) => s + bucketRemaining(b), 0);
                                       return (
                                         <tr className="bg-zinc-100 dark:bg-zinc-800/40">
                                           <th className="text-left px-3 py-1.5 text-zinc-500 font-medium">Bucket <span className="text-zinc-400 font-normal">{availBuckets.length}</span></th>
@@ -2497,7 +2587,7 @@ export function PlanningPage() {
                                   </thead>
                                   <tbody className="divide-y divide-zinc-800/20">
                                     {buckets
-                                      .filter((b) => b.remaining_contacts > 0)
+                                      .filter((b) => bucketRemaining(b) > 0)
                                       .slice()
                                       .sort((a, b) => Number(isDisqualifiedBucket(a)) - Number(isDisqualifiedBucket(b)))
                                       .map((b) => (
@@ -2506,7 +2596,7 @@ export function PlanningPage() {
                                         setAssignCountries((b.countries || []).join(", "));
                                         setAssignEmpRange(b.emp_range || "");
                                         setAssignAccounts(0);
-                                        let vol = b.remaining_contacts;
+                                        let vol = bucketRemaining(b);
                                         if (assignSender) {
                                           const s = senders.find((s) => s.id === assignSender);
                                           if (s) {
@@ -2530,7 +2620,7 @@ export function PlanningPage() {
                                           </span>
                                         </td>
                                         <td className="px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400">{b.total_contacts.toLocaleString()}</td>
-                                        <td className="px-3 py-1.5 text-right font-mono text-violet-400">{b.remaining_contacts.toLocaleString()}</td>
+                                        <td className="px-3 py-1.5 text-right font-mono text-violet-400">{bucketRemaining(b).toLocaleString()}</td>
                                       </tr>
                                     ))}
                                   </tbody>

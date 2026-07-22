@@ -25,7 +25,7 @@ from sqlalchemy.orm import selectinload
 
 from db.models import (
     Contact, GHLContact, GHLWebinarStats, OutreachSender, Webinar,
-    WebinarGeekSubscriber, WebinarListAssignment,
+    WebinarContactMembership, WebinarGeekSubscriber, WebinarListAssignment,
 )
 from db.session import AsyncSessionLocal
 
@@ -302,17 +302,15 @@ async def _webinar_summary_from_app(
     row = result.one()
     list_size = int(row.list_size) if row.list_size is not None else 0
 
-    # actuallyUsed: live count of contacts marked sent (outreach_status='used')
-    # for any assignment of this webinar. Released contacts go back to
-    # 'available' and disappear from this count, so plan/actual diverge by
-    # the released amount.
+    # actuallyUsed: live count of memberships marked sent (status='used') for this
+    # webinar. Released contacts have their membership deleted and disappear from
+    # this count, so plan/actual diverge by the released amount.
     used_result = await db.execute(
         select(func.count())
-        .select_from(Contact)
-        .join(WebinarListAssignment, WebinarListAssignment.id == Contact.assignment_id)
+        .select_from(WebinarContactMembership)
         .where(
-            WebinarListAssignment.webinar_id == webinar_id,
-            Contact.outreach_status == "used",
+            WebinarContactMembership.webinar_id == webinar_id,
+            WebinarContactMembership.status == "used",
         )
     )
     actually_used = int(used_result.scalar() or 0)
@@ -862,8 +860,8 @@ class GoHighLevelStatisticsSource:
             nj_planned AS (
                 SELECT DISTINCT LOWER(c.email) AS email
                 FROM contacts c
-                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-                WHERE wla.webinar_id = ANY(CAST(:nj_planned_wids AS uuid[]))
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                WHERE m.webinar_id = ANY(CAST(:nj_planned_wids AS uuid[]))
                   AND c.email IS NOT NULL
             )
             SELECT s.email
@@ -1153,8 +1151,8 @@ class GoHighLevelStatisticsSource:
             planned AS (
                 SELECT DISTINCT LOWER(c.email) AS email
                 FROM contacts c
-                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-                WHERE wla.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
                   AND c.email IS NOT NULL
             ),
             unplanned AS (
@@ -1247,8 +1245,8 @@ class GoHighLevelStatisticsSource:
                 planned AS (
                     SELECT DISTINCT LOWER(c.email) AS email
                     FROM contacts c
-                    JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-                    WHERE wla.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
+                    JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                    WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
                       AND c.email IS NOT NULL
                 )
                 SELECT
@@ -1296,8 +1294,8 @@ class GoHighLevelStatisticsSource:
                         WITH planned AS (
                             SELECT DISTINCT LOWER(c.email) AS email
                             FROM contacts c
-                            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-                            WHERE wla.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
+                            JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                            WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
                               AND c.email IS NOT NULL
                         )
                         SELECT
@@ -1410,12 +1408,12 @@ class GoHighLevelStatisticsSource:
         # when contacts are released back to the bucket pool, while volume
         # (planned) stays the same so plan vs. actual stays comparable.
         used_q = await db.execute(
-            select(Contact.assignment_id, func.count())
+            select(WebinarContactMembership.assignment_id, func.count())
             .where(
-                Contact.assignment_id.in_([a.id for a in assignments]),
-                Contact.outreach_status == "used",
+                WebinarContactMembership.assignment_id.in_([a.id for a in assignments]),
+                WebinarContactMembership.status == "used",
             )
-            .group_by(Contact.assignment_id)
+            .group_by(WebinarContactMembership.assignment_id)
         )
         for aid, cnt in used_q.all():
             if str(aid) in out:
@@ -1470,7 +1468,7 @@ class GoHighLevelStatisticsSource:
         ghl_sql = f"""
             {csv_cte_prefix}
             SELECT
-                c.assignment_id,
+                m.assignment_id,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {yes_pred}) AS yes_marked,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {maybe_pred}) AS maybe_marked,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE g.calendar_webinar_series_history ~* :series_re) AS gcal_invited_ghl,
@@ -1480,10 +1478,10 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE ({window_filter_marker}) AND g.booked_call_webinar_series = :N) AS self_reg_bookings,
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {unsub_filter}) AS unsubscribes
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
-            WHERE wla.webinar_id = CAST(:wid AS uuid)
-            GROUP BY c.assignment_id
+            WHERE m.webinar_id = CAST(:wid AS uuid)
+            GROUP BY m.assignment_id
         """
         r = await db.execute(sa_text(ghl_sql).bindparams(**ghl_params))
         for row in r.mappings().all():
@@ -1521,7 +1519,7 @@ class GoHighLevelStatisticsSource:
             wg_sql = f"""
                 {csv_cte_prefix}
                 SELECT
-                    c.assignment_id,
+                    m.assignment_id,
                     COUNT(DISTINCT LOWER(c.email)) AS total_regs,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT}) AS total_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 10) AS total_10m,
@@ -1536,12 +1534,12 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM contacts c
-                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
                 JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)
-                WHERE wla.webinar_id = CAST(:wid AS uuid)
+                WHERE m.webinar_id = CAST(:wid AS uuid)
                   AND wgs.broadcast_id = :bid
-                GROUP BY c.assignment_id
+                GROUP BY m.assignment_id
             """
             r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
             for row in r.mappings().all():
@@ -1570,7 +1568,7 @@ class GoHighLevelStatisticsSource:
         qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
         opp_sql = f"""
             SELECT
-                c.assignment_id,
+                m.assignment_id,
                 COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
@@ -1585,12 +1583,12 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
             JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE wla.webinar_id = CAST(:wid AS uuid)
+            WHERE m.webinar_id = CAST(:wid AS uuid)
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
-            GROUP BY c.assignment_id
+            GROUP BY m.assignment_id
         """
         r = await db.execute(sa_text(opp_sql).bindparams(
             wid=wid, N=N,
@@ -1682,8 +1680,9 @@ class GoHighLevelStatisticsSource:
         inv_sql = f"""
             SELECT {lln_expr} AS lln, COUNT(DISTINCT LOWER(c.email)) AS invited
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
             GROUP BY 1
         """
         r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
@@ -1703,10 +1702,11 @@ class GoHighLevelStatisticsSource:
                         AND wgs.minutes_viewing >= 10
                     ) AS total_10m
                 FROM contacts c
-                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
                 JOIN webinargeek_subscribers wgs
                     ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
-                WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
                 GROUP BY 1
             """
             r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
@@ -1736,10 +1736,11 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             GROUP BY 1
         """
@@ -1818,8 +1819,9 @@ class GoHighLevelStatisticsSource:
         inv_sql = f"""
             SELECT {bucket_expr} AS bucket, COUNT(DISTINCT LOWER(c.email)) AS invited
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
-            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
             GROUP BY 1
         """
         r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
@@ -1839,10 +1841,11 @@ class GoHighLevelStatisticsSource:
                         AND wgs.minutes_viewing >= 10
                     ) AS total_10m
                 FROM contacts c
-                JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
                 JOIN webinargeek_subscribers wgs
                     ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
-                WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
                 GROUP BY 1
             """
             r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
@@ -1870,10 +1873,11 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
             FROM contacts c
-            JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+            JOIN webinar_contact_memberships m ON m.contact_id = c.id
+            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE wla.webinar_id = CAST(:wid AS uuid) AND {cold}
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             GROUP BY 1
         """

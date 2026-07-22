@@ -3,7 +3,7 @@ the per-metric contacts drill-down endpoint.
 
 Each metric maps to a set of SQL WHERE clauses (and optional extra JOINs)
 applied against a base query that filters to contacts belonging to a
-specific webinar (via contacts.assignment_id -> webinar_list_assignments).
+specific webinar (via webinar_contact_memberships.webinar_id).
 """
 from __future__ import annotations
 
@@ -25,11 +25,11 @@ class MetricSpec:
     The base query for any metric is:
         SELECT ...
         FROM contacts c
-        JOIN webinar_list_assignments wla ON c.assignment_id = wla.id
+        JOIN webinar_contact_memberships m ON m.contact_id = c.id
         JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
         [+ wgs join if needs_wg]
         [+ opp join if needs_opp]
-        WHERE wla.webinar_id = :wid
+        WHERE m.webinar_id = :wid
           AND [assignment filter if any]
           AND [all where_clauses joined by AND]
 
@@ -226,7 +226,10 @@ def build_contacts_query(
 
     Returns (sql, params).
     """
-    joins = ["JOIN webinar_list_assignments wla ON c.assignment_id = wla.id",
+    # Membership rows scope contacts to this webinar (a contact may belong to
+    # several webinars now). UNIQUE(webinar_id, contact_id) keeps this 1 row per
+    # contact, so the DISTINCT semantics below are unchanged.
+    joins = ["JOIN webinar_contact_memberships m ON m.contact_id = c.id",
              "JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)"]
     if spec.needs_wg:
         joins.append("LEFT JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)")
@@ -234,12 +237,12 @@ def build_contacts_query(
         joins.append("JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id")
         joins.append("LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id")
 
-    wheres = ["wla.webinar_id = CAST(:webinar_id AS uuid)"]
+    wheres = ["m.webinar_id = CAST(:webinar_id AS uuid)"]
     wheres.extend(f"({w})" for w in spec.where_clauses)
 
     params = {"webinar_id": webinar_id, "limit": limit, **spec.params}
     if assignment_id:
-        wheres.append("c.assignment_id = CAST(:assignment_id AS uuid)")
+        wheres.append("m.assignment_id = CAST(:assignment_id AS uuid)")
         params["assignment_id"] = assignment_id
 
     # Select distinct contact info + optional opp info
@@ -268,7 +271,7 @@ def build_contacts_query(
             c.first_name,
             c.last_name,
             c.company_website,
-            c.assignment_id
+            m.assignment_id
         """
     else:
         select = """
@@ -284,7 +287,7 @@ def build_contacts_query(
             c.first_name,
             c.last_name,
             c.company_website,
-            c.assignment_id
+            m.assignment_id
         """
 
     sql = f"""

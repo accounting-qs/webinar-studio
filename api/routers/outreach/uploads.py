@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func as sa_func, update, delete
+from sqlalchemy import and_, select, func as sa_func, update, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy import pool
@@ -221,7 +221,10 @@ async def list_custom_lists(
             select(
                 Contact.upload_id,
                 sa_func.count().label("total"),
-                sa_func.count().filter(Contact.outreach_status == "available").label("available"),
+                sa_func.count().filter(and_(
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
+                )).label("available"),
             )
             .where(Contact.upload_id.in_(upload_ids))
             .group_by(Contact.upload_id)
@@ -1428,9 +1431,10 @@ async def _process_csv_import(
                         select(
                             Contact.__table__.c.bucket_id,
                             sa_func.count(Contact.__table__.c.id).label("total"),
-                            sa_func.count(Contact.__table__.c.id).filter(
-                                Contact.__table__.c.outreach_status == "available"
-                            ).label("available"),
+                            sa_func.count(Contact.__table__.c.id).filter(and_(
+                                Contact.__table__.c.last_invited_at.is_(None),
+                                Contact.__table__.c.assigned_membership_count == 0,
+                            )).label("available"),
                         )
                         .where(Contact.__table__.c.user_id == LLOYD_USER_ID,
                                Contact.__table__.c.bucket_id.in_(touched_bucket_ids))

@@ -19,6 +19,7 @@ from db.models.outreach import (  # noqa: F401
     OutreachBucket, BucketCopy, OutreachSender,
     Webinar, WebinarListAssignment, CopyUsageLog,
     BucketCopyGenerationJob, ContactReleaseLog, WebinarListExportJob,
+    WebinarContactMembership,
 )
 from db.models.uploads import (  # noqa: F401
     UploadHistory, ContactCustomField, Contact,

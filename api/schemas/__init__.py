@@ -124,6 +124,16 @@ class AssignRequest(BaseModel):
     # The frontend expands region shortcuts (Europe / USA / Canada) into concrete
     # country strings before sending, so this is always a flat list of countries.
     filter_countries: list[str] | None = None
+    # Reuse filter (Planning page, chosen above the bucket list). Controls which
+    # contacts are eligible to claim:
+    #   None / "never" / "fresh"  → fresh only (never invited) — the default,
+    #                               reproduces the pre-reuse behavior exactly.
+    #   "1d","3d","1w","2w","1mo","2mo","3mo","6mo" → also include contacts whose
+    #                               last sent-invite is older than that.
+    # `reuse_before` (a date) is the custom "invited before <date>" option and
+    # takes precedence over `reuse_cutoff` when set.
+    reuse_cutoff: str | None = None
+    reuse_before: datetime.date | None = None
 
 class AssignmentUpdate(BaseModel):
     title_copy_id: str | None = None
