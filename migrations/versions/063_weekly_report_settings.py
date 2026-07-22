@@ -14,13 +14,13 @@ New singleton table report_settings (id=1, seeded on first read):
 - last_error    TEXT        — last failure message, cleared on success
 
 Revision ID: 063
-Revises: 062
+Revises: 061
 """
 from alembic import op
 
 
 revision = "063"
-down_revision = "062"
+down_revision = "061"
 branch_labels = None
 depends_on = None
 
