@@ -51,6 +51,7 @@ PROVIDER = "webinargeek"
 OPENAI_PROVIDER = "openai"
 GHL_PROVIDER = "ghl"
 ANTHROPIC_PROVIDER = "anthropic"
+RESEND_PROVIDER = "resend"
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +480,64 @@ async def delete_anthropic_credential(db: AsyncSession = Depends(get_db)):
     await db.execute(
         delete(ConnectorCredential).where(
             ConnectorCredential.provider == ANTHROPIC_PROVIDER,
+            ConnectorCredential.name == "default",
+        )
+    )
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Resend credentials (used by the weekly report emailer)
+# ---------------------------------------------------------------------------
+@router.get("/resend", response_model=CredentialStatus)
+async def get_resend_status(db: AsyncSession = Depends(get_db)):
+    """Status of the Resend credential. Single 'default' row — matches
+    the Anthropic pattern. Used by the weekly webinar report sender."""
+    row = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.provider == RESEND_PROVIDER,
+            ConnectorCredential.name == "default",
+        )
+    )).scalar_one_or_none()
+    if not row:
+        return CredentialStatus(configured=False)
+    return CredentialStatus(configured=True, api_key_masked=_mask(row.api_key))
+
+
+@router.put("/resend", response_model=CredentialStatus)
+async def set_resend_credential(body: SetCredentialRequest, db: AsyncSession = Depends(get_db)):
+    api_key = body.api_key.strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    # Validate with the cheapest Resend call (list domains). 401/403 means the
+    # key is bad; other errors are transient and bubble as 502 so the user can
+    # retry rather than store a key we can't confirm.
+    from integrations import resend_client
+    try:
+        valid = await resend_client.verify_key(api_key)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to verify key: {exc}")
+    if not valid:
+        raise HTTPException(status_code=400, detail="Invalid Resend API key")
+
+    stmt = pg_insert(ConnectorCredential).values(
+        provider=RESEND_PROVIDER,
+        name="default",
+        api_key=api_key,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["provider", "name"],
+        set_={"api_key": api_key, "updated_at": datetime.now(timezone.utc)},
+    )
+    await db.execute(stmt)
+    return CredentialStatus(configured=True, api_key_masked=_mask(api_key))
+
+
+@router.delete("/resend")
+async def delete_resend_credential(db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        delete(ConnectorCredential).where(
+            ConnectorCredential.provider == RESEND_PROVIDER,
             ConnectorCredential.name == "default",
         )
     )

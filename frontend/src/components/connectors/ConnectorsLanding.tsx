@@ -7,10 +7,12 @@ import {
   fetchOpenAiStatus,
   fetchAnthropicStatus,
   fetchGhlConnectorStatus,
+  fetchResendStatus,
   type WgCredentialStatus,
   type OpenAiCredentialStatus,
   type AnthropicCredentialStatus,
   type GhlCredentialStatus,
+  type ResendCredentialStatus,
 } from "@/lib/api";
 
 type Status = "connected" | "not_connected" | "loading";
@@ -20,6 +22,7 @@ export function ConnectorsLanding() {
   const [openai, setOpenai] = useState<Status>("loading");
   const [anthropic, setAnthropic] = useState<Status>("loading");
   const [ghl, setGhl] = useState<Status>("loading");
+  const [resend, setResend] = useState<Status>("loading");
 
   useEffect(() => {
     fetchWgStatus()
@@ -34,6 +37,9 @@ export function ConnectorsLanding() {
     fetchGhlConnectorStatus()
       .then((s: GhlCredentialStatus) => setGhl(s.configured ? "connected" : "not_connected"))
       .catch(() => setGhl("not_connected"));
+    fetchResendStatus()
+      .then((s: ResendCredentialStatus) => setResend(s.configured ? "connected" : "not_connected"))
+      .catch(() => setResend("not_connected"));
   }, []);
 
   return (
@@ -74,6 +80,17 @@ export function ConnectorsLanding() {
           icon={
             <svg className="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          }
+        />
+        <ConnectorCard
+          href="/connectors/resend"
+          name="Resend"
+          description="Sends the weekly webinar report emails scheduled on the Reports page."
+          status={resend}
+          icon={
+            <svg className="w-5 h-5 text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
           }
         />
