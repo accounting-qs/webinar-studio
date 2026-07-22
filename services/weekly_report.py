@@ -351,22 +351,30 @@ Metric conventions: keys ending in Percent are FRACTIONS (0.031 = 3.1%);
 /1k metrics are per 1000 invited.
 
 Write the weekly report narrative as plain text (no markdown, no HTML) in
-exactly three sections, each opened by its header line:
+exactly four sections, each opened by its header line (exact words, all caps):
+
+FLAGS
+0-3 bullet lines starting with "- ": anomalies that need attention — a metric
+far outside its normal range, a sharp week-over-week drop, or a data artifact
+(e.g. a 100% rate on 1-2 contacts, a bucket with implausible numbers). If
+nothing is anomalous, output exactly "- none".
 
 HIGHLIGHTS
-3-5 bullet lines starting with "- ": the numbers that matter this week and how
-they moved vs the previous webinar (say direction + magnitude, e.g. "+0.8pp").
+3-5 bullet lines: the numbers that matter this week and how they moved vs the
+previous webinar (say direction + magnitude, e.g. "+0.8pp").
 
 MEANINGFUL CHANGES
 2-4 bullet lines: differences that look real (not noise) across segments,
 A/B variants, copies or senders. Name the segment/variant/copy/sender.
 
-RECOMMENDATIONS
-2-4 bullet lines: what to improve, change, close out or watch next week.
-Be concrete and tie each to a number. If sample sizes are small, say so
-instead of over-claiming.
+ACTIONS
+3-5 bullet lines: concrete improvement ideas for next week — what to test or
+change (copy angle, segment mix, sender allocation, invite volume), what to
+scale up because it's working, what to close out or stop, and what to watch.
+Tie each to a number. If sample sizes are small, say so instead of
+over-claiming.
 
-Keep the whole thing under 250 words. Numbers with at most 1 decimal."""
+Keep the whole thing under 300 words. Numbers with at most 1 decimal."""
 
 
 async def generate_narrative(data: dict[str, Any]) -> str | None:
@@ -485,6 +493,8 @@ def _webinar_label(w: dict[str, Any] | None) -> str:
 def _headline_table(current: dict[str, Any], previous: dict[str, Any] | None) -> str:
     cur_m = current.get("summary") or {}
     prev_m = (previous or {}).get("summary") or {}
+    cur_col = f"W{current.get('number')} <span style='color:{_GREEN};font-size:10px'>(latest)</span>"
+    prev_col = f"W{previous.get('number')}" if previous else "Previous"
     rows = []
     for key, label, fmt in _HEADLINE_METRICS:
         rows.append([
@@ -493,61 +503,145 @@ def _headline_table(current: dict[str, Any], previous: dict[str, Any] | None) ->
             _fmt(prev_m.get(key), fmt) if previous else "—",
             _fmt_delta(cur_m.get(key), prev_m.get(key), fmt, key) if previous else "—",
         ])
-    return _table(["Metric", "This webinar", "Previous", "Δ"], rows)
+    return _table(["Metric", cur_col, prev_col, "Δ"], rows)
 
 
-def _narrative_html(narrative: str) -> str:
-    """Render the plain-text narrative: header lines bold, '- ' lines as bullets."""
-    parts: list[str] = []
+_NARRATIVE_HEADERS = ("FLAGS", "HIGHLIGHTS", "MEANINGFUL CHANGES", "ACTIONS")
+
+
+def _parse_narrative(narrative: str) -> dict[str, list[str]]:
+    """Split the model's plain-text output into {section: [bullet, ...]}."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
     for line in narrative.splitlines():
         line = line.strip()
         if not line:
             continue
-        if line.startswith("- "):
-            parts.append(
-                f"<div style='font-size:13px;margin:2px 0 2px 14px'>• {_esc(line[2:])}</div>"
-            )
-        else:
-            parts.append(
-                f"<div style='font-size:13px;font-weight:700;margin:10px 0 4px'>{_esc(line)}</div>"
-            )
+        upper = line.rstrip(":").upper()
+        if upper in _NARRATIVE_HEADERS:
+            current = upper
+            sections[current] = []
+            continue
+        if current is None:
+            continue
+        sections[current].append(line[2:] if line.startswith("- ") else line)
+    return sections
+
+
+def _bullet(text: str, color: str = "#111827") -> str:
+    return (
+        f"<div style='font-size:13px;line-height:1.5;margin:0 0 6px 0;color:{color}'>"
+        f"<span style='color:{_MUTED}'>&bull;&nbsp;</span>{_esc(text)}</div>"
+    )
+
+
+def _flags_box(flags: list[str]) -> str:
+    """Amber anomaly-flags callout, shown at the top when the AI raises any."""
+    real = [f for f in flags if f.strip().lower() not in ("none", "- none")]
+    if not real:
+        return ""
+    bullets = "".join(
+        f"<div style='font-size:13px;line-height:1.5;margin:0 0 6px 0;color:#92400e'>&#9888;&#65039;&nbsp;{_esc(f)}</div>"
+        for f in real
+    )
+    return (
+        "<div style='border:1px solid #f59e0b66;background:#fffbeb;border-radius:8px;"
+        "padding:12px 16px;margin:0 0 18px 0'>"
+        "<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:#b45309;"
+        "text-transform:uppercase;margin-bottom:8px'>Anomaly Flags</div>"
+        f"{bullets}</div>"
+    )
+
+
+def _summary_card(sections: dict[str, list[str]]) -> str:
+    """Highlights / meaningful changes / actions as one clean card."""
+    blocks: list[str] = []
+    styling = [
+        ("HIGHLIGHTS", "Highlights", "#4f46e5"),
+        ("MEANINGFUL CHANGES", "Meaningful Changes", "#0891b2"),
+        ("ACTIONS", "Actions for Next Week", "#16a34a"),
+    ]
+    for key, title, color in styling:
+        bullets = sections.get(key) or []
+        if not bullets:
+            continue
+        blocks.append(
+            f"<div style='font-size:11px;font-weight:700;letter-spacing:1px;color:{color};"
+            f"text-transform:uppercase;margin:14px 0 8px 0'>{title}</div>"
+            + "".join(_bullet(b) for b in bullets)
+        )
+    if not blocks:
+        return ""
+    inner = "".join(blocks).replace("margin:14px 0 8px 0", "margin:0 0 8px 0", 1)
     return (
         "<div style='border:1px solid %s;border-left:4px solid #4f46e5;"
-        "border-radius:6px;padding:12px 16px;margin:6px 0'>%s</div>"
-        % (_BORDER, "".join(parts))
+        "border-radius:8px;padding:14px 18px;margin:6px 0'>%s</div>"
+        % (_BORDER, inner)
     )
 
 
-def _segments_table(segments: dict[str, Any]) -> str:
-    rows = []
+def _segment_tables(segments: dict[str, Any]) -> list[tuple[str, str]]:
+    """Three ranked views of the same bucket rows: registrations, attendance,
+    bookings — each sorted best-first on its own metric."""
     seg_rows = list(segments.get("segments") or [])
     totals = segments.get("totals")
-    if totals:
-        seg_rows.append(totals)
-    for s in seg_rows:
-        invites = s.get("invites") or 0
-        regs = s.get("regs") or 0
-        att10 = s.get("attendees10m") or 0
-        bookings = s.get("bookings") or 0
+
+    def _name_cell(s: dict[str, Any], bold: bool = False) -> str:
         name = s.get("bucketName") or "—"
-        is_total = name == "Total"
-        style_name = f"<b>{_esc(name)}</b>" if is_total else _esc(name)
+        cell = f"<b>{_esc(name)}</b>" if bold else _esc(name)
         quality = s.get("quality")
-        if quality and not is_total:
-            style_name += f" <span style='color:{_MUTED};font-size:11px'>({_esc(quality)})</span>"
-        rows.append([
-            style_name,
-            f"{invites:,}",
-            f"{regs:,}",
-            _fmt(regs / invites if invites else None, "pct"),
-            f"{att10:,}",
-            f"{bookings:,}",
-            _fmt(bookings / att10 if att10 else None, "pct"),
-        ])
-    return _table(
-        ["Bucket", "Invites", "Regs", "Inv>Reg %", "10m+", "Bookings", "Book/10m %"],
-        rows,
-    )
+        if quality and not bold:
+            cell += f" <span style='color:{_MUTED};font-size:11px'>({_esc(quality)})</span>"
+        return cell
+
+    def _rate(a: float, b: float) -> float | None:
+        return a / b if b else None
+
+    def _build(headers: list[str], row_fn, sort_key) -> str:
+        ranked = sorted(seg_rows, key=sort_key, reverse=True)
+        rows = [row_fn(s, False) for s in ranked]
+        if totals:
+            rows.append(row_fn(totals, True))
+        return _table(headers, rows)
+
+    def _reg_row(s: dict[str, Any], bold: bool) -> list[str]:
+        inv, regs = s.get("invites") or 0, s.get("regs") or 0
+        return [_name_cell(s, bold), f"{inv:,}", f"{regs:,}", _fmt(_rate(regs, inv), "pct")]
+
+    def _att_row(s: dict[str, Any], bold: bool) -> list[str]:
+        regs, att10 = s.get("regs") or 0, s.get("attendees10m") or 0
+        return [_name_cell(s, bold), f"{regs:,}", f"{att10:,}", _fmt(_rate(att10, regs), "pct")]
+
+    def _book_row(s: dict[str, Any], bold: bool) -> list[str]:
+        att10, bookings = s.get("attendees10m") or 0, s.get("bookings") or 0
+        return [_name_cell(s, bold), f"{att10:,}", f"{bookings:,}", _fmt(_rate(bookings, att10), "pct")]
+
+    return [
+        (
+            "Segments — by Registrations",
+            _build(
+                ["Bucket", "Invites", "Regs", "Inv>Reg %"],
+                _reg_row,
+                lambda s: (_rate(s.get("regs") or 0, s.get("invites") or 0) or 0, s.get("regs") or 0),
+            ),
+        ),
+        (
+            "Segments — by Attendance",
+            _build(
+                ["Bucket", "Regs", "10m+", "Att 10m+ %"],
+                _att_row,
+                lambda s: (_rate(s.get("attendees10m") or 0, s.get("regs") or 0) or 0, s.get("attendees10m") or 0),
+            ),
+        ),
+        (
+            "Segments — by Bookings",
+            _build(
+                ["Bucket", "10m+", "Bookings", "Book/10m %"],
+                _book_row,
+                lambda s: (s.get("bookings") or 0, _rate(s.get("bookings") or 0, s.get("attendees10m") or 0) or 0),
+            ),
+        ),
+    ]
 
 
 def _group_table(groups: list[dict[str, Any]], first_col: str) -> str:
@@ -598,19 +692,25 @@ def render_report_html(data: dict[str, Any], narrative: str | None) -> str:
     sections.append(header)
 
     if narrative:
-        sections.append(_section("Summary &amp; Recommendations", _narrative_html(narrative)))
+        parsed = _parse_narrative(narrative)
+        flags_html = _flags_box(parsed.get("FLAGS") or [])
+        if flags_html:
+            sections.append(flags_html)
+        summary_html = _summary_card(parsed)
+        if summary_html:
+            sections.append(_section("Summary &amp; Actions", summary_html))
 
     sections.append(_section("Headline Stats", _headline_table(current, previous)))
 
     if data["segments"] and (data["segments"].get("segments") or []):
-        seg_html = _segments_table(data["segments"])
+        for title, table_html in _segment_tables(data["segments"]):
+            sections.append(_section(title, table_html))
         pending = data["segments"].get("pendingWebinarIds") or []
         if pending:
-            seg_html += (
+            sections.append(
                 f"<div style='font-size:11px;color:{_MUTED};margin-top:4px'>"
                 f"Note: {len(pending)} webinar snapshot(s) pending — totals may undercount.</div>"
             )
-        sections.append(_section("Segment Performance", seg_html))
 
     if data["variants"]:
         sections.append(_section("A/B Variants", _variants_table(data["variants"])))
@@ -688,7 +788,10 @@ async def send_weekly_report(*, test: bool = False, webinar_id: str | None = Non
     html = render_report_html(data, narrative)
 
     current = data["current"]
-    subject = f"Weekly Webinar Report — W{current.get('number')}"
+    # ASCII-only subject: non-ASCII chars (em dashes etc.) get RFC2047-encoded
+    # in the header, which trips Gmail's "abnormal characters" spoof warning
+    # on a young sending domain.
+    subject = f"Weekly Webinar Report - W{current.get('number')}"
     if current.get("date"):
         subject += f" ({current['date']})"
     if test:
