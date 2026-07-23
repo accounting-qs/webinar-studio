@@ -61,17 +61,28 @@ def reuse_cutoff_to_ts(reuse_cutoff: str | None, reuse_before=None) -> datetime 
     return datetime.now(timezone.utc) - delta
 
 
-def claimable_conditions(cutoff_ts: datetime | None, target_webinar_id: str | None):
+def claimable_conditions(
+    cutoff_ts: datetime | None,
+    target_webinar_id: str | None,
+    reuse_only: bool = False,
+):
     """WHERE predicates (list) for the reuse-aware claimable pool.
 
     A contact is claimable when it is not in-flight on any unsent list and either
     is fresh (never invited) or its last invite is older than the cutoff — and,
     when a target webinar is given, it is not already a member of that webinar.
-    Blocklist and per-source (bucket/upload) predicates are applied by the caller.
+    With `reuse_only` (and a cutoff), fresh contacts are EXCLUDED: only contacts
+    whose last invite is older than the cutoff qualify. Blocklist and per-source
+    (bucket/upload) predicates are applied by the caller.
     """
     conds = [Contact.assigned_membership_count == 0]
     if cutoff_ts is None:
+        # Fresh-only. reuse_only without a cutoff would be the empty set, so it
+        # is ignored here (the UI hides the checkbox for "never").
         conds.append(Contact.last_invited_at.is_(None))
+    elif reuse_only:
+        conds.append(Contact.last_invited_at.isnot(None))
+        conds.append(Contact.last_invited_at < cutoff_ts)
     else:
         conds.append(or_(
             Contact.last_invited_at.is_(None),

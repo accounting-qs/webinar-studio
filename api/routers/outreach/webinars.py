@@ -297,7 +297,7 @@ async def assign_bucket(
     # claimed. `claimable` also excludes in-flight contacts and contacts already
     # a member of this webinar.
     cutoff_ts = reuse_cutoff_to_ts(getattr(body, "reuse_cutoff", None), getattr(body, "reuse_before", None))
-    claimable = claimable_conditions(cutoff_ts, webinar_id)
+    claimable = claimable_conditions(cutoff_ts, webinar_id, reuse_only=bool(getattr(body, "reuse_only", False)))
 
     # Optional location filter, applied identically to the availability counts and
     # the claim query so volume validation matches what gets claimed. A contact

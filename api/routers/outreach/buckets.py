@@ -122,6 +122,7 @@ async def list_buckets(
 async def bucket_eligible_counts(
     reuse_cutoff: str | None = Query(None),
     reuse_before: str | None = Query(None),
+    reuse_only: bool = Query(False),
     webinar_id: str | None = Query(None),
     country: list[str] | None = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -144,7 +145,7 @@ async def bucket_eligible_counts(
         except ValueError:
             raise HTTPException(400, "reuse_before must be an ISO date (YYYY-MM-DD)")
     cutoff_ts = reuse_cutoff_to_ts(reuse_cutoff, parsed_before)
-    claimable = claimable_conditions(cutoff_ts, webinar_id)
+    claimable = claimable_conditions(cutoff_ts, webinar_id, reuse_only=reuse_only)
 
     conds = [
         Contact.user_id == LLOYD_USER_ID,

@@ -756,6 +756,7 @@ export async function assignBucketToWebinar(
     filter_countries?: string[];
     reuse_cutoff?: string;
     reuse_before?: string;
+    reuse_only?: boolean;
   }
 ): Promise<ApiAssignment> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}/assign`, {
@@ -800,11 +801,12 @@ export async function fetchAssignCountries(
  *  Used by the Planning assign panel to show a reuse-aware "remaining" above the
  *  bucket list (bucket TOTAL is unchanged; only remaining reflects the filter). */
 export async function fetchBucketEligible(
-  params: { reuse_cutoff?: string; reuse_before?: string; webinar_id?: string; country?: string[] }
+  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[] }
 ): Promise<Record<string, number>> {
   const qs = new URLSearchParams();
   if (params.reuse_cutoff) qs.set("reuse_cutoff", params.reuse_cutoff);
   if (params.reuse_before) qs.set("reuse_before", params.reuse_before);
+  if (params.reuse_only) qs.set("reuse_only", "true");
   if (params.webinar_id) qs.set("webinar_id", params.webinar_id);
   for (const c of params.country ?? []) qs.append("country", c);
   const res = await fetch(`${API_URL}/outreach/buckets/eligible?${qs.toString()}`, {

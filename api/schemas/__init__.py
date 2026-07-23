@@ -134,6 +134,9 @@ class AssignRequest(BaseModel):
     # takes precedence over `reuse_cutoff` when set.
     reuse_cutoff: str | None = None
     reuse_before: datetime.date | None = None
+    # With a cutoff: claim ONLY previously-invited contacts past the cutoff,
+    # excluding fresh (never-invited) ones. Ignored for "never"/fresh-only.
+    reuse_only: bool = False
 
 class AssignmentUpdate(BaseModel):
     title_copy_id: str | None = None

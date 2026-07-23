@@ -940,6 +940,9 @@ export function PlanningPage() {
   const [assignReuseCutoff, setAssignReuseCutoff] = useState<string>("never");
   // Custom "invited before <date>" (ISO yyyy-mm-dd); used when cutoff === "custom".
   const [assignReuseBefore, setAssignReuseBefore] = useState<string>("");
+  // With a cutoff: claim ONLY previously-invited contacts (exclude fresh).
+  // Meaningless for "never" (would be empty), so the checkbox is hidden there.
+  const [assignReuseOnly, setAssignReuseOnly] = useState(false);
   const [assignEligible, setAssignEligible] = useState<Record<string, number>>({});
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
@@ -972,13 +975,14 @@ export function PlanningPage() {
     fetchBucketEligible({
       reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
       reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
+      reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
       webinar_id: assigningWebinarId,
       country: assignFilterCountries.length ? assignFilterCountries : undefined,
     })
       .then((m) => { if (!cancelled) setAssignEligible(m); })
       .catch(() => { if (!cancelled) setAssignEligible({}); });
     return () => { cancelled = true; };
-  }, [assigningWebinarId, assignReuseCutoff, assignReuseBefore, assignFilterCountries, eligibleRefresh]);
+  }, [assigningWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket: the eligible count under the current
   // filter if we have it, else the bucket's stored fresh remaining.
@@ -1104,6 +1108,7 @@ export function PlanningPage() {
       setAssignDays(5);
       setAssignReuseCutoff("never");
       setAssignReuseBefore("");
+      setAssignReuseOnly(false);
       setAssignEligible({});
       // Load custom lists
       fetchCustomLists().then(({ lists }) => setCustomLists(lists)).catch(() => {});
@@ -1396,6 +1401,7 @@ export function PlanningPage() {
         filter_countries: filterCountries,
         reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
         reuse_before: assignReuseCutoff === "custom" ? (assignReuseBefore || undefined) : undefined,
+        reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
       };
     }
 
@@ -2366,10 +2372,23 @@ export function PlanningPage() {
                                   />
                                 </div>
                               )}
+                              {assignReuseCutoff !== "never" && (
+                                <label className="flex items-center gap-1.5 mb-1.5 cursor-pointer select-none">
+                                  <input
+                                    type="checkbox"
+                                    checked={assignReuseOnly}
+                                    onChange={(e) => setAssignReuseOnly(e.target.checked)}
+                                    className="w-3.5 h-3.5 rounded border-zinc-400 dark:border-zinc-600 text-violet-600 focus:ring-violet-500 accent-violet-600"
+                                  />
+                                  <span className="text-[11px] text-zinc-600 dark:text-zinc-300">Previously invited only</span>
+                                </label>
+                              )}
                               <span className="text-[10px] text-zinc-500 mt-4">
                                 {assignReuseCutoff === "never"
                                   ? "Only contacts never invited"
-                                  : "Includes previously-invited contacts past the cutoff"}
+                                  : assignReuseOnly
+                                    ? "Only contacts invited past the cutoff — fresh excluded"
+                                    : "Fresh + previously-invited contacts past the cutoff"}
                               </span>
                             </div>
                           )}
