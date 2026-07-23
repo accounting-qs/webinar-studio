@@ -108,6 +108,10 @@ async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> 
         return
     for i in range(0, len(ids), _CACHE_CHUNK_SIZE):
         chunk = ids[i : i + _CACHE_CHUNK_SIZE]
+        # last_invited_at = the DATE OF THE WEBINAR the contact was last sent to
+        # (midnight UTC), not the send timestamp — so "invited before <date>" /
+        # "invited over X ago" reason in webinar dates, matching how the operator
+        # thinks. used_at is the fallback for legacy rows missing assigned_date.
         await db.execute(sa_text(
             "UPDATE contacts c SET "
             "  assigned_membership_count = COALESCE(agg.a, 0), "
@@ -117,7 +121,8 @@ async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> 
             "LEFT JOIN LATERAL ( "
             "  SELECT count(*) FILTER (WHERE m.status='assigned') AS a, "
             "         count(*) FILTER (WHERE m.status='used') AS u, "
-            "         max(m.used_at) FILTER (WHERE m.status='used') AS mx "
+            "         max(COALESCE(m.assigned_date::timestamptz, m.used_at)) "
+            "           FILTER (WHERE m.status='used') AS mx "
             "  FROM webinar_contact_memberships m WHERE m.contact_id = k.cid "
             ") agg ON true "
             "WHERE c.id = k.cid"

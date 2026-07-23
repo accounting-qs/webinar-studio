@@ -92,6 +92,9 @@ async def _recompute_caches(chunk: int) -> None:
             if not ids:
                 break
 
+            # last_invited_at = webinar date (midnight UTC) of the last used
+            # membership; used_at is the fallback for rows missing assigned_date.
+            # Mirrors recompute_contact_caches in api/routers/outreach/_helpers.py.
             n = (await db.execute(sa_text(
                 "UPDATE contacts c SET "
                 "  assigned_membership_count = COALESCE(agg.a, 0), "
@@ -101,7 +104,8 @@ async def _recompute_caches(chunk: int) -> None:
                 "LEFT JOIN LATERAL ( "
                 "  SELECT count(*) FILTER (WHERE m.status='assigned') AS a, "
                 "         count(*) FILTER (WHERE m.status='used') AS u, "
-                "         max(m.used_at) FILTER (WHERE m.status='used') AS mx "
+                "         max(COALESCE(m.assigned_date::timestamptz, m.used_at)) "
+                "           FILTER (WHERE m.status='used') AS mx "
                 "  FROM webinar_contact_memberships m WHERE m.contact_id = k.cid "
                 ") agg ON true "
                 "WHERE c.id = k.cid "
