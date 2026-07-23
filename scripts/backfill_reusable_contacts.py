@@ -1,6 +1,6 @@
 """One-off (and re-runnable) backfill for the reusable-contacts membership model.
 
-Run once after migration 062 to populate webinar_contact_memberships from the
+Run once after migration 064 to populate webinar_contact_memberships from the
 current live contacts slot and recompute the three cache columns, and any time
 you suspect drift — every step is idempotent and self-healing.
 

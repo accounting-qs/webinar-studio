@@ -1,4 +1,4 @@
-"""062_add_webinar_contact_memberships
+"""064_add_webinar_contact_memberships
 
 Restructure invitation state from the single denormalized slot on `contacts`
 (assignment_id / outreach_status / assigned_date / used_at — one webinar at a
@@ -23,14 +23,14 @@ The legacy single-slot columns (assignment_id / outreach_status / assigned_date 
 used_at) are intentionally LEFT IN PLACE here; they are dropped in a later
 migration after the membership model has fully taken over the read/write paths.
 
-Revision ID: 062
-Revises: 061
+Revision ID: 064
+Revises: 063
 """
 from alembic import op
 
 
-revision = "062"
-down_revision = "061"
+revision = "064"
+down_revision = "063"
 branch_labels = None
 depends_on = None
 
