@@ -953,10 +953,11 @@ export function PlanningPage() {
   const [assignSendPerAcct, setAssignSendPerAcct] = useState(0);
   const [assignDays, setAssignDays] = useState(5);
 
-  // Load the country options for the selected source and reset the filter.
+  // Load the country options (with per-source counts) for the selected source.
+  // The country/region filter itself is NOT reset here — it can be set BEFORE a
+  // bucket is picked and must persist once one is (reset happens on panel open).
   const assignSource = assignTab === "custom_lists" ? assignCustomList : assignBucket;
   useEffect(() => {
-    setAssignFilterCountries([]);
     if (!assignSource) { setAssignAvailCountries([]); return; }
     let cancelled = false;
     const params = assignTab === "custom_lists" ? { upload_id: assignSource } : { bucket_id: assignSource };
@@ -1119,6 +1120,8 @@ export function PlanningPage() {
       setAssignReuseBefore("");
       setAssignReuseOnly(false);
       setAssignEligible(null);
+      setAssignFilterCountries([]);
+      setAssignAvailCountries([]);
       // Load custom lists
       fetchCustomLists().then(({ lists }) => setCustomLists(lists)).catch(() => {});
     }
@@ -2416,6 +2419,28 @@ export function PlanningPage() {
                             </div>
                           )}
 
+                          {/* Assignment form — country / region filter. Placed ABOVE the
+                              bucket picker so it can be set first; it then narrows the
+                              per-bucket "remaining" counts shown below. Persists across
+                              bucket changes (reset only when the panel is reopened). */}
+                          <div className="flex items-center gap-3 mb-2">
+                            <div className="w-72">
+                              <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Country / Region filter</label>
+                              <MultiCountryDropdown
+                                options={assignLocationOptions}
+                                value={assignFilterCountries}
+                                onChange={setAssignFilterCountries}
+                              />
+                            </div>
+                            <span className="text-[10px] text-zinc-500 mt-4">
+                              {assignFilterCountries.length === 0
+                                ? "No filter — assigning from all countries"
+                                : assignSource
+                                  ? `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match in this ${assignTab === "custom_lists" ? "list" : "bucket"}`
+                                  : "Narrowing bucket remaining below to the selected countries"}
+                            </span>
+                          </div>
+
                           {/* Assignment form — row 1: source + sender + volume */}
                           <div className="flex items-end gap-3 mb-2">
                             {assignTab === "buckets" && (
@@ -2499,25 +2524,6 @@ export function PlanningPage() {
                               {assignInFlight === w.id ? "Assigning…" : "Assign →"}
                             </button>
                           </div>
-
-                          {/* Assignment form — country / region filter (shown when a source is selected) */}
-                          {assignSource && (
-                            <div className="flex items-center gap-3 mb-2">
-                              <div className="w-72">
-                                <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Country / Region filter</label>
-                                <MultiCountryDropdown
-                                  options={assignLocationOptions}
-                                  value={assignFilterCountries}
-                                  onChange={setAssignFilterCountries}
-                                />
-                              </div>
-                              <span className="text-[10px] text-zinc-500 mt-4">
-                                {assignFilterCountries.length === 0
-                                  ? "No filter — assigning from all countries"
-                                  : `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match`}
-                              </span>
-                            </div>
-                          )}
 
                           {/* Assignment form — row 2: sending config (shown when bucket + sender selected) */}
                           {(assignTab === "custom_lists" ? assignCustomList : assignBucket) && assignSender && (() => {

@@ -18,13 +18,22 @@ export const REGION_COUNTRIES: Record<string, Set<string>> = {
     "andorra", "san marino", "north macedonia", "macedonia", "montenegro",
     "bosnia and herzegovina", "albania", "moldova", "kosovo",
   ]),
+  // Sub-regions of Europe (kept as separate shortcuts; they overlap Europe).
+  DACH: new Set(["dach", "germany", "austria", "switzerland"]),
+  BENELUX: new Set(["benelux", "belgium", "netherlands", "the netherlands", "luxembourg"]),
   USA: new Set([
     "usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america",
   ]),
-  Canada: new Set(["canada", "ca"]),
+  // North America = USA + Canada. (Canada on its own is just a country in the
+  // list, so it isn't a separate region shortcut anymore.)
+  "North America": new Set([
+    "north america",
+    "usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america",
+    "canada", "ca",
+  ]),
 };
 
-export const REGION_ORDER = ["Europe", "USA", "Canada"];
+export const REGION_ORDER = ["Europe", "DACH", "BENELUX", "USA", "North America"];
 
 export const normCountry = (c: string) => c.trim().toLowerCase();
 
