@@ -716,6 +716,21 @@ class GoHighLevelStatisticsSource:
                     summary["totalRegs"] = wg_totals["subscriptions_count"]
                     summary["totalAttended"] = wg_totals["live_viewers_count"]
 
+            # Override actuallyUsed with the webinar-level membership count.
+            # The per-list sum drops memberships whose list was deleted
+            # (assignment_id NULL) even though delete_assignment deliberately
+            # keeps those contacts in the webinar's stats — the webinar-level
+            # count matches list-distribution and the metric drill-downs.
+            used_total = await db.execute(
+                select(func.count())
+                .select_from(WebinarContactMembership)
+                .where(
+                    WebinarContactMembership.webinar_id == w.id,
+                    WebinarContactMembership.status == "used",
+                )
+            )
+            summary["actuallyUsed"] = int(used_total.scalar() or 0)
+
             rows.extend(synthetic)
 
             # Per (data-source, vintage) funnel cells — powers the By List
@@ -1667,8 +1682,12 @@ class GoHighLevelStatisticsSource:
         wid = w.id
         N = w.number
         bid = w.broadcast_id
+        # wla.id IS NOT NULL keeps the LEFT-JOINed membership rows of DELETED
+        # lists out of the cold funnels (legacy INNER-JOIN semantics) — without
+        # it, a deleted NONJOINER list's contacts would leak in as "cold".
         cold = (
-            "COALESCE(wla.is_nonjoiners, false) = false "
+            "wla.id IS NOT NULL "
+            "AND COALESCE(wla.is_nonjoiners, false) = false "
             "AND COALESCE(wla.is_no_list_data, false) = false"
         )
         lln_expr = "COALESCE(NULLIF(c.lead_list_name, ''), '(no label)')"
@@ -1806,8 +1825,12 @@ class GoHighLevelStatisticsSource:
         wid = w.id
         N = w.number
         bid = w.broadcast_id
+        # wla.id IS NOT NULL keeps the LEFT-JOINed membership rows of DELETED
+        # lists out of the cold funnels (legacy INNER-JOIN semantics) — without
+        # it, a deleted NONJOINER list's contacts would leak in as "cold".
         cold = (
-            "COALESCE(wla.is_nonjoiners, false) = false "
+            "wla.id IS NOT NULL "
+            "AND COALESCE(wla.is_nonjoiners, false) = false "
             "AND COALESCE(wla.is_no_list_data, false) = false"
         )
         bucket_expr = "COALESCE(NULLIF(c.employee_range, ''), '(no size)')"

@@ -20,7 +20,9 @@ from sqlalchemy import delete, func as sa_func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
-from api.routers.outreach._helpers import LLOYD_USER_ID, recompute_contact_caches
+from api.routers.outreach._helpers import (
+    LLOYD_USER_ID, recompute_contact_caches, reconcile_legacy_slots,
+)
 from db.models import (
     Contact, ContactReleaseLog, OutreachBucket, Webinar,
     WebinarContactMembership, WebinarListAssignment,
@@ -107,16 +109,10 @@ async def release_contacts(
     assignments_by_id: dict[str, WebinarListAssignment] = {
         a.id: a for a in a_result.scalars().all()
     }
-    assignment_ids = list(assignments_by_id.keys())
-    if not assignment_ids:
-        return {
-            "release_batch_id": None,
-            "released": 0,
-            "not_found": [],
-            "already_available": [],
-            "by_status": {"assigned": 0, "used": 0},
-            "bucket_updates": {},
-        }
+    # NOTE: no early-return when the webinar has zero assignment rows — used
+    # memberships survive their list's deletion (assignment_id NULL) and must
+    # still be releasable. assignments_by_id is only needed for the `remaining`
+    # counter decrement below, which no-ops for NULL/missing assignments.
 
     # Normalize + dedupe input emails, drop empties
     seen: set[str] = set()
@@ -174,11 +170,26 @@ async def release_contacts(
     contact_ids_to_release: list[str] = []
     legacy_reset_ids: list[str] = []
 
+    # Classify unmatched emails: a contact that EXISTS but has no membership in
+    # this webinar was already released (or never scheduled here) → mirror the
+    # legacy "already_available" bucket so the modal's tiles stay meaningful.
+    unmatched = [e for e in normalized if e not in by_email]
+    known_emails: set[str] = set()
+    for chunk in _chunked(unmatched, _DB_CHUNK_SIZE):
+        k_result = await db.execute(
+            select(sa_func.lower(Contact.email))
+            .where(
+                Contact.user_id == LLOYD_USER_ID,
+                sa_func.lower(Contact.email).in_(chunk),
+            )
+        )
+        known_emails.update(k_result.scalars().all())
+
     for email in normalized:
         target = by_email.get(email)
         if target is None:
-            # No membership in this webinar — nothing to release here.
-            not_found.append(email)
+            # No membership in this webinar — already released, or unknown email.
+            (already_available if email in known_emails else not_found).append(email)
             continue
 
         log_rows.append({
@@ -243,6 +254,7 @@ async def release_contacts(
             )
         )
     await recompute_contact_caches(db, contact_ids_to_release)
+    await reconcile_legacy_slots(db, contact_ids_to_release)
 
     # Reconcile bucket.remaining_contacts from the live fresh baseline (never
     # invited, not in-flight) — keeps the field self-healing if it ever drifts.
@@ -352,9 +364,22 @@ async def release_contacts_by_id(
     # assignment(s) the operator is viewing). The membership carries webinar_id
     # and the authoritative status — so a reused contact is released from the
     # viewed webinar, not whatever its legacy slot happens to point at.
+    # `had_any_membership` tracks contacts that DO hold memberships but none in
+    # scope, so the response can report them as out_of_scope rather than
+    # not_found. Without a scope, a multi-webinar contact's NEWEST membership is
+    # released (created_at DESC) — deterministic, and matches the operator
+    # intuition of undoing the most recent scheduling.
     m = WebinarContactMembership
     mem_by_contact: dict[str, dict] = {}
+    had_any_membership: set[str] = set()
     for chunk in _chunked(contact_ids, _DB_CHUNK_SIZE):
+        if scope_assignment_ids is not None:
+            any_result = await db.execute(
+                select(m.contact_id).where(
+                    m.user_id == LLOYD_USER_ID, m.contact_id.in_(chunk)
+                )
+            )
+            had_any_membership.update(any_result.scalars().all())
         conds = [m.user_id == LLOYD_USER_ID, m.contact_id.in_(chunk)]
         if scope_assignment_ids is not None:
             conds.append(m.assignment_id.in_(scope_assignment_ids))
@@ -367,9 +392,11 @@ async def release_contacts_by_id(
             )
             .join(Contact, Contact.id == m.contact_id)
             .where(*conds)
+            .order_by(m.contact_id, m.created_at.desc())
         )
         for row in c_result.all():
-            # One membership per contact for the viewed page (scope narrows it).
+            # First row per contact wins = newest membership (ORDER BY above);
+            # an explicit scope narrows it to the viewed page's lists.
             mem_by_contact.setdefault(row.contact_id, {
                 "id": row.contact_id,
                 "email": row.email,
@@ -411,8 +438,10 @@ async def release_contacts_by_id(
     for cid in contact_ids:
         row = mem_by_contact.get(cid)
         if row is None:
-            # No membership (in scope) → nothing to release for this contact.
-            not_found.append(cid)
+            # Memberships exist but none in the viewed scope → out_of_scope
+            # (feeds the frontend's scope-violation warning); otherwise the
+            # contact has nothing to release.
+            (out_of_scope if cid in had_any_membership else not_found).append(cid)
             continue
 
         log_rows.append({
@@ -473,6 +502,7 @@ async def release_contacts_by_id(
                 )
             )
     await recompute_contact_caches(db, contact_ids_to_release)
+    await reconcile_legacy_slots(db, contact_ids_to_release)
 
     bucket_updates: dict[str, int] = {}
     if touched_bucket_ids:

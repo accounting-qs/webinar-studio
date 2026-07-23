@@ -17,7 +17,7 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, assignment_dict, claimable_conditions,
     compute_blocklist_counts_per_assignment, copy_dict,
-    recompute_contact_caches, reuse_cutoff_to_ts, webinar_dict,
+    recompute_contact_caches, reconcile_legacy_slots, reuse_cutoff_to_ts, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
 from db.models import (
@@ -168,10 +168,15 @@ async def delete_webinar(
     # membership for this webinar is removed (webinar_id FK is ON DELETE CASCADE),
     # so its past invites stop counting toward times_invited. Capture the affected
     # contacts now (before the cascade) so we can recompute their caches after.
-    affected_ids = (await db.execute(
-        select(WebinarContactMembership.contact_id)
+    # Membership bucket snapshots are included in the baseline recompute set:
+    # assignment-less memberships (their list was deleted earlier) still hold
+    # contacts whose bucket remaining changes when this webinar goes away.
+    affected_rows = (await db.execute(
+        select(WebinarContactMembership.contact_id, WebinarContactMembership.bucket_id)
         .where(WebinarContactMembership.webinar_id == webinar_id)
-    )).scalars().all()
+    )).all()
+    affected_ids = [r.contact_id for r in affected_rows]
+    touched_bucket_ids.update(r.bucket_id for r in affected_rows if r.bucket_id)
 
     # Legacy slot dual-write: release 'assigned' contacts, clear assignment_id on
     # 'used' ones. `released` is the count of not-yet-sent contacts freed.
@@ -201,6 +206,7 @@ async def delete_webinar(
     # Recompute caches for affected contacts (their memberships are now gone) and
     # restore each touched bucket's fresh-baseline remaining.
     await recompute_contact_caches(db, affected_ids)
+    await reconcile_legacy_slots(db, affected_ids)
     for bucket_id in touched_bucket_ids:
         fresh_remaining = (await db.execute(
             select(sa_func.count()).where(
@@ -265,6 +271,10 @@ async def assign_bucket(
         raise HTTPException(400, "Either bucket_id or upload_id must be provided")
     if body.bucket_id and body.upload_id:
         raise HTTPException(400, "Cannot provide both bucket_id and upload_id")
+    # A zero/negative volume would skip the claim loop AND the zero-claim 409
+    # cleanup, leaving a persistent empty assignment.
+    if body.volume <= 0:
+        raise HTTPException(400, "volume must be a positive number")
 
     is_custom_list = body.upload_id is not None
 
@@ -289,7 +299,9 @@ async def assign_bucket(
     desc_copy = None
     upload = None
 
-    not_blocklisted = Contact.is_blocklisted.is_(False)
+    # NOT form matches the partial indexes' predicates exactly (the planner
+    # does not prove `IS false` ⇒ `NOT col`).
+    not_blocklisted = ~Contact.is_blocklisted
 
     # Reuse filter: fresh-only by default ("never"), or include contacts whose
     # last sent-invite is older than the cutoff. Applied identically to the
@@ -485,8 +497,15 @@ async def assign_bucket(
     claimed = 0
     while claimed < body.volume:
         chunk_limit = min(CLAIM_CHUNK, body.volume - claimed)
+        # FOR UPDATE SKIP LOCKED: the row locks are what prevents two CONCURRENT
+        # assigns to DIFFERENT webinars from claiming the same contacts (the
+        # ON CONFLICT unique key only guards the same webinar). A concurrent
+        # claim skips our locked rows, and once we commit, its next chunk sees
+        # assigned_membership_count > 0 and excludes them via `claimable`. This
+        # replaces the old EvalPlanQual outreach_status re-check.
         candidate_ids = (await db.execute(
             select(Contact.id).where(*claim_where).limit(chunk_limit)
+            .with_for_update(skip_locked=True)
         )).scalars().all()
         if not candidate_ids:
             break
@@ -605,7 +624,9 @@ async def assign_countries(
     if bucket_id and upload_id:
         raise HTTPException(400, "Cannot provide both bucket_id and upload_id")
 
-    not_blocklisted = Contact.is_blocklisted.is_(False)
+    # NOT form matches the partial indexes' predicates exactly (the planner
+    # does not prove `IS false` ⇒ `NOT col`).
+    not_blocklisted = ~Contact.is_blocklisted
     if upload_id is not None:
         source_where = (
             Contact.upload_id == upload_id,
@@ -733,6 +754,7 @@ async def delete_assignment(
     )
 
     await recompute_contact_caches(db, affected_ids)
+    await reconcile_legacy_slots(db, affected_ids)
 
     # Restore bucket remaining to the fresh baseline.
     bucket_id = assignment.bucket_id
@@ -828,7 +850,9 @@ async def get_assignment_contacts(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    not_blocklisted = Contact.is_blocklisted.is_(False)
+    # NOT form matches the partial indexes' predicates exactly (the planner
+    # does not prove `IS false` ⇒ `NOT col`).
+    not_blocklisted = ~Contact.is_blocklisted
     m = WebinarContactMembership
 
     # Membership rows scope which contacts belong to THIS assignment; status /
@@ -921,30 +945,36 @@ async def mark_contacts_used(
         raise HTTPException(404, "Assignment not found")
 
     now = datetime.now(timezone.utc)
-    # Mark this assignment's memberships used (authoritative) — an invite was sent.
-    used_ids = (await db.execute(
-        update(WebinarContactMembership)
-        .where(
-            WebinarContactMembership.assignment_id == assignment_id,
-            WebinarContactMembership.contact_id.in_(body.contact_ids),
-            WebinarContactMembership.status == "assigned",
+    # Chunk the id lists: "select all" pages can submit tens of thousands of ids
+    # and asyncpg caps a statement at 32,767 bind params.
+    MARK_CHUNK = 5000
+    used_ids: list[str] = []
+    for i in range(0, len(body.contact_ids), MARK_CHUNK):
+        chunk = body.contact_ids[i : i + MARK_CHUNK]
+        # Mark this assignment's memberships used (authoritative) — an invite was sent.
+        used_ids.extend((await db.execute(
+            update(WebinarContactMembership)
+            .where(
+                WebinarContactMembership.assignment_id == assignment_id,
+                WebinarContactMembership.contact_id.in_(chunk),
+                WebinarContactMembership.status == "assigned",
+            )
+            .values(status="used", used_at=now)
+            .returning(WebinarContactMembership.contact_id)
+        )).scalars().all())
+        # Legacy slot dual-write — only contacts whose slot still points at this
+        # assignment (fresh-origin); reused contacts keep their prior slot.
+        await db.execute(
+            update(Contact)
+            .where(
+                Contact.id.in_(chunk),
+                Contact.assignment_id == assignment_id,
+                Contact.user_id == LLOYD_USER_ID,
+                Contact.outreach_status == "assigned",
+            )
+            .values(outreach_status="used", used_at=now)
         )
-        .values(status="used", used_at=now)
-        .returning(WebinarContactMembership.contact_id)
-    )).scalars().all()
     marked = len(used_ids)
-    # Legacy slot dual-write — only contacts whose slot still points at this
-    # assignment (fresh-origin); reused contacts keep their prior slot.
-    await db.execute(
-        update(Contact)
-        .where(
-            Contact.id.in_(body.contact_ids),
-            Contact.assignment_id == assignment_id,
-            Contact.user_id == LLOYD_USER_ID,
-            Contact.outreach_status == "assigned",
-        )
-        .values(outreach_status="used", used_at=now)
-    )
     if marked:
         await recompute_contact_caches(db, used_ids)
         assignment.remaining = max(0, (assignment.remaining or 0) - marked)
@@ -1001,7 +1031,9 @@ async def get_group_contacts(
     if len(assignments) != len(assignment_ids):
         raise HTTPException(404, "One or more assignments not found")
 
-    not_blocklisted = Contact.is_blocklisted.is_(False)
+    # NOT form matches the partial indexes' predicates exactly (the planner
+    # does not prove `IS false` ⇒ `NOT col`).
+    not_blocklisted = ~Contact.is_blocklisted
     m = WebinarContactMembership
 
     q = (
@@ -1110,7 +1142,9 @@ async def stream_group_contacts_csv(
 
     list_name_by_aid = {a.id: _list_name(a) for a in assignments}
 
-    not_blocklisted = Contact.is_blocklisted.is_(False)
+    # NOT form matches the partial indexes' predicates exactly (the planner
+    # does not prove `IS false` ⇒ `NOT col`).
+    not_blocklisted = ~Contact.is_blocklisted
 
     async def row_iter():
         # CSV header.
@@ -1168,6 +1202,10 @@ async def stream_group_contacts_csv(
 
 class GroupMarkUsedRequest(BaseModel):
     contact_ids: list[str]
+    # Visible-scope guard (mirrors ReleaseByIdRequest): only memberships in these
+    # assignments are flipped. Without it, marking a REUSED contact would also
+    # flip its still-'assigned' membership on a different, unsent webinar.
+    assignment_ids: list[str] | None = None
 
 
 @router.put("/assignment-groups/contacts/mark-used")
@@ -1183,17 +1221,26 @@ async def mark_group_contacts_used(
 
     # Mark this user's 'assigned' memberships for these contacts as used
     # (authoritative), capturing which assignment each belonged to so we can
-    # decrement its remaining counter.
-    rows = (await db.execute(
-        update(WebinarContactMembership)
-        .where(
-            WebinarContactMembership.user_id == LLOYD_USER_ID,
-            WebinarContactMembership.contact_id.in_(body.contact_ids),
-            WebinarContactMembership.status == "assigned",
-        )
-        .values(status="used", used_at=now)
-        .returning(WebinarContactMembership.contact_id, WebinarContactMembership.assignment_id)
-    )).all()
+    # decrement its remaining counter. Chunked: "select all" pages can submit
+    # tens of thousands of ids (asyncpg 32,767-param cap).
+    MARK_CHUNK = 5000
+    scope = [
+        WebinarContactMembership.assignment_id.in_(body.assignment_ids)
+    ] if body.assignment_ids else []
+    rows = []
+    for i in range(0, len(body.contact_ids), MARK_CHUNK):
+        chunk = body.contact_ids[i : i + MARK_CHUNK]
+        rows.extend((await db.execute(
+            update(WebinarContactMembership)
+            .where(
+                WebinarContactMembership.user_id == LLOYD_USER_ID,
+                WebinarContactMembership.contact_id.in_(chunk),
+                WebinarContactMembership.status == "assigned",
+                *scope,
+            )
+            .values(status="used", used_at=now)
+            .returning(WebinarContactMembership.contact_id, WebinarContactMembership.assignment_id)
+        )).all())
     if not rows:
         return {"marked": 0, "by_assignment": {}}
 
@@ -1204,16 +1251,17 @@ async def mark_group_contacts_used(
         if r.assignment_id:
             per_assignment[r.assignment_id] = per_assignment.get(r.assignment_id, 0) + 1
 
-    # Legacy slot dual-write — fresh-origin contacts only.
-    await db.execute(
-        update(Contact)
-        .where(
-            Contact.id.in_(used_ids),
-            Contact.user_id == LLOYD_USER_ID,
-            Contact.outreach_status == "assigned",
+    # Legacy slot dual-write — fresh-origin contacts only (chunked).
+    for i in range(0, len(used_ids), MARK_CHUNK):
+        await db.execute(
+            update(Contact)
+            .where(
+                Contact.id.in_(used_ids[i : i + MARK_CHUNK]),
+                Contact.user_id == LLOYD_USER_ID,
+                Contact.outreach_status == "assigned",
+            )
+            .values(outreach_status="used", used_at=now)
         )
-        .values(outreach_status="used", used_at=now)
-    )
     await recompute_contact_caches(db, used_ids)
 
     # Decrement each affected assignment's remaining counter atomically in the

@@ -28,8 +28,8 @@ async def contact_counts(
     """Return total, available, and disqualified contact counts.
 
     - total_contacts: every contact (all statuses, all buckets, incl. unbucketed).
-    - available_contacts: outreach_status='available' in non-Disqualified buckets
-      (mirrors the Planning page "available" number).
+    - available_contacts: fresh-baseline remaining (never invited, not in-flight)
+      in non-Disqualified buckets — mirrors the Planning page "available" number.
     - disqualified_contacts: contacts in the Disqualified bucket.
     """
     # Split the user's live buckets into Disqualified vs. the rest.
@@ -56,16 +56,14 @@ async def contact_counts(
             .where(Contact.bucket_id.in_(dq_bucket_ids))
         )
 
+    # Sum the buckets' stored fresh-baseline counters instead of scanning the
+    # contacts table on a public endpoint — list_buckets self-heals them from
+    # live counts, so this matches the Planning page's numbers.
     available_contacts = 0
     if non_dq_bucket_ids:
         available_contacts = await db.scalar(
-            select(sa_func.count())
-            .select_from(Contact)
-            .where(
-                Contact.last_invited_at.is_(None),
-                Contact.assigned_membership_count == 0,
-                Contact.bucket_id.in_(non_dq_bucket_ids),
-            )
+            select(sa_func.coalesce(sa_func.sum(OutreachBucket.remaining_contacts), 0))
+            .where(OutreachBucket.id.in_(non_dq_bucket_ids))
         )
 
     return {

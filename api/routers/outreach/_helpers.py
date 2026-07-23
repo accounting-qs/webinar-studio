@@ -76,6 +76,16 @@ def claimable_conditions(
     (bucket/upload) predicates are applied by the caller.
     """
     conds = [Contact.assigned_membership_count == 0]
+    # TRANSITION-ONLY guard (remove with the legacy-column drop migration):
+    # between running migration 064 and the backfill script, contacts still
+    # carry only the legacy slot (caches 0/NULL). Without this, a slot-'used'
+    # contact would look fresh and be claimable immediately. The predicate is
+    # a no-op once the backfill has stamped the caches.
+    conds.append(~and_(
+        Contact.outreach_status.in_(("assigned", "used")),
+        Contact.last_invited_at.is_(None),
+        Contact.assigned_membership_count == 0,
+    ))
     if cutoff_ts is None:
         # Fresh-only. reuse_only without a cutoff would be the empty set, so it
         # is ignored here (the UI hides the checkbox for "never").
@@ -94,6 +104,34 @@ def claimable_conditions(
             WebinarContactMembership.webinar_id == target_webinar_id,
         ).exists())
     return conds
+
+
+async def reconcile_legacy_slots(db: AsyncSession, contact_ids: list[str]) -> None:
+    """Reset the legacy single-slot columns to 'available' for contacts that no
+    longer hold ANY membership (times_invited=0 and assigned_membership_count=0
+    — call AFTER recompute_contact_caches). Covers slots the guarded per-path
+    dual-writes can't reach: a released membership whose list was deleted
+    (assignment_id NULL on both sides), and webinar deletion un-inviting 'used'
+    contacts. Without this, the transition guard in claimable_conditions would
+    keep such contacts out of the claimable pool forever. Idempotent; does NOT
+    commit/flush."""
+    ids = [c for c in dict.fromkeys(contact_ids) if c]
+    for i in range(0, len(ids), _CACHE_CHUNK_SIZE):
+        await db.execute(
+            update(Contact)
+            .where(
+                Contact.id.in_(ids[i : i + _CACHE_CHUNK_SIZE]),
+                Contact.times_invited == 0,
+                Contact.assigned_membership_count == 0,
+                Contact.outreach_status != "available",
+            )
+            .values(
+                outreach_status="available",
+                assignment_id=None,
+                assigned_date=None,
+                used_at=None,
+            )
+        )
 
 
 async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> None:

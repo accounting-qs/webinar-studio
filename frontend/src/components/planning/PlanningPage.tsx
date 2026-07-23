@@ -943,7 +943,10 @@ export function PlanningPage() {
   // With a cutoff: claim ONLY previously-invited contacts (exclude fresh).
   // Meaningless for "never" (would be empty), so the checkbox is hidden there.
   const [assignReuseOnly, setAssignReuseOnly] = useState(false);
-  const [assignEligible, setAssignEligible] = useState<Record<string, number>>({});
+  // null = no eligible map loaded for the current filter (falls back to the
+  // stored fresh baseline). When loaded, buckets ABSENT from the map have zero
+  // eligible contacts and must show 0 — not their fresh baseline.
+  const [assignEligible, setAssignEligible] = useState<Record<string, number> | null>(null);
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
@@ -968,10 +971,14 @@ export function PlanningPage() {
   // an assign panel is open. When cutoff = "never" this equals the fresh baseline
   // already on each bucket, so the panel falls back to bucket.remaining_contacts.
   useEffect(() => {
-    if (!assigningWebinarId) { setAssignEligible({}); return; }
+    if (!assigningWebinarId) { setAssignEligible(null); return; }
     // Custom mode needs a date before it can query.
-    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible({}); return; }
+    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); return; }
     let cancelled = false;
+    // Invalidate immediately so a filter change never shows the PREVIOUS
+    // filter's counts while the new fetch is in flight (brief fresh-baseline
+    // fallback instead of stale-wrong numbers).
+    setAssignEligible(null);
     fetchBucketEligible({
       reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
       reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
@@ -980,15 +987,17 @@ export function PlanningPage() {
       country: assignFilterCountries.length ? assignFilterCountries : undefined,
     })
       .then((m) => { if (!cancelled) setAssignEligible(m); })
-      .catch(() => { if (!cancelled) setAssignEligible({}); });
+      .catch(() => { if (!cancelled) setAssignEligible(null); });
     return () => { cancelled = true; };
   }, [assigningWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, eligibleRefresh]);
 
-  // Reuse-aware remaining for a bucket: the eligible count under the current
-  // filter if we have it, else the bucket's stored fresh remaining.
+  // Reuse-aware remaining for a bucket. When the eligible map is loaded, a
+  // bucket ABSENT from it has zero eligible contacts under the current filter —
+  // default 0, NOT the fresh baseline. Only fall back to the stored baseline
+  // when no map is loaded (panel closed / fetch pending or failed).
   const bucketRemaining = useCallback(
     (b: { id: string; remaining_contacts: number }) =>
-      assignEligible[b.id] ?? b.remaining_contacts,
+      assignEligible ? (assignEligible[b.id] ?? 0) : b.remaining_contacts,
     [assignEligible],
   );
 
@@ -1109,7 +1118,7 @@ export function PlanningPage() {
       setAssignReuseCutoff("never");
       setAssignReuseBefore("");
       setAssignReuseOnly(false);
-      setAssignEligible({});
+      setAssignEligible(null);
       // Load custom lists
       fetchCustomLists().then(({ lists }) => setCustomLists(lists)).catch(() => {});
     }
@@ -1264,6 +1273,8 @@ export function PlanningPage() {
           ? { ...w, lists: assignments.map(apiAssignmentToList) }
           : w
       )));
+      // Released contacts re-enter the reuse-filter pools.
+      setEligibleRefresh((n) => n + 1);
     } catch (err) {
       console.error("Failed to refresh after release:", err);
     }
@@ -1359,6 +1370,12 @@ export function PlanningPage() {
 
     if (!isCustomListAssign && !assignBucket) return;
     if (isCustomListAssign && !assignCustomList) return;
+    // Custom cutoff needs a date — otherwise the backend would silently treat
+    // the claim as fresh-only while the UI promises a reuse pool.
+    if (!isCustomListAssign && assignReuseCutoff === "custom" && !assignReuseBefore) {
+      alert("Pick an 'Invited before' date for the custom reuse filter first.");
+      return;
+    }
 
     const sender = senders.find((s) => s.id === assignSender);
     if (!sender) return;
@@ -1387,6 +1404,10 @@ export function PlanningPage() {
       if (!bucket) return;
       // Cap to the reuse-aware eligible remaining (falls back to fresh baseline).
       const volume = Math.min(assignVolume, bucketRemaining(bucket));
+      if (volume <= 0) {
+        alert("No eligible contacts in this bucket under the current filter.");
+        return;
+      }
       const countries = assignCountries || (bucket.countries || []).join(", ");
       const empRange = assignEmpRange || bucket.emp_range || "";
       requestData = {
@@ -1448,7 +1469,7 @@ export function PlanningPage() {
       assignInFlightRef.current = null;
       setAssignInFlight(null);
     }
-  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignAccounts, assignSendPerAcct, assignDays, buckets, senders]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignAccounts, assignSendPerAcct, assignDays, buckets, senders, assignReuseCutoff, assignReuseBefore, assignReuseOnly, bucketRemaining]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
@@ -1487,6 +1508,8 @@ export function PlanningPage() {
           b.id === bucket_id ? { ...b, remaining_contacts: bucket_remaining } : b
         ));
       }
+      // Releasing contacts changes reuse-filter eligibility too.
+      setEligibleRefresh((n) => n + 1);
 
       // Deselect if selected
       setSelectedIds((prev) => {
@@ -2468,7 +2491,7 @@ export function PlanningPage() {
                               <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Contacts</label>
                               <input type="number" value={assignVolume || ""} onChange={(e) => { setAssignVolume(parseInt(e.target.value) || 0); setAssignAccounts(0); }} className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500" />
                             </div>
-                            <button onClick={() => handleAssign(w.id)} disabled={(assignTab === "custom_lists" ? !assignCustomList : !assignBucket) || !assignSender || assignVolume <= 0 || assignInFlight === w.id}
+                            <button onClick={() => handleAssign(w.id)} disabled={(assignTab === "custom_lists" ? !assignCustomList : !assignBucket) || !assignSender || assignVolume <= 0 || assignInFlight === w.id || (assignTab === "buckets" && assignReuseCutoff === "custom" && !assignReuseBefore)}
                               className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-200 dark:disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-wait text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap inline-flex items-center gap-1.5">
                               {assignInFlight === w.id && (
                                 <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>

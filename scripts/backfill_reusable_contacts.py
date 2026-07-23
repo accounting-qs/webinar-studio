@@ -125,10 +125,12 @@ async def _create_index() -> None:
     async with engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
         print("Creating ix_contacts_claimable CONCURRENTLY (may take a while)…")
+        # NOT form: the claim/eligible queries emit `NOT is_blocklisted`, and
+        # the planner only proves partial-index implication on an exact match.
         await conn.exec_driver_sql(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_contacts_claimable "
             "ON contacts (bucket_id, last_invited_at) "
-            "WHERE is_blocklisted = false AND assigned_membership_count = 0"
+            "WHERE NOT is_blocklisted AND assigned_membership_count = 0"
         )
         print("  index ready.")
 

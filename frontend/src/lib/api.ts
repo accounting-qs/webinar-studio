@@ -1435,12 +1435,15 @@ export async function downloadBucketContactsCsv(
 }
 
 export async function markGroupContactsUsed(
-  contactIds: string[]
+  contactIds: string[],
+  assignmentIds?: string[]
 ): Promise<{ marked: number; by_assignment: Record<string, number> }> {
   const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts/mark-used`, {
     method: "PUT",
     headers: jsonHeaders(),
-    body: JSON.stringify({ contact_ids: contactIds }),
+    // assignment_ids scopes the flip to the lists the operator is viewing so a
+    // reused contact's membership on ANOTHER webinar is never touched.
+    body: JSON.stringify({ contact_ids: contactIds, assignment_ids: assignmentIds }),
   });
   if (!res.ok) throw new Error("Failed to mark group contacts as used");
   return res.json();

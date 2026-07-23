@@ -359,7 +359,15 @@ def build_webinar_wide_opp_query(
                 c.first_name                AS first_name,
                 c.last_name                 AS last_name,
                 c.company_website           AS company_website,
-                c.assignment_id             AS assignment_id
+                -- List attribution via THIS webinar-number's membership (the
+                -- legacy contacts.assignment_id slot points at whatever webinar
+                -- last claimed the contact and dies with the column drop).
+                (SELECT m.assignment_id
+                   FROM webinar_contact_memberships m
+                   JOIN webinars w2 ON w2.id = m.webinar_id
+                  WHERE m.contact_id = c.id AND w2.number = :N
+                  ORDER BY m.created_at DESC
+                  LIMIT 1)                  AS assignment_id
             FROM ghl_opportunity o
             LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
             LEFT JOIN contacts c ON LOWER(c.email) = LOWER(g.email)

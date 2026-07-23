@@ -138,6 +138,10 @@ async def bucket_eligible_counts(
     """
     from datetime import date as _date
 
+    # Empty-string ids (an empty <select> submits "") would reach the NOT
+    # EXISTS as an invalid UUID and 500.
+    webinar_id = webinar_id or None
+
     parsed_before = None
     if reuse_before:
         try:
@@ -150,7 +154,9 @@ async def bucket_eligible_counts(
     conds = [
         Contact.user_id == LLOYD_USER_ID,
         Contact.bucket_id.isnot(None),
-        Contact.is_blocklisted.is_(False),
+        # NOT form matches ix_contacts_claimable's partial predicate exactly
+        # (the planner does not prove `IS false` ⇒ `NOT col`).
+        ~Contact.is_blocklisted,
         *claimable,
     ]
     if country:

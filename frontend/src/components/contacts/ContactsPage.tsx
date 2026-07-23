@@ -222,7 +222,7 @@ export function ContactsPage(props: ContactsPageProps) {
     setMarking(true);
     try {
       if (isGroup) {
-        await markGroupContactsUsed(Array.from(selectedIds));
+        await markGroupContactsUsed(Array.from(selectedIds), props.groupAssignmentIds);
       } else {
         await markContactsUsed(props.assignmentId!, Array.from(selectedIds));
       }

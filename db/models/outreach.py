@@ -127,7 +127,15 @@ class Webinar(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    assignments: Mapped[list["WebinarListAssignment"]] = relationship(back_populates="webinar", lazy="selectin")
+    # delete + passive_deletes: on webinar deletion the DB-level ON DELETE
+    # CASCADE removes the assignments; without this the ORM tried to null the
+    # NOT NULL webinar_id on loaded children and delete_webinar 500'd whenever
+    # the webinar had lists (pre-existing bug, load-bearing since deletion now
+    # also un-invites via the membership cascade).
+    assignments: Mapped[list["WebinarListAssignment"]] = relationship(
+        back_populates="webinar", lazy="selectin",
+        cascade="all, delete", passive_deletes=True,
+    )
 
     # The two unique partial indexes below are managed in migration 034 via
     # raw SQL because Alembic/SQLAlchemy don't have a clean cross-DB way to
