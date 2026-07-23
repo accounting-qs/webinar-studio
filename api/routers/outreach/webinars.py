@@ -478,7 +478,10 @@ async def assign_bucket(
     # WHERE outreach_status='available') so reused contacts keep their prior
     # 'used' slot for any read path not yet migrated to memberships.
     membership_source_bucket = body.bucket_id if not is_custom_list else None
-    CLAIM_CHUNK = 5000
+    # asyncpg caps a statement at 32,767 bind params. The membership INSERT
+    # binds 7 values per row, so 2,000 rows ≈ 14k params — safely under the cap
+    # (5,000 rows × 7 = 35k blew it up on real-size assigns).
+    CLAIM_CHUNK = 2000
     claimed = 0
     while claimed < body.volume:
         chunk_limit = min(CLAIM_CHUNK, body.volume - claimed)
