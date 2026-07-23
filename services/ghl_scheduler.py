@@ -26,6 +26,7 @@ INCREMENTAL_JOB_ID = "ghl_incremental_sync"
 WEEKLY_JOB_ID = "ghl_weekly_full_sync"
 DAILY_SALES_JOB_ID = "ghl_daily_sales_sync"
 STALE_SWEEPER_JOB_ID = "ghl_stale_sweeper"
+WEEKLY_REPORT_JOB_ID = "weekly_report_send"
 
 # How often to scan for sync runs with stale heartbeats and reap them.
 # Cheap query (one indexed scan over status='running') so 2 minutes is fine.
@@ -66,6 +67,17 @@ async def _stale_sweeper_job() -> None:
         await sweep_stale_runs()
     except Exception as exc:
         logger.error("Stale sync sweeper failed: %s", exc)
+
+
+async def _weekly_report_job() -> None:
+    try:
+        # Lazy import — avoids a scheduler ↔ report-service import cycle.
+        from services.weekly_report import send_weekly_report
+        result = await send_weekly_report()
+        if not result.get("ok"):
+            logger.warning("Scheduled weekly report skipped/failed: %s", result.get("error"))
+    except Exception as exc:
+        logger.error("Scheduled weekly report failed: %s", exc)
 
 
 async def _wg_auto_sync_job() -> None:
@@ -123,7 +135,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -149,6 +161,32 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=300,
         replace_existing=True,
     )
+
+    # Weekly report job — separate settings + its own try/except so a reports
+    # failure never blocks the GHL sync jobs (and vice versa).
+    try:
+        from services.weekly_report import get_report_settings
+        rs = await get_report_settings()
+        if rs["enabled"]:
+            scheduler.add_job(
+                _weekly_report_job,
+                trigger=CronTrigger(
+                    day_of_week=rs["day_of_week"],
+                    hour=int(rs["hour_local"]),
+                    minute=int(rs["minute_local"]),
+                    timezone=rs["timezone"],
+                ),
+                id=WEEKLY_REPORT_JOB_ID,
+                max_instances=1,
+                misfire_grace_time=3600,
+                replace_existing=True,
+            )
+            logger.info(
+                "Registered weekly report %s %02d:%02d %s",
+                rs["day_of_week"], rs["hour_local"], rs["minute_local"], rs["timezone"],
+            )
+    except Exception as exc:
+        logger.warning("Could not load report settings (skipping weekly report): %s", exc)
 
     try:
         s = await get_sync_settings()

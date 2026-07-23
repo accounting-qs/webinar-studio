@@ -2781,3 +2781,84 @@ export async function fetchCalendarDayOfWeek(): Promise<CalendarDayOfWeekRespons
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch day-of-week stats"));
   return res.json();
 }
+
+/* ── Connectors: Resend (weekly report emails) ─────────────────────────── */
+
+export interface ResendCredentialStatus {
+  configured: boolean;
+  api_key_masked?: string | null;
+}
+
+export async function fetchResendStatus(): Promise<ResendCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/resend`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch Resend status");
+  return res.json();
+}
+
+export async function saveResendApiKey(api_key: string): Promise<ResendCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/resend`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ api_key }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to save Resend API key"));
+  return res.json();
+}
+
+export async function deleteResendApiKey(): Promise<void> {
+  const res = await fetch(`${API_URL}/connectors/resend`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to delete Resend API key");
+}
+
+/* ── Weekly Reports ────────────────────────────────────────────────────── */
+
+export interface ReportSettings {
+  enabled: boolean;
+  day_of_week: string;
+  hour_local: number;
+  minute_local: number;
+  timezone: string;
+  recipients: string[];
+  from_address: string;
+  last_sent_at: string | null;
+  last_error: string | null;
+}
+
+export async function fetchReportSettings(): Promise<ReportSettings> {
+  const res = await fetch(`${API_URL}/reports/settings`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch report settings"));
+  return res.json();
+}
+
+export async function updateReportSettings(
+  patch: Partial<ReportSettings>,
+): Promise<ReportSettings> {
+  const res = await fetch(`${API_URL}/reports/settings`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to update report settings"));
+  return res.json();
+}
+
+export interface TestReportResult {
+  ok: boolean;
+  message_id?: string | null;
+  error?: string | null;
+  webinar_number?: number | null;
+  narrative_included?: boolean | null;
+}
+
+export async function sendTestReport(webinarId?: string): Promise<TestReportResult> {
+  const res = await fetch(`${API_URL}/reports/send-test`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ webinar_id: webinarId ?? null }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to send test report"));
+  return res.json();
+}

@@ -12,6 +12,7 @@ const NAV_LINKS = [
   { href: "/statistics", label: "Statistics" },
   { href: "/blocklist", label: "Blocklist" },
   { href: "/connectors", label: "Connectors" },
+  { href: "/reports", label: "Reports" },
   { href: "/sync", label: "Sync" },
   { href: "/sop", label: "SOP" },
   { href: "/api-docs", label: "API Docs" },
