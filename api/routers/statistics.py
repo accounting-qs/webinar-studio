@@ -183,7 +183,10 @@ class StatisticsListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ContactDrilldownItem(BaseModel):
-    ghl_contact_id: str
+    # Nullable: the webinar-wide opportunity drilldown LEFT-JOINs ghl_contact, so
+    # an opportunity whose ghl_contact_id has no matching ghl_contact row (orphan
+    # inbound/self-booked opp) emits NULL here — a required str 500'd the endpoint.
+    ghl_contact_id: str | None = None
     email: str | None = None
     first_name: str | None = None
     last_name: str | None = None

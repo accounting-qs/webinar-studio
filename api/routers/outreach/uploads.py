@@ -795,7 +795,27 @@ async def delete_upload(
         if not upload:
             raise HTTPException(404, "Upload not found after cancellation")
 
-    # Always delete contacts associated with this upload (regardless of status)
+    # Guard: refuse to delete an upload whose contacts still hold webinar
+    # memberships. Hard-deleting those contacts would CASCADE-delete the
+    # memberships (contacts.id FK ON DELETE CASCADE), silently shrinking past
+    # webinars' statistics and leaving no contact_release_log audit — unlike the
+    # release / delete-webinar paths which preserve 'used' invites + write the
+    # log. The operator must release/delete the relevant webinars first.
+    from db.models import WebinarContactMembership
+    in_use = (await db.execute(
+        select(sa_func.count())
+        .select_from(WebinarContactMembership)
+        .join(Contact, Contact.id == WebinarContactMembership.contact_id)
+        .where(Contact.upload_id == upload_id)
+    )).scalar() or 0
+    if in_use > 0:
+        raise HTTPException(
+            409,
+            f"{in_use} contact(s) from this upload are assigned or used in "
+            "webinars. Release or delete those webinar lists first.",
+        )
+
+    # Delete contacts associated with this upload (none are in a webinar now)
     count_result = await db.execute(
         select(sa_func.count()).select_from(Contact).where(Contact.upload_id == upload_id)
     )
