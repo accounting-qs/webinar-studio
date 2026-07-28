@@ -59,35 +59,20 @@ async def list_buckets(
     result = await db.execute(q)
     buckets = result.scalars().all()
 
-    # Compute actual total/remaining from contacts table
+    # Serve the stored total_contacts / remaining_contacts counters directly.
+    #
+    # `remaining_contacts` is the fresh baseline — contacts never invited and not
+    # in-flight on any unsent list (assigned_membership_count = 0) — and is
+    # maintained at write time (imports, assignments, releases, merges). This
+    # block used to re-derive it here with a `GROUP BY bucket_id` aggregate over
+    # the *entire* contacts table (3.8M+ rows) on every single Planning-page load,
+    # then write the results back. That aggregate routinely blew past the DB's
+    # 120s statement_timeout, which surfaced as a 500 on GET /outreach/buckets and
+    # made Planning take minutes (or fail to load at all). Trusting the stored
+    # counters — the same thing the webinar/assignment endpoints already do —
+    # keeps this read cheap. The live, reuse-filter-aware remaining is served
+    # separately by GET /outreach/buckets/eligible.
     bucket_ids = [b.id for b in buckets]
-    if bucket_ids:
-        # `remaining` is the fresh baseline — contacts never invited and not
-        # in-flight on any unsent list (assigned_membership_count = 0). This
-        # replaces the old outreach_status='available' notion now that a contact
-        # can hold memberships across several webinars. The live, reuse-filter-
-        # aware remaining is served by GET /outreach/buckets/eligible.
-        count_result = await db.execute(
-            select(
-                Contact.bucket_id,
-                sa_func.count().label("total"),
-                sa_func.count().filter(and_(
-                    Contact.last_invited_at.is_(None),
-                    Contact.assigned_membership_count == 0,
-                )).label("available"),
-            )
-            .where(Contact.bucket_id.in_(bucket_ids))
-            .group_by(Contact.bucket_id)
-        )
-        count_map = {row.bucket_id: (row.total, row.available) for row in count_result}
-
-        # Sync stored counters with actual counts
-        for b in buckets:
-            total, available = count_map.get(b.id, (0, 0))
-            if b.total_contacts != total or b.remaining_contacts != available:
-                b.total_contacts = total
-                b.remaining_contacts = available
-        await db.flush()
 
     # When including copies, also fetch which copy IDs are actively assigned
     assigned_copy_ids: set[str] = set()
