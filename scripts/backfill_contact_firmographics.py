@@ -66,10 +66,12 @@ STD_COLS = [
 ]
 
 # App custom fields: (field_name in contact_custom_fields / custom_data key, staging_col).
+# NB: company name uses the pre-existing lowercase 'company name' field/key so we
+# don't recreate the 'Company Name' duplicate that had to be consolidated before.
 CUSTOM_FIELDS = [
     ("Phone", "phone"),
     ("LinkedIn", "linkedin"),
-    ("Company Name", "company_name"),
+    ("company name", "company_name"),
 ]
 
 

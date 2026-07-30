@@ -97,12 +97,55 @@ MAP_ZOOMINFO = {
 }
 
 
+# FindyLead export. No numeric headcount at all — its only size signal is a
+# list-level constant ("10-25"/"25-50", identical every row) that doesn't map to
+# the finer bucket vocabulary, so employee_count/employee_range are left unmapped.
+# Industry is the list label ("Consulting & Adv"), present only in some files.
+MAP_FINDYLEAD = {
+    "email": "Email",
+    "title": "Title",
+    "industry": "List Build - Industry",
+    "country": "Country",
+    "company_annual_revenue": "Annual Revenue",
+    "company_total_funding": "Total Funding",
+    "company_founded_year": "Company Founded Year",
+    "company_country": "Company Country",
+    "company_website": "Website",
+    "phone": "Company Phone",
+    "linkedin": "Person Linkedin Url",
+    "company_name": "Company Name",
+}
+
+
+# ZoomInfo "Ric" export — a different ZoomInfo layout with TitleCase headers and,
+# crucially, a real numeric headcount ("Employees (All Sites)"). Company phone is
+# well-populated; Direct Phone is mostly empty; no LinkedIn/funding/founded-year.
+MAP_ZOOMINFO_RIC = {
+    "email": "Email",
+    "title": "Title",
+    "seniority": "Contact Level",
+    "industry": "Zoominfo Industry",
+    "country": "Country/Region",
+    "employee_count": "Employees (All Sites)",
+    "company_annual_revenue": "Revenue (USD)",
+    "company_website": "URL",
+    "phone": "Phone",
+    "company_name": "Company Name",
+}
+
+
 def detect_schema(headers: list[str]):
     hset = set(headers)
     if "lead_titles" in hset:
         return "zoominfo", MAP_ZOOMINFO
+    # ZoomInfo Ric: TitleCase export with an all-sites headcount column.
+    if "Employees (All Sites)" in hset or "Zoominfo Industry" in hset:
+        return "zoominfo_ric", MAP_ZOOMINFO_RIC
     if "Employees Count" in hset or "Company Total Funding" in hset:
         return "ampleleads", MAP_AMPLELEADS
+    # FindyLead: bare "Total Funding" (Ampleleads uses "Company Total Funding").
+    if "Total Funding" in hset:
+        return "findylead", MAP_FINDYLEAD
     if "# Employees" in hset:
         return "salesnav", MAP_SALESNAV
     return None, None
