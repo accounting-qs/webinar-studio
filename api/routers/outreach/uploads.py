@@ -99,12 +99,17 @@ _COPY_COLUMNS: tuple[str, ...] = (
 # range, we bucket it here and store the label in employee_range so range-source
 # and count-source imports share one filter vocabulary. Upper bound is inclusive.
 _EMPLOYEE_BUCKETS: tuple[tuple[int, str], ...] = (
-    (10, "1 - 10"),
-    (50, "11 - 50"),
-    (200, "51 - 200"),
+    (2, "0 - 2"),
+    (5, "3 - 5"),
+    (10, "6 - 10"),
+    (20, "11 - 20"),
+    (50, "21 - 50"),
+    (100, "51 - 100"),
+    (200, "101 - 200"),
     (500, "201 - 500"),
     (1000, "501 - 1000"),
-    (5000, "1001 - 5000"),
+    (2000, "1001 - 2000"),
+    (5000, "2001 - 5000"),
     (10000, "5001 - 10000"),
 )
 
