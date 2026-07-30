@@ -1795,10 +1795,12 @@ class GoHighLevelStatisticsSource:
 
         A trimmed clone of _compute_per_source_cells: same three funnel queries
         (invited / WebinarGeek regs+attended / opportunity bookings+quality),
-        same cold filter and metric set, but groups by contacts.employee_range
-        (the canonical bucketed size key: "1 - 10", "11 - 50", … "10000+")
-        instead of lead_list_name. Contacts with no size land in "(no size)".
-        Single dimension, so one cell per bucket — no source/vintage rollup.
+        same cold filter and metric set, but groups by the canonical company-size
+        bucket ("0 - 2", "3 - 5", … "10000+"; see bucket_expr below) instead of
+        lead_list_name. The bucket is derived from the numeric employee_count when
+        present, else a stored canonical employee_range label; everything else
+        (foreign ranges, stray dates, no size) lands in "(no size)". Single
+        dimension, so one cell per bucket — no source/vintage rollup.
         """
         from sqlalchemy import text as sa_text
 
@@ -1809,7 +1811,34 @@ class GoHighLevelStatisticsSource:
             "COALESCE(wla.is_nonjoiners, false) = false "
             "AND COALESCE(wla.is_no_list_data, false) = false"
         )
-        bucket_expr = "COALESCE(NULLIF(c.employee_range, ''), '(no size)')"
+        # Canonical company-size buckets — mirror _EMPLOYEE_BUCKETS in
+        # api/routers/outreach/uploads.py (inclusive upper bound, ascending).
+        # The tab may only ever show these labels plus "(no size)": prefer the
+        # numeric headcount when present, else accept a stored canonical label,
+        # else collapse anything foreign (Apollo-style ranges like "5 - 50",
+        # stray export dates, legacy labels) into "(no size)".
+        _emp_buckets = (
+            (2, "0 - 2"), (5, "3 - 5"), (10, "6 - 10"), (20, "11 - 20"),
+            (50, "21 - 50"), (100, "51 - 100"), (200, "101 - 200"),
+            (500, "201 - 500"), (1000, "501 - 1000"), (2000, "1001 - 2000"),
+            (5000, "2001 - 5000"), (10000, "5001 - 10000"),
+        )
+        _emp_overflow = "10000+"
+        _emp_labels = [lbl for _, lbl in _emp_buckets] + [_emp_overflow]
+        _count_case = "\n              ".join(
+            f"WHEN c.employee_count <= {ceil} THEN '{lbl}'"
+            for ceil, lbl in _emp_buckets
+        )
+        _canonical_in = ", ".join(f"'{lbl}'" for lbl in _emp_labels)
+        bucket_expr = f"""CASE
+            WHEN c.employee_count IS NOT NULL THEN
+              CASE
+              {_count_case}
+              ELSE '{_emp_overflow}'
+              END
+            WHEN c.employee_range IN ({_canonical_in}) THEN c.employee_range
+            ELSE '(no size)'
+          END"""
 
         # {bucket: {raw metric: count}} — merged across the batches.
         raw: dict[str, dict[str, int]] = {}
