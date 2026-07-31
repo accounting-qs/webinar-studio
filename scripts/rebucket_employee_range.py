@@ -1,21 +1,24 @@
-"""Re-derive contacts.employee_range from the stored numeric employee_count.
+"""Canonicalize contacts.employee_range to the agreed company-size buckets.
 
-When the canonical company-size bucket mapping changes (see _EMPLOYEE_BUCKETS in
-api/routers/outreach/uploads.py), contacts imported under the old mapping keep
-their old range label. This backfill re-buckets EXISTING contacts that carry a
-raw numeric employee_count so the Employee count statistics tab reflects the new
-buckets on historical data.
+Rewrites every contact's employee_range so it is always either a canonical bucket
+(see _EMPLOYEE_BUCKETS in api/routers/outreach/uploads.py) or NULL — matching how
+uploads now stores it. This both re-buckets contacts imported under an older
+mapping and strips foreign/junk labels that range-source imports let through
+(Apollo-style "5 - 50" ranges that span buckets, ZoomInfo export-date artifacts
+like "4/20/2025", legacy labels).
 
-  * Scope: only rows WHERE employee_count IS NOT NULL — those are safely
-    re-derivable from the headcount. Range-source-only contacts (no numeric
-    count) keep whatever employee_range their source list provided.
-  * Idempotent: only writes rows whose re-derived label differs from the stored
-    one, so re-runs are no-ops and the reported "updated" count is real changes.
+Per contact, the new value is:
+  * the headcount bucketed, when employee_count IS NOT NULL (count is authoritative);
+  * otherwise the stored employee_range if it is already canonical;
+  * otherwise NULL (shown as "(no size)" in the stats tab).
+
+  * Idempotent: only writes rows whose value actually changes, so re-runs are
+    no-ops and the reported "updated" count is real changes.
   * Touches ONLY employee_range (+ updated_at). Never reads/writes bucket_id,
     outreach_status, is_blocklisted, assignment_id, etc.
 
-Bucketing is done as a single SQL CASE per batch (built from _EMPLOYEE_BUCKETS so
-it can't drift), keyset-batched by contact id and committed every chunk so each
+The mapping is a single SQL CASE per batch (built from _EMPLOYEE_BUCKETS so it
+can't drift), keyset-batched by contact id and committed every chunk so each
 statement stays well under the prod 120s statement_timeout.
 
 After this completes, rebuild the statistics snapshots (POST /statistics/recompute
@@ -45,34 +48,43 @@ LLOYD_USER_ID = "9baf8117-db65-4f30-87a5-a76cf4f23d82"
 
 # Label the fallthrough (above the top ceiling) exactly as _employee_bucket does.
 _OVERFLOW_LABEL = _employee_bucket(_EMPLOYEE_BUCKETS[-1][0] + 1)
+# The only non-NULL strings allowed in employee_range.
+_CANONICAL_LABELS = [lbl for _, lbl in _EMPLOYEE_BUCKETS] + [_OVERFLOW_LABEL]
 
 
-def _bucket_case_sql() -> str:
-    """A SQL CASE mapping employee_count -> range label, mirroring _EMPLOYEE_BUCKETS
-    (inclusive upper bound, ascending ceilings, fallthrough overflow label)."""
-    whens = "\n            ".join(
+def _canonical_case_sql() -> str:
+    """SQL expression resolving each contact to a canonical bucket or NULL,
+    mirroring _canonical_employee_range() in uploads.py: headcount wins, else a
+    stored canonical label, else NULL. Built from _EMPLOYEE_BUCKETS so it can't
+    drift."""
+    whens = "\n              ".join(
         f"WHEN c.employee_count <= {ceiling} THEN '{label}'"
         for ceiling, label in _EMPLOYEE_BUCKETS
     )
+    canon_in = ", ".join(f"'{lbl}'" for lbl in _CANONICAL_LABELS)
     return (
         "CASE\n"
-        f"            {whens}\n"
-        f"            ELSE '{_OVERFLOW_LABEL}'\n"
+        "          WHEN c.employee_count IS NOT NULL THEN\n"
+        "            CASE\n"
+        f"              {whens}\n"
+        f"              ELSE '{_OVERFLOW_LABEL}'\n"
+        "            END\n"
+        f"          WHEN c.employee_range IN ({canon_in}) THEN c.employee_range\n"
+        "          ELSE NULL\n"
         "        END"
     )
 
 
 def _build_update_sql(scoped: bool) -> str:
-    case_sql = _bucket_case_sql()
+    case_sql = _canonical_case_sql()
     user_clause = "c.user_id = :uid AND " if scoped else ""
     return (
         "UPDATE contacts c SET\n"
         f"        employee_range = {case_sql},\n"
         "        updated_at = now()\n"
         f"      WHERE {user_clause}c.id = ANY(:ids)\n"
-        "        AND c.employee_count IS NOT NULL\n"
-        # only real changes — keeps re-runs no-ops and the count honest.
-        f"        AND COALESCE(c.employee_range, '') IS DISTINCT FROM ({case_sql})"
+        # only real changes — NULL-safe compare keeps re-runs no-ops.
+        f"        AND c.employee_range IS DISTINCT FROM ({case_sql})"
     )
 
 
@@ -87,22 +99,28 @@ async def _preflight(scoped: bool, uid: str | None) -> int:
         if missing:
             raise SystemExit(f"ABORT: contacts is missing columns {missing}.")
 
-        where = "employee_count IS NOT NULL"
         params: dict = {}
+        uscope = ""
         if scoped:
-            where += " AND user_id = :uid"
+            uscope = " AND user_id = :uid"
             params["uid"] = uid
-        in_scope = (await db.execute(sa_text(
-            f"SELECT count(*) FROM contacts WHERE {where}"
+        with_count = (await db.execute(sa_text(
+            f"SELECT count(*) FROM contacts WHERE employee_count IS NOT NULL{uscope}"
+        ), params)).scalar()
+        canon_in = ", ".join(f"'{lbl}'" for lbl in _CANONICAL_LABELS)
+        to_null = (await db.execute(sa_text(
+            f"SELECT count(*) FROM contacts WHERE employee_count IS NULL "
+            f"AND employee_range IS NOT NULL AND employee_range <> '' "
+            f"AND employee_range NOT IN ({canon_in}){uscope}"
         ), params)).scalar()
 
     print("\n── Pre-flight ─────────────────────────────")
-    print(f"  scope                 : {'user ' + uid if scoped else 'ALL users'}")
-    print(f"  new buckets           : "
-          f"{[lbl for _, lbl in _EMPLOYEE_BUCKETS] + [_OVERFLOW_LABEL]}")
-    print(f"  contacts w/ headcount : {in_scope:,}")
+    print(f"  scope                     : {'user ' + uid if scoped else 'ALL users'}")
+    print(f"  canonical buckets         : {_CANONICAL_LABELS}")
+    print(f"  contacts w/ headcount     : {with_count:,}  (bucketed from count)")
+    print(f"  junk ranges → NULL        : {to_null:,}  (non-canonical, no count)")
     print("───────────────────────────────────────────")
-    return in_scope or 0
+    return (with_count or 0) + (to_null or 0)
 
 
 async def _rebucket(chunk: int, scoped: bool, uid: str | None) -> None:
@@ -135,19 +153,21 @@ async def _rebucket(chunk: int, scoped: bool, uid: str | None) -> None:
 
 
 async def _report_distribution(scoped: bool, uid: str | None) -> None:
-    where = "employee_count IS NOT NULL"
+    where = "TRUE"
     params: dict = {}
     if scoped:
-        where += " AND user_id = :uid"
+        where = "user_id = :uid"
         params["uid"] = uid
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(sa_text(
-            f"SELECT COALESCE(employee_range, '(null)') AS b, count(*) AS n "
-            f"FROM contacts WHERE {where} GROUP BY 1 ORDER BY 2 DESC"
+            f"SELECT COALESCE(NULLIF(employee_range,''),'(no size / NULL)') AS b, "
+            f"count(*) AS n FROM contacts WHERE {where} GROUP BY 1 ORDER BY 2 DESC"
         ), params)).mappings().all()
-    print("\n── employee_range distribution (rows with a headcount) ──")
+    print("\n── employee_range distribution (all contacts in scope) ──")
     for r in rows:
-        print(f"  {r['b']:>16} : {r['n']:,}")
+        canon = r["b"] in _CANONICAL_LABELS or r["b"] == "(no size / NULL)"
+        tag = "" if canon else "  <-- non-canonical"
+        print(f"  {r['b']:>18} : {r['n']:>10,}{tag}")
     print("─────────────────────────────────────────────────────────")
 
 
@@ -163,7 +183,7 @@ async def main(args) -> None:
         await engine.dispose()
         return
     if in_scope == 0:
-        print("\nNo contacts with a headcount in scope — nothing to do.")
+        print("\nNothing to canonicalize in scope — already clean.")
         await engine.dispose()
         return
 

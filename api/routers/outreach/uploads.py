@@ -121,6 +121,26 @@ def _employee_bucket(count: int) -> str:
     return "10000+"
 
 
+# The only strings allowed in contacts.employee_range.
+_CANONICAL_EMPLOYEE_RANGES: frozenset[str] = frozenset(
+    lbl for _, lbl in _EMPLOYEE_BUCKETS
+) | {"10000+"}
+
+
+def _canonical_employee_range(count, raw_range) -> str | None:
+    """Resolve a contact's size label to a canonical bucket (or None).
+
+    A numeric headcount is authoritative — bucket it. Otherwise keep a
+    source-provided range only if it's already one of our buckets; anything
+    else (Apollo-style "5 - 50" ranges, ZoomInfo export-date artifacts like
+    "4/20/2025", legacy labels) is dropped so only agreed ranges are stored.
+    """
+    if count is not None:
+        return _employee_bucket(count)
+    r = (raw_range or "").strip()
+    return r if r in _CANONICAL_EMPLOYEE_RANGES else None
+
+
 def _contact_to_copy_tuple(c: dict) -> tuple:
     """Return contact dict values in _COPY_COLUMNS order for asyncpg COPY."""
     return (
@@ -1189,10 +1209,12 @@ async def _process_csv_import(
             # Stamp blocklist membership at write time (email already lowercased,
             # matching the lowercased blocklist set).
             contact["is_blocklisted"] = bool(contact.get("email") and contact["email"] in blocklist_emails)
-            # Keep employee_range as the single unified size filter: when the source
-            # gives a raw headcount but no range, bucket the count into a range label.
-            if not contact.get("employee_range") and contact.get("employee_count") is not None:
-                contact["employee_range"] = _employee_bucket(contact["employee_count"])
+            # Keep employee_range as the single unified size filter, and only ever
+            # store a canonical bucket: headcount wins, otherwise a source-provided
+            # range is kept only if canonical (junk like dates is dropped).
+            contact["employee_range"] = _canonical_employee_range(
+                contact.get("employee_count"), contact.get("employee_range")
+            )
             return contact
 
         # Pre-compute the INSERT…SELECT statement that resolves conflicts.
