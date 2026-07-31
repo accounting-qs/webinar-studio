@@ -134,8 +134,32 @@ MAP_ZOOMINFO_RIC = {
 }
 
 
+# Apollo export — lowercase snake_case headers with a real per-person org
+# headcount ("estimated_num_employees"). Note the filename size segment is
+# unreliable (a "10-25" file can hold 2-5-employee orgs), so trust the count.
+# List-level "List Build - Employee Range" spans are ignored (non-canonical).
+MAP_APOLLO = {
+    "email": "email",
+    "title": "title",
+    "seniority": "seniority",
+    "industry": "industry",
+    "country": "country",
+    "employee_count": "estimated_num_employees",
+    "company_annual_revenue": "organization_annual_revenue_printed",
+    "company_total_funding": "organization_total_funding_printed",
+    "company_founded_year": "organization_founded_year",
+    "company_country": "organization_country",
+    "company_website": "organization_website_url",
+    "phone": "organization_phone",
+    "linkedin": "linkedin_url",
+    "company_name": "organization_name",
+}
+
+
 def detect_schema(headers: list[str]):
     hset = set(headers)
+    if "estimated_num_employees" in hset:
+        return "apollo", MAP_APOLLO
     if "lead_titles" in hset:
         return "zoominfo", MAP_ZOOMINFO
     # ZoomInfo Ric: TitleCase export with an all-sites headcount column.
