@@ -671,6 +671,18 @@ class GoHighLevelStatisticsSource:
         rows = [_row_for_assignment(a, w.status) for a in assignments]
 
         async with AsyncSessionLocal() as db:
+            # Large webinars (100k+ planned contacts) turn the contacts⋈ghl_contact
+            # join into a nested loop of hundreds of thousands of random index
+            # probes, which blows past the prod 120s statement_timeout on
+            # Supabase's networked storage (W150 measured at ~183s). Networked
+            # random I/O is far costlier than the default cost model assumes;
+            # nudging random_page_cost up lets the planner pick a single-pass hash
+            # join for those big joins (~5x faster, ~35s) while small webinars keep
+            # the cheaper nested loop. Scoped to this transaction only (SET LOCAL).
+            from sqlalchemy import text as sa_text
+            await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
+            await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
+
             # Per-list first so the variant summary can sum from it.
             per_list = await self._compute_per_list_metrics(
                 db, w, assignments, prev_date, current_date,
