@@ -156,6 +156,27 @@ MAP_APOLLO = {
 }
 
 
+# Apollo app-export CSV (Doctor Lead / FL lists). TitleCase Apollo columns with
+# a real "# Employees" headcount; only "Corporate Phone" is populated (Mobile/Work
+# Direct are empty). No founded-year column. Distinguished by "Apollo Contact Id"
+# so it beats the Sales Nav ("# Employees") and FindyLead ("Total Funding") rules.
+MAP_APOLLO_CSV = {
+    "email": "Email",
+    "title": "Title",
+    "seniority": "Seniority",
+    "industry": "Industry",
+    "country": "Country",
+    "employee_count": "# Employees",
+    "company_annual_revenue": "Annual Revenue",
+    "company_total_funding": "Total Funding",
+    "company_country": "Company Country",
+    "company_website": "Website",
+    "phone": "Corporate Phone",
+    "linkedin": "Person Linkedin Url",
+    "company_name": "Company Name",
+}
+
+
 def detect_schema(headers: list[str]):
     hset = set(headers)
     if "estimated_num_employees" in hset:
@@ -165,6 +186,9 @@ def detect_schema(headers: list[str]):
     # ZoomInfo Ric: TitleCase export with an all-sites headcount column.
     if "Employees (All Sites)" in hset or "Zoominfo Industry" in hset:
         return "zoominfo_ric", MAP_ZOOMINFO_RIC
+    # Apollo app-export (Doctor Lead / FL) — before the # Employees / Total Funding rules.
+    if "Apollo Contact Id" in hset:
+        return "apollo_csv", MAP_APOLLO_CSV
     if "Employees Count" in hset or "Company Total Funding" in hset:
         return "ampleleads", MAP_AMPLELEADS
     # FindyLead: bare "Total Funding" (Ampleleads uses "Company Total Funding").
