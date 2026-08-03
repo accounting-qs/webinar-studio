@@ -270,6 +270,15 @@ function webinarRangeLabel(webinars: SegmentFunnelWebinar[], selected: Set<strin
 
 const COL = "px-3 py-2 text-right tabular-nums whitespace-nowrap";
 
+/** Sort key for the company-size column: the bucket's numeric lower bound
+ * ("0 - 2" → 0, "10000+" → 10000). "(no size)" and any unparseable label sort
+ * before the numbered buckets, so ascending shows "(no size)" on top then sizes
+ * small→large (descending reverses it). */
+function bucketOrder(bucket: string): number {
+  const n = parseInt(bucket, 10);
+  return Number.isNaN(n) ? Number.NEGATIVE_INFINITY : n;
+}
+
 type CellKey = keyof FunnelCells;
 type SortKey = "group" | CellKey;
 type SortDir = "asc" | "desc";
@@ -347,8 +356,10 @@ function EmployeeFunnelTable({
   byEmployee: EmployeeFunnelRow[];
   totals?: EmployeeFunnelResponse["totals"];
 }) {
-  const [sortKey, setSortKey] = useState<SortKey>("invites");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  // Default to company-size order (ascending): "(no size)" first, then the
+  // buckets small→large. Clicking the column header toggles to reverse.
+  const [sortKey, setSortKey] = useState<SortKey>("group");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
 
   const rows = useMemo<BucketRow[]>(
     () => byEmployee.map((r) => ({ bucket: r.bucket, ...funnelOf(r) })),
@@ -387,7 +398,9 @@ function EmployeeFunnelTable({
     decorated.sort((a, b) => {
       let cmp: number;
       if (sortKey === "group") {
-        cmp = a.row.bucket.localeCompare(b.row.bucket);
+        // Order by the bucket's numeric lower bound so sizes increment properly
+        // ("6 - 10" before "11 - 20", "10000+" last). "(no size)" sorts to the end.
+        cmp = bucketOrder(a.row.bucket) - bucketOrder(b.row.bucket);
       } else {
         const av = a.cells[sortKey];
         const bv = b.cells[sortKey];
