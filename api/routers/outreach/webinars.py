@@ -319,6 +319,29 @@ async def assign_bucket(
     # a member of this webinar.
     cutoff_ts = reuse_cutoff_to_ts(getattr(body, "reuse_cutoff", None), getattr(body, "reuse_before", None))
     claimable = claimable_conditions(cutoff_ts, webinar_id, reuse_only=bool(getattr(body, "reuse_only", False)))
+    # Count-only variant WITHOUT the target-webinar exclusion: the id-based
+    # exclusion forces a heap fetch per candidate row, which on a big bucket
+    # pushes the pre-claim COUNT past prod's statement cap and the whole assign
+    # request past the HTTP proxy timeout (client sees an endless load, then
+    # rollback). The already-member overlap is counted separately from the small
+    # membership side and subtracted — see _member_overlap_count below. The
+    # claim itself keeps the full `claimable` (its scans are LIMIT-bounded).
+    claimable_count_conds = claimable_conditions(cutoff_ts, None, reuse_only=bool(getattr(body, "reuse_only", False)))
+
+    async def _member_overlap_count(*source_conds) -> int:
+        """Contacts already members of this webinar that would otherwise be
+        counted available — driven from the membership side (tiny for a fresh
+        webinar)."""
+        res = await db.execute(
+            select(sa_func.count())
+            .select_from(WebinarContactMembership)
+            .join(Contact, Contact.id == WebinarContactMembership.contact_id)
+            .where(
+                WebinarContactMembership.webinar_id == webinar_id,
+                *source_conds,
+            )
+        )
+        return int(res.scalar() or 0)
 
     # Optional location filter, applied identically to the availability counts and
     # the claim query so volume validation matches what gets claimed. A contact
@@ -357,18 +380,20 @@ async def assign_bucket(
         if not upload:
             raise HTTPException(404, "Custom list not found or not complete")
 
-        # Count available (non-blocklisted) contacts from this upload
-        available_count_result = await db.execute(
-            select(sa_func.count()).where(
-                Contact.upload_id == body.upload_id,
-                Contact.bucket_id.is_(None),
-                not_blocklisted,
-                *claimable,
-                *country_filter,
-                *emp_filter,
-            )
+        # Count available (non-blocklisted) contacts from this upload —
+        # no-target claimable minus the already-member overlap (see above).
+        _src_conds = (
+            Contact.upload_id == body.upload_id,
+            Contact.bucket_id.is_(None),
+            not_blocklisted,
+            *claimable_count_conds,
+            *country_filter,
+            *emp_filter,
         )
-        available_count = available_count_result.scalar() or 0
+        available_count_result = await db.execute(
+            select(sa_func.count()).where(*_src_conds)
+        )
+        available_count = (available_count_result.scalar() or 0) - await _member_overlap_count(*_src_conds)
         desc_str = upload.custom_list_name or upload.file_name
 
         # Copies for this custom list (by upload_id). Prefer primary; fall
@@ -402,17 +427,19 @@ async def assign_bucket(
         if not bucket:
             raise HTTPException(404, "Bucket not found")
 
-        # Count available (non-blocklisted) contacts in this bucket
-        available_count_result = await db.execute(
-            select(sa_func.count()).where(
-                Contact.bucket_id == body.bucket_id,
-                not_blocklisted,
-                *claimable,
-                *country_filter,
-                *emp_filter,
-            )
+        # Count available (non-blocklisted) contacts in this bucket —
+        # no-target claimable minus the already-member overlap (see above).
+        _src_conds = (
+            Contact.bucket_id == body.bucket_id,
+            not_blocklisted,
+            *claimable_count_conds,
+            *country_filter,
+            *emp_filter,
         )
-        available_count = available_count_result.scalar() or 0
+        available_count_result = await db.execute(
+            select(sa_func.count()).where(*_src_conds)
+        )
+        available_count = (available_count_result.scalar() or 0) - await _member_overlap_count(*_src_conds)
 
         # Prefer the primary copy; fall back to any non-deleted copy
         # (lowest variant_index) so every assignment has a default selection
