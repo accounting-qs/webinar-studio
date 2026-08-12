@@ -1489,7 +1489,7 @@ class GoHighLevelStatisticsSource:
 
     @staticmethod
     async def _assignment_chunks(
-        db: AsyncSession, wid, max_members: int = 60_000,
+        db: AsyncSession, wid, max_members: int = 25_000,
     ) -> list[list]:
         """Greedy-pack a webinar's assignment_ids into chunks of ≤max_members
         memberships. Chunks partition the webinar's contacts (UNIQUE(webinar_id,
@@ -1577,7 +1577,9 @@ class GoHighLevelStatisticsSource:
         # (webinar_id, contact_id)), and every batch below GROUPs BY
         # m.assignment_id, so per-chunk results are disjoint and merge exactly.
         # Small webinars pack into one chunk → same single query as before.
-        _CHUNK_MEMBERS = 60_000
+        # 25k leaves real headroom under live prod load — 60k chunks ran 30–90s
+        # and the slowest crossed the 120s cap when the app was busy.
+        _CHUNK_MEMBERS = 25_000
         mem_cnt_q = await db.execute(
             select(WebinarContactMembership.assignment_id, func.count())
             .where(
@@ -1731,22 +1733,20 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
-                FROM contacts c
-                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                FROM webinargeek_subscribers wgs
+                JOIN contacts c ON LOWER(c.email) = LOWER(wgs.email)
+                JOIN webinar_contact_memberships m
+                  ON m.contact_id = c.id AND m.webinar_id = CAST(:wid AS uuid)
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
-                JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)
-                WHERE m.webinar_id = CAST(:wid AS uuid)
-                  AND wgs.broadcast_id = :bid
-                  {_AIDS_PRED}
+                WHERE wgs.broadcast_id = :bid
                 GROUP BY m.assignment_id
             """
-            wg_rows = []
-            for _aids in aid_chunks:
-                r = await db.execute(
-                    sa_text(wg_sql).bindparams(sa_bindparam("aids", expanding=True), **wg_params),
-                    {"aids": _aids},
-                )
-                wg_rows.extend(r.mappings().all())
+            # Driven from the broadcast's registrants (~few thousand) probing
+            # contacts via ix_contacts_lower_email + memberships via
+            # uq_wcm_webinar_contact — no chunking needed; the contacts-driven
+            # form flaked past the 120s cap on 100k+-member webinars.
+            r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
+            wg_rows = r.mappings().all()
             for row in wg_rows:
                 aid = str(row["assignment_id"]) if row["assignment_id"] is not None else None
                 if aid is None or aid not in out:
@@ -1771,49 +1771,61 @@ class GoHighLevelStatisticsSource:
         # Union of (opp.webinar_source_number = N) or (contact.booked_call = N)
         # is enforced in WHERE; per-bucket counts use FILTER.
         qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
+        # Inverted join: drive from the handful of opportunities matching this
+        # webinar's series (UNION splits the cross-table OR so each branch scans
+        # its own small side) and probe contacts via ix_contacts_lower_email +
+        # memberships via uq_wcm_webinar_contact. The old contacts-side join
+        # scanned the whole membership set and timed out on 100k+-member
+        # webinars regardless of chunking (the planner drove from the big side).
         opp_sql = f"""
+            WITH ser AS (
+                SELECT o.ghl_opportunity_id, o.call1_appointment_date,
+                       o.call1_appointment_status, o.pipeline_stage_id,
+                       o.lead_quality, g.ghl_contact_id, LOWER(g.email) AS lem
+                FROM ghl_opportunity o
+                JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
+                WHERE o.webinar_source_number = :N
+                UNION
+                SELECT o.ghl_opportunity_id, o.call1_appointment_date,
+                       o.call1_appointment_status, o.pipeline_stage_id,
+                       o.lead_quality, g.ghl_contact_id, LOWER(g.email) AS lem
+                FROM ghl_contact g
+                JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+                WHERE g.booked_call_webinar_series = :N
+            )
             SELECT
                 m.assignment_id,
-                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
-                COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'cancelled') AS canceled,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :won_stage) AS won,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :dq_stage) AS disqualified,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed' AND o.lead_quality IN {qual_in}) AS qualified,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
-            FROM contacts c
-            JOIN webinar_contact_memberships m ON m.contact_id = c.id
-            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
-            JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE m.webinar_id = CAST(:wid AS uuid)
-              AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
-              {_AIDS_PRED}
+                COUNT(DISTINCT s.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT s.ghl_contact_id) AS unique_bookers,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.call1_appointment_date IS NOT NULL AND s.call1_appointment_date <= :now_ts) AS calls_passed,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(s.call1_appointment_status, '')) = 'confirmed') AS confirmed,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(s.call1_appointment_status, '')) = 'showed') AS shows,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(s.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(s.call1_appointment_status, '')) = 'cancelled') AS canceled,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.pipeline_stage_id = :won_stage) AS won,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.pipeline_stage_id = :dq_stage) AS disqualified,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(s.call1_appointment_status, '')) = 'showed' AND s.lead_quality IN {qual_in}) AS qualified,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.lead_quality = :lq_great) AS lq_great,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.lead_quality = :lq_ok) AS lq_ok,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.lead_quality = :lq_barely) AS lq_barely,
+                COUNT(DISTINCT s.ghl_opportunity_id) FILTER (WHERE s.lead_quality = :lq_dq) AS lq_dq
+            FROM ser s
+            JOIN contacts c ON LOWER(c.email) = s.lem
+            JOIN webinar_contact_memberships m
+              ON m.contact_id = c.id AND m.webinar_id = CAST(:wid AS uuid)
             GROUP BY m.assignment_id
         """
-        opp_rows = []
-        for _aids in aid_chunks:
-            r = await db.execute(
-                sa_text(opp_sql).bindparams(
-                    sa_bindparam("aids", expanding=True),
-                    wid=wid, N=N,
-                    now_ts=datetime.now(timezone.utc),
-                    won_stage=DEAL_WON_STAGE_ID,
-                    dq_stage=DISQUALIFIED_STAGE_ID,
-                    lq_great=LEAD_QUALITY_GREAT,
-                    lq_ok=LEAD_QUALITY_OK,
-                    lq_barely=LEAD_QUALITY_BARELY,
-                    lq_dq=LEAD_QUALITY_BAD_DQ,
-                ),
-                {"aids": _aids},
-            )
-            opp_rows.extend(r.mappings().all())
+        r = await db.execute(sa_text(opp_sql).bindparams(
+            wid=wid, N=N,
+            now_ts=datetime.now(timezone.utc),
+            won_stage=DEAL_WON_STAGE_ID,
+            dq_stage=DISQUALIFIED_STAGE_ID,
+            lq_great=LEAD_QUALITY_GREAT,
+            lq_ok=LEAD_QUALITY_OK,
+            lq_barely=LEAD_QUALITY_BARELY,
+            lq_dq=LEAD_QUALITY_BAD_DQ,
+        ))
+        opp_rows = r.mappings().all()
         for row in opp_rows:
             aid = str(row["assignment_id"]) if row["assignment_id"] is not None else None
             if aid is None or aid not in out:
