@@ -50,6 +50,10 @@ async def _backfill_memberships(chunk: int) -> None:
     inserted = 0
     while True:
         async with AsyncSessionLocal() as db:
+            # A single bulk chunk can legitimately exceed Supabase's default 120s
+            # statement_timeout; lift it for this session so one heavy chunk can't
+            # abort the whole (idempotent, resumable) backfill.
+            await db.execute(sa_text("SET statement_timeout = 0"))
             ids = (await db.execute(sa_text(
                 "SELECT id FROM contacts "
                 "WHERE id > :last AND assignment_id IS NOT NULL "
@@ -86,6 +90,10 @@ async def _recompute_caches(chunk: int) -> None:
     changed = 0
     while True:
         async with AsyncSessionLocal() as db:
+            # The per-contact LATERAL aggregate can push a chunk past Supabase's
+            # 120s statement_timeout (this is what crashed the first prod run);
+            # lift it for this session. Chunks stay idempotent + resumable.
+            await db.execute(sa_text("SET statement_timeout = 0"))
             ids = (await db.execute(sa_text(
                 "SELECT id FROM contacts WHERE id > :last ORDER BY id LIMIT :lim"
             ), {"last": last_id, "lim": chunk})).scalars().all()
@@ -145,6 +153,17 @@ _INDEXES: list[tuple[str, str]] = [
         "ON contacts (user_id, bucket_id) INCLUDE (country, list_location, employee_count) "
         "WHERE NOT is_blocklisted AND assigned_membership_count = 0 "
         "AND last_invited_at IS NULL",
+    ),
+    (
+        # Serves /buckets/eligible's per-bucket TOTALS query when a country /
+        # employee filter is active: it counts ALL non-blocklisted contacts (any
+        # claim status), so the fresh-only partial indexes above can't cover it —
+        # without this it heap-scans 4.5M rows and blows the 120s cap.
+        # (Built manually on prod 2026-08-12; listed here for environment parity.)
+        "ix_contacts_bucket_filters",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_contacts_bucket_filters "
+        "ON contacts (user_id, bucket_id) INCLUDE (country, list_location, employee_count) "
+        "WHERE NOT is_blocklisted",
     ),
 ]
 

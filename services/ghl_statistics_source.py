@@ -693,6 +693,10 @@ class GoHighLevelStatisticsSource:
             per_list = await self._compute_per_list_metrics(
                 db, w, assignments, prev_date, current_date,
             )
+            # per-list restored the default random_page_cost for its chunked
+            # probes — put the hash-join tuning back for the whole-webinar
+            # scans below (synthetic / per-source / per-employee).
+            await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
             for r, a in zip(rows, assignments):
                 extra = per_list.get(a.id, {})
                 r["metrics"].update(extra)
@@ -704,13 +708,24 @@ class GoHighLevelStatisticsSource:
             # variant folds them into its summary so its total stays consistent:
             # Total = Assigned lists + NO LIST DATA + Nonjoiners.
             show_specials = (not is_variant) or is_primary
-            synthetic = (
-                await self._synthetic_special_rows(
-                    db, w, assignments, prev_date, current_date,
-                    sibling_webinar_ids=siblings,
+            # Non-fatal: on very large webinars this whole-webinar scan can hit
+            # the prod 120s statement cap. Losing the NLD/Nonjoiner rows for one
+            # compute is better than losing the entire webinar's snapshot.
+            try:
+                synthetic = (
+                    await self._synthetic_special_rows(
+                        db, w, assignments, prev_date, current_date,
+                        sibling_webinar_ids=siblings,
+                    )
+                    if show_specials else []
                 )
-                if show_specials else []
-            )
+            except Exception:
+                logger.exception("synthetic special rows failed for webinar %s — continuing without", w.number)
+                await db.rollback()
+                # Reapply the txn-scoped planner tuning lost with the rollback.
+                await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
+                await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
+                synthetic = []
 
             # Parent summary = Assigned lists + NO LIST DATA + Nonjoiners for
             # every metric — the sum of the partition rows beneath it — for both
@@ -773,10 +788,24 @@ class GoHighLevelStatisticsSource:
 
             # Per (data-source, vintage) funnel cells — powers the By List
             # Source tab. Additive: rides the cached snapshot payload.
-            source_rows = await self._compute_per_source_cells(db, w)
+            # Non-fatal (see synthetic above): a 120s cancel on these extras must
+            # not sink the whole webinar's snapshot.
+            try:
+                source_rows = await self._compute_per_source_cells(db, w)
+            except Exception:
+                logger.exception("per-source cells failed for webinar %s — continuing without", w.number)
+                await db.rollback()
+                await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
+                await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
+                source_rows = []
 
             # Per company-size funnel cells — powers the Employee count tab.
-            employee_rows = await self._compute_per_employee_cells(db, w)
+            try:
+                employee_rows = await self._compute_per_employee_cells(db, w)
+            except Exception:
+                logger.exception("per-employee cells failed for webinar %s — continuing without", w.number)
+                await db.rollback()
+                employee_rows = []
 
         return {
             "number": w.number,
@@ -859,6 +888,13 @@ class GoHighLevelStatisticsSource:
         """
         from sqlalchemy import text as sa_text
 
+        # This function's scans are driven from SMALL sets (calendar invites,
+        # WG registrants, nonjoiner emails) probing contacts/ghl_contact by
+        # email — nested loops win. The caller's whole-webinar hash-join tuning
+        # (random_page_cost=8) turns the planned-email anti-join into full
+        # rescans that blow the 120s cap on 100k+-member webinars.
+        await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+
         N = w.number
         series_nj_re = _webinar_series_regex(N)
         yes_re = _invite_response_regex(N, "Yes")
@@ -869,6 +905,40 @@ class GoHighLevelStatisticsSource:
         # Union of all webinars (this + siblings) whose planned contacts
         # should be excluded from "leftover" leaked-signal counts.
         planned_webinar_ids: list[str] = [wid] + list(sibling_ids)
+
+        # Materialize the planned-email set ONCE into a session temp table via
+        # chunked inserts (each well under the 120s cap) instead of rebuilding a
+        # 250k-row CTE inside BOTH NLD statements below — post-backfill the
+        # membership join is far too big for a single in-statement scan on
+        # 100k+-member webinars. IF NOT EXISTS + TRUNCATE (never DROP) keeps the
+        # table's OID stable for this pooled connection, so asyncpg's prepared
+        # statements stay valid across webinars in a full recompute.
+        from sqlalchemy import bindparam as sa_bindparam
+        await db.execute(sa_text(
+            "CREATE TEMP TABLE IF NOT EXISTS tmp_nld_planned "
+            "(email text PRIMARY KEY) ON COMMIT PRESERVE ROWS"))
+        await db.execute(sa_text("TRUNCATE tmp_nld_planned"))
+        _fill_sql = sa_text(
+            "INSERT INTO tmp_nld_planned "
+            "SELECT DISTINCT LOWER(c.email) FROM contacts c "
+            "JOIN webinar_contact_memberships m ON m.contact_id = c.id "
+            "WHERE m.webinar_id = CAST(:pwid AS uuid) AND m.assignment_id IN :aids "
+            "  AND c.email IS NOT NULL "
+            "ON CONFLICT (email) DO NOTHING"
+        ).bindparams(sa_bindparam("aids", expanding=True))
+        for _pwid in planned_webinar_ids:
+            for _aids in await self._assignment_chunks(db, _pwid):
+                await db.execute(_fill_sql, {"pwid": _pwid, "aids": _aids})
+            # Memberships whose list was deleted (assignment_id NULL) are still
+            # planned contacts — keep them excluded from the leftover pool.
+            await db.execute(sa_text(
+                "INSERT INTO tmp_nld_planned "
+                "SELECT DISTINCT LOWER(c.email) FROM contacts c "
+                "JOIN webinar_contact_memberships m ON m.contact_id = c.id "
+                "WHERE m.webinar_id = CAST(:pwid AS uuid) AND m.assignment_id IS NULL "
+                "  AND c.email IS NOT NULL "
+                "ON CONFLICT (email) DO NOTHING"
+            ), {"pwid": _pwid})
 
         # ── Nonjoiners ────────────────────────────────────────────────
         # If this webinar links to a previous one (nonjoiner_source_webinar_id),
@@ -911,17 +981,14 @@ class GoHighLevelStatisticsSource:
                 {nj_source_sql}
             ),
             nj_planned AS (
-                SELECT DISTINCT LOWER(c.email) AS email
-                FROM contacts c
-                JOIN webinar_contact_memberships m ON m.contact_id = c.id
-                WHERE m.webinar_id = ANY(CAST(:nj_planned_wids AS uuid[]))
-                  AND c.email IS NOT NULL
+                -- pre-materialized session temp table (chunked fill above)
+                SELECT email FROM tmp_nld_planned
             )
             SELECT s.email
             FROM nj_src s
             LEFT JOIN nj_planned p ON p.email = s.email
             WHERE p.email IS NULL
-        """).bindparams(nj_planned_wids=planned_webinar_ids, **nj_source_params))
+        """).bindparams(**nj_source_params))
         nonjoiner_emails: list[str] = [r[0] for r in nj_emails_rows.all() if r[0]]
         nj_count = len(nonjoiner_emails)
 
@@ -1112,7 +1179,6 @@ class GoHighLevelStatisticsSource:
         # union of (this webinar + sibling variants) so the planned CTE
         # excludes everyone covered by any plan for this number.
         nld_params: dict[str, Any] = {
-            "planned_wids": planned_webinar_ids,
             "yes_re": yes_re, "maybe_re": maybe_re,
             "nj_re": series_nj_re, "N": N,
         }
@@ -1204,11 +1270,9 @@ class GoHighLevelStatisticsSource:
                 {relevant_csv_union}
             ),
             planned AS (
-                SELECT DISTINCT LOWER(c.email) AS email
-                FROM contacts c
-                JOIN webinar_contact_memberships m ON m.contact_id = c.id
-                WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
-                  AND c.email IS NOT NULL
+                -- pre-materialized by _synthetic_special_rows into an indexed
+                -- session temp table (chunked fill; see above)
+                SELECT email FROM tmp_nld_planned
             ),
             unplanned AS (
                 SELECT r.*
@@ -1261,7 +1325,6 @@ class GoHighLevelStatisticsSource:
         if broadcast_id:
             ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
             wg_nld_params: dict[str, Any] = {
-                "planned_wids": planned_webinar_ids,
                 "bid": broadcast_id,
             }
             if csv_mode_nld:
@@ -1301,11 +1364,8 @@ class GoHighLevelStatisticsSource:
                 {wg_csv_prefix}
                 {wg_nj_cte_sql}
                 planned AS (
-                    SELECT DISTINCT LOWER(c.email) AS email
-                    FROM contacts c
-                    JOIN webinar_contact_memberships m ON m.contact_id = c.id
-                    WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
-                      AND c.email IS NOT NULL
+                    -- pre-materialized session temp table (see chunked fill above)
+                    SELECT email FROM tmp_nld_planned
                 )
                 SELECT
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT})                                                  AS total_attended,
@@ -1350,11 +1410,8 @@ class GoHighLevelStatisticsSource:
                     matched = await db.execute(sa_text(
                         """
                         WITH planned AS (
-                            SELECT DISTINCT LOWER(c.email) AS email
-                            FROM contacts c
-                            JOIN webinar_contact_memberships m ON m.contact_id = c.id
-                            WHERE m.webinar_id = ANY(CAST(:planned_wids AS uuid[]))
-                              AND c.email IS NOT NULL
+                            -- pre-materialized session temp table (chunked fill above)
+                            SELECT email FROM tmp_nld_planned
                         )
                         SELECT
                           COUNT(DISTINCT LOWER(wgs.email)) AS planned_regs,
@@ -1363,7 +1420,7 @@ class GoHighLevelStatisticsSource:
                         JOIN planned p ON p.email = LOWER(wgs.email)
                         WHERE wgs.broadcast_id = :bid
                         """
-                    ).bindparams(planned_wids=planned_webinar_ids, bid=broadcast_id))
+                    ).bindparams(bid=broadcast_id))
                     mrow = matched.mappings().one()
                     planned_regs = int(mrow["planned_regs"] or 0)
                     planned_attended = int(mrow["planned_attended"] or 0)
@@ -1430,6 +1487,38 @@ class GoHighLevelStatisticsSource:
             })
         return rows_out
 
+    @staticmethod
+    async def _assignment_chunks(
+        db: AsyncSession, wid, max_members: int = 60_000,
+    ) -> list[list]:
+        """Greedy-pack a webinar's assignment_ids into chunks of ≤max_members
+        memberships. Chunks partition the webinar's contacts (UNIQUE(webinar_id,
+        contact_id)), so whole-webinar aggregates can run per chunk and be
+        SUMMED per group key exactly — the pattern that keeps every statement
+        under Supabase's hard 120s cap on 100k+-member webinars. Emails are
+        unique within a webinar's memberships (verified on prod), so summed
+        COUNT(DISTINCT email) stays exact."""
+        from sqlalchemy import text as sa_text
+        import uuid as _uuid
+
+        rows = (await db.execute(sa_text(
+            "SELECT assignment_id, count(*) FROM webinar_contact_memberships "
+            "WHERE webinar_id = CAST(:wid AS uuid) AND assignment_id IS NOT NULL "
+            "GROUP BY assignment_id ORDER BY count(*) DESC"
+        ).bindparams(wid=wid))).all()
+        chunks: list[list] = []
+        cur: list = []
+        cur_n = 0
+        for aid, n in rows:
+            if cur and cur_n + int(n or 0) > max_members:
+                chunks.append(cur)
+                cur, cur_n = [], 0
+            cur.append(_uuid.UUID(str(aid)))
+            cur_n += int(n or 0)
+        if cur:
+            chunks.append(cur)
+        return chunks
+
     async def _compute_per_list_metrics(
         self,
         db: AsyncSession,
@@ -1478,6 +1567,50 @@ class GoHighLevelStatisticsSource:
                 out[str(aid)]["actuallyUsed"] = int(cnt or 0)
         for aid in out:
             out[aid].setdefault("actuallyUsed", 0)
+
+        # ── Assignment chunking ────────────────────────────────────────────
+        # Large webinars (150k+ members) push a single whole-webinar batch
+        # query past Supabase's hard 120s statement_timeout (W152: 256k members
+        # → ~150s → canceled; the cap can't be lifted through the pooler).
+        # Greedy-pack assignments into chunks of ≤ ~60k members and run each
+        # batch per chunk — chunks partition the webinar's contacts (UNIQUE
+        # (webinar_id, contact_id)), and every batch below GROUPs BY
+        # m.assignment_id, so per-chunk results are disjoint and merge exactly.
+        # Small webinars pack into one chunk → same single query as before.
+        _CHUNK_MEMBERS = 60_000
+        mem_cnt_q = await db.execute(
+            select(WebinarContactMembership.assignment_id, func.count())
+            .where(
+                WebinarContactMembership.webinar_id == wid,
+                WebinarContactMembership.assignment_id.in_([a.id for a in assignments]),
+            )
+            .group_by(WebinarContactMembership.assignment_id)
+        )
+        _mem_counts = {str(aid): int(cnt or 0) for aid, cnt in mem_cnt_q.all()}
+        import uuid as _uuid
+        aid_chunks: list[list] = []
+        _cur: list = []
+        _cur_n = 0
+        # Biggest lists first so a single huge list gets its own chunk.
+        for a in sorted(assignments, key=lambda a: -_mem_counts.get(str(a.id), 0)):
+            n = _mem_counts.get(str(a.id), 0)
+            if _cur and _cur_n + n > _CHUNK_MEMBERS:
+                aid_chunks.append(_cur)
+                _cur, _cur_n = [], 0
+            _cur.append(_uuid.UUID(str(a.id)))
+            _cur_n += n
+        if _cur:
+            aid_chunks.append(_cur)
+
+        from sqlalchemy import bindparam as sa_bindparam
+        _AIDS_PRED = "AND m.assignment_id IN :aids"
+
+        # Chunked batches probe ≤60k rows — the default cost model's nested
+        # loop wins there; the caller's SET LOCAL random_page_cost=8 (tuned for
+        # the whole-webinar scans) would force hash joins that rescan
+        # ghl_contact per chunk. Restore the default for this txn; the caller
+        # re-issues its tuning after per-list where needed.
+        await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
 
         has_window = bool(prev_date and current_date)
 
@@ -1539,10 +1672,17 @@ class GoHighLevelStatisticsSource:
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             WHERE m.webinar_id = CAST(:wid AS uuid)
+              {_AIDS_PRED}
             GROUP BY m.assignment_id
         """
-        r = await db.execute(sa_text(ghl_sql).bindparams(**ghl_params))
-        for row in r.mappings().all():
+        ghl_rows = []
+        for _aids in aid_chunks:
+            r = await db.execute(
+                sa_text(ghl_sql).bindparams(sa_bindparam("aids", expanding=True), **ghl_params),
+                {"aids": _aids},
+            )
+            ghl_rows.extend(r.mappings().all())
+        for row in ghl_rows:
             aid = str(row["assignment_id"]) if row["assignment_id"] is not None else None
             if aid is None or aid not in out:
                 continue
@@ -1597,10 +1737,17 @@ class GoHighLevelStatisticsSource:
                 JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)
                 WHERE m.webinar_id = CAST(:wid AS uuid)
                   AND wgs.broadcast_id = :bid
+                  {_AIDS_PRED}
                 GROUP BY m.assignment_id
             """
-            r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
-            for row in r.mappings().all():
+            wg_rows = []
+            for _aids in aid_chunks:
+                r = await db.execute(
+                    sa_text(wg_sql).bindparams(sa_bindparam("aids", expanding=True), **wg_params),
+                    {"aids": _aids},
+                )
+                wg_rows.extend(r.mappings().all())
+            for row in wg_rows:
                 aid = str(row["assignment_id"]) if row["assignment_id"] is not None else None
                 if aid is None or aid not in out:
                     continue
@@ -1647,19 +1794,27 @@ class GoHighLevelStatisticsSource:
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
             WHERE m.webinar_id = CAST(:wid AS uuid)
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
+              {_AIDS_PRED}
             GROUP BY m.assignment_id
         """
-        r = await db.execute(sa_text(opp_sql).bindparams(
-            wid=wid, N=N,
-            now_ts=datetime.now(timezone.utc),
-            won_stage=DEAL_WON_STAGE_ID,
-            dq_stage=DISQUALIFIED_STAGE_ID,
-            lq_great=LEAD_QUALITY_GREAT,
-            lq_ok=LEAD_QUALITY_OK,
-            lq_barely=LEAD_QUALITY_BARELY,
-            lq_dq=LEAD_QUALITY_BAD_DQ,
-        ))
-        for row in r.mappings().all():
+        opp_rows = []
+        for _aids in aid_chunks:
+            r = await db.execute(
+                sa_text(opp_sql).bindparams(
+                    sa_bindparam("aids", expanding=True),
+                    wid=wid, N=N,
+                    now_ts=datetime.now(timezone.utc),
+                    won_stage=DEAL_WON_STAGE_ID,
+                    dq_stage=DISQUALIFIED_STAGE_ID,
+                    lq_great=LEAD_QUALITY_GREAT,
+                    lq_ok=LEAD_QUALITY_OK,
+                    lq_barely=LEAD_QUALITY_BARELY,
+                    lq_dq=LEAD_QUALITY_BAD_DQ,
+                ),
+                {"aids": _aids},
+            )
+            opp_rows.extend(r.mappings().all())
+        for row in opp_rows:
             aid = str(row["assignment_id"]) if row["assignment_id"] is not None else None
             if aid is None or aid not in out:
                 continue
@@ -1737,21 +1892,36 @@ class GoHighLevelStatisticsSource:
         )
         lln_expr = "COALESCE(NULLIF(c.lead_list_name, ''), '(no label)')"
 
+        # Chunked probes + small-side joins below both want nested loops — the
+        # caller's whole-webinar hash-join tuning (random_page_cost=8) would
+        # rescan contacts per chunk instead.
+        await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+
         # {lead_list_name: {raw metric: count}} — merged across the batches.
         raw: dict[str, dict[str, int]] = {}
 
-        # invited: distinct cold contacts per list name.
+        # invited: distinct cold contacts per list name. This scans every
+        # membership of the webinar, so run it per assignment-chunk (exact under
+        # summation — chunks partition contacts, emails unique per webinar) to
+        # stay under the 120s statement cap on 100k+-member webinars.
+        from sqlalchemy import bindparam as sa_bindparam
         inv_sql = f"""
             SELECT {lln_expr} AS lln, COUNT(DISTINCT LOWER(c.email)) AS invited
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+              AND m.assignment_id IN :aids
             GROUP BY 1
         """
-        r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
-        for row in r.mappings().all():
-            raw.setdefault(row["lln"], {})["invited"] = int(row["invited"] or 0)
+        for _aids in await self._assignment_chunks(db, wid):
+            r = await db.execute(
+                sa_text(inv_sql).bindparams(sa_bindparam("aids", expanding=True), wid=wid),
+                {"aids": _aids},
+            )
+            for row in r.mappings().all():
+                slot = raw.setdefault(row["lln"], {})
+                slot["invited"] = slot.get("invited", 0) + int(row["invited"] or 0)
 
         # regs / attended / 10m: WebinarGeek subscriber join (needs a broadcast).
         if bid:
@@ -1919,24 +2089,36 @@ class GoHighLevelStatisticsSource:
             ELSE '(no size)'
           END"""
 
+        # Chunked probes + small-side joins want nested loops (see
+        # _compute_per_source_cells).
+        await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+
         # {bucket: {raw metric: count}} — merged across the batches.
         raw: dict[str, dict[str, int]] = {}
 
-        # invited: distinct cold contacts per size bucket.
+        # invited: distinct cold contacts per size bucket — chunked per
+        # assignment like per-source (exact under summation).
+        from sqlalchemy import bindparam as sa_bindparam
         inv_sql = f"""
             SELECT {bucket_expr} AS bucket, COUNT(DISTINCT LOWER(c.email)) AS invited
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
+              AND m.assignment_id IN :aids
             GROUP BY 1
         """
         inv_params = {"wid": wid}
         if bucket_id:
             inv_params["seg_bucket"] = bucket_id
-        r = await db.execute(sa_text(inv_sql).bindparams(**inv_params))
-        for row in r.mappings().all():
-            raw.setdefault(row["bucket"], {})["invited"] = int(row["invited"] or 0)
+        for _aids in await self._assignment_chunks(db, wid):
+            r = await db.execute(
+                sa_text(inv_sql).bindparams(sa_bindparam("aids", expanding=True), **inv_params),
+                {"aids": _aids},
+            )
+            for row in r.mappings().all():
+                slot = raw.setdefault(row["bucket"], {})
+                slot["invited"] = slot.get("invited", 0) + int(row["invited"] or 0)
 
         # regs / attended / 10m: WebinarGeek subscriber join (needs a broadcast).
         if bid:
