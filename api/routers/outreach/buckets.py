@@ -138,7 +138,13 @@ async def bucket_eligible_counts(
         except ValueError:
             raise HTTPException(400, "reuse_before must be an ISO date (YYYY-MM-DD)")
     cutoff_ts = reuse_cutoff_to_ts(reuse_cutoff, parsed_before)
-    claimable = claimable_conditions(cutoff_ts, webinar_id, reuse_only=reuse_only)
+    # Build the claimable predicate WITHOUT the target-webinar exclusion: any
+    # predicate on contacts.id breaks the index-only scan over the covering
+    # partial indexes (id isn't in them), turning this into ~600k heap fetches
+    # that blow the 120s cap. Instead, the target webinar's already-member
+    # overlap is counted separately below (driven from the SMALL membership
+    # side) and subtracted per bucket.
+    claimable = claimable_conditions(cutoff_ts, None, reuse_only=reuse_only)
 
     country_cond = None
     if country:
@@ -167,6 +173,33 @@ async def bucket_eligible_counts(
         .group_by(Contact.bucket_id)
     )
     counts = {row[0]: int(row[1] or 0) for row in result}
+
+    # Subtract contacts already members of the target webinar. Driven from the
+    # SMALL membership side (one PK probe per member — zero/tiny for a freshly
+    # created webinar), which keeps the big scan above index-only. Equivalent to
+    # the old in-query NOT-member predicate: base(claimable) − overlap(claimable
+    # ∧ member) = claimable ∧ ¬member, per bucket.
+    if webinar_id is not None:
+        overlap_conds = [
+            WebinarContactMembership.webinar_id == webinar_id,
+            Contact.user_id == LLOYD_USER_ID,
+            Contact.bucket_id.isnot(None),
+            ~Contact.is_blocklisted,
+            *claimable,
+        ]
+        if country_cond is not None:
+            overlap_conds.append(country_cond)
+        overlap_conds.extend(emp_conds)
+        overlap_result = await db.execute(
+            select(Contact.bucket_id, sa_func.count())
+            .select_from(WebinarContactMembership)
+            .join(Contact, Contact.id == WebinarContactMembership.contact_id)
+            .where(*overlap_conds)
+            .group_by(Contact.bucket_id)
+        )
+        for _bid, _cnt in overlap_result:
+            if _bid in counts:
+                counts[_bid] = max(0, counts[_bid] - int(_cnt or 0))
 
     # When a country/employee filter is active, also return a per-bucket TOTAL
     # that respects the SAME filter (all matching contacts, not just fresh) so the

@@ -147,10 +147,17 @@ def claimable_conditions(
             Contact.last_invited_at < cutoff_ts,
         ))
     if target_webinar_id is not None:
-        conds.append(~select(WebinarContactMembership.id).where(
-            WebinarContactMembership.contact_id == Contact.id,
-            WebinarContactMembership.webinar_id == target_webinar_id,
-        ).exists())
+        # Hashed anti-join, NOT a correlated NOT EXISTS: the correlated form
+        # probed the membership index once per candidate row (~4M fresh
+        # contacts), blowing the 120s statement cap on /buckets/eligible with a
+        # webinar_id — the target webinar's member set is tiny by comparison,
+        # so build it once and hash-exclude. (contact_id is NOT NULL, so the
+        # NOT IN NULL-semantics trap doesn't apply.)
+        conds.append(Contact.id.not_in(
+            select(WebinarContactMembership.contact_id).where(
+                WebinarContactMembership.webinar_id == target_webinar_id,
+            )
+        ))
     return conds
 
 
