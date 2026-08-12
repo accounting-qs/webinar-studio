@@ -33,3 +33,6 @@ apscheduler==3.10.4
 
 # Utilities
 python-multipart==0.0.20
+
+# Mojibake repair for imported CSVs (double-encoded UTF-8 names/companies)
+ftfy==6.3.1

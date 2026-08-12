@@ -77,7 +77,16 @@ export function BookingSourceModal({ target, onClose }: { target: DrillTarget; o
             <div className="text-base font-bold text-zinc-900 dark:text-zinc-100">{target.label}</div>
             {data && (
               <div className="text-[11px] text-zinc-500 mt-0.5">
-                {data.total} {unitLabel}
+                {data.unit === "opportunity" && data.unique_total != null ? (
+                  <>
+                    <span className="font-semibold text-zinc-700 dark:text-zinc-300">
+                      {data.unique_total.toLocaleString()} unique booker{data.unique_total === 1 ? "" : "s"}
+                    </span>
+                    {" · "}{data.total.toLocaleString()} opportunit{data.total === 1 ? "y" : "ies"}
+                  </>
+                ) : (
+                  <>{data.total.toLocaleString()} {unitLabel}</>
+                )}
                 {data.items.length < data.total ? ` · showing first ${data.items.length}` : ""}
               </div>
             )}

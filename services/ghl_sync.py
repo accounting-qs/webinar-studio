@@ -32,6 +32,7 @@ from db.models import (
     GHLSyncRun, GHLSyncSettings, GHLWebinarStats,
 )
 from db.session import AsyncSessionLocal
+from services.booking_attribution import rebuild_attributions
 from services.ghl_appointments import classify_calendar, derive_calls
 from integrations.ghl_client import (
     CONTACT_FIELD_BOOK_CAMPAIGN_CONTENT,
@@ -526,6 +527,16 @@ async def _derive_calls_for_contacts(state: _SyncState | None, contact_ids: list
                     .values(call1_source="custom_field")
                 )
             await db.commit()
+            # Capture-forward: lock each first-call booking to the webinar that
+            # drove it while the opp's webinar_source_number is still fresh, so a
+            # later overwrite can't move it. Best-effort — never abort the sync
+            # (e.g. if the membership table isn't migrated yet).
+            try:
+                await rebuild_attributions(db, chunk, lock=True)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception("booking-attribution capture-forward failed (non-fatal)")
         if state is not None:
             await _heartbeat(state)
 

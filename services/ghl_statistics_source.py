@@ -32,6 +32,14 @@ from db.session import AsyncSessionLocal
 logger = logging.getLogger(__name__)
 
 
+# Known limitation — A/B same-number variants: GHL custom fields carry only the
+# webinar NUMBER (webinar_source_number / booked_call_webinar_series), never the
+# A/B variant. So a booking for webinar N can't be split between variant A and B
+# of that number; number-keyed sales metrics count it for whichever variant(s)
+# the contact belongs to. Nonjoiner/no-list specials are already pinned to the
+# primary variant. Not fixable without variant data in GHL. (Reuse across
+# DIFFERENT numbers is handled by webinar_booking_attribution.)
+
 # Deal Won / Disqualified stage IDs (from reference project)
 DEAL_WON_STAGE_ID = "544b178f-d1f2-4186-a8c2-00c3b0eeefe8"
 DISQUALIFIED_STAGE_ID = "62448525-88ab-4e82-b414-b6880e69e2de"
@@ -208,7 +216,7 @@ def _webinar_series_regex(webinar_number: int) -> str:
 # Segments tab's _FUNNEL_RAW_KEYS so the aggregate + frontend reuse the same
 # funnel-derivation logic (percentages derived from these sums, never averaged).
 SOURCE_FUNNEL_RAW_KEYS = (
-    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
     "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -292,7 +300,7 @@ async def _webinar_summary_from_app(
     db: AsyncSession, webinar_id: str
 ) -> dict[str, float | None]:
     """Fetch invited/accountsNeeded from app-side assignments, plus the live
-    actuallyUsed count from contacts.outreach_status='used'."""
+    actuallyUsed count from webinar_contact_memberships (status='used')."""
     result = await db.execute(
         select(
             func.coalesce(func.sum(WebinarListAssignment.volume), 0).label("list_size"),
@@ -743,6 +751,24 @@ class GoHighLevelStatisticsSource:
             )
             summary["actuallyUsed"] = int(used_total.scalar() or 0)
 
+            # Keep invited >= actuallyUsed. Orphaned 'used' memberships (their list
+            # was deleted via delete_assignment, assignment_id NULL) are counted in
+            # the webinar-wide actuallyUsed just set, but their planned volume is
+            # gone from summary['invited'] (sum of surviving assignment volumes).
+            # Add them back so a deleted list never produces an impossible >100%
+            # used ratio. Non-orphan used are already within a surviving volume, so
+            # this does not double-count; webinars with no orphans are unaffected.
+            orphan_used = await db.execute(
+                select(func.count())
+                .select_from(WebinarContactMembership)
+                .where(
+                    WebinarContactMembership.webinar_id == w.id,
+                    WebinarContactMembership.status == "used",
+                    WebinarContactMembership.assignment_id.is_(None),
+                )
+            )
+            summary["invited"] = (summary.get("invited") or 0) + int(orphan_used.scalar() or 0)
+
             rows.extend(synthetic)
 
             # Per (data-source, vintage) funnel cells — powers the By List
@@ -975,6 +1001,7 @@ class GoHighLevelStatisticsSource:
                 WITH {NJ_EMAILS_CTE}, {NJ_CSV_CTE}
                 SELECT
                     COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                    COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
@@ -1007,6 +1034,7 @@ class GoHighLevelStatisticsSource:
             orow = r.mappings().one_or_none()
             if orow:
                 nj_metrics["totalBookings"] = int(orow["total_bookings"] or 0)
+                nj_metrics["uniqueBookers"] = int(orow["unique_bookers"] or 0)
                 nj_metrics["totalCallsDatePassed"] = int(orow["calls_passed"] or 0)
                 nj_metrics["confirmed"] = int(orow["confirmed"] or 0)
                 nj_metrics["shows"] = int(orow["shows"] or 0)
@@ -1220,6 +1248,9 @@ class GoHighLevelStatisticsSource:
             "lpRegs": lp_regs_u,
             "selfRegBookings": sr_bookings_u,
             "totalBookings": booked_u,
+            # NLD's booking count is already distinct-contact (COUNT DISTINCT
+            # COALESCE(ghl_contact_id, email)), so unique == total here.
+            "uniqueBookers": booked_u,
         }
 
         # WG attendance for the unplanned pool: anyone who attended the
@@ -1410,9 +1441,9 @@ class GoHighLevelStatisticsSource:
         """Return {assignment_id: partial_metrics_dict} with GHL/WG metrics
         filtered to the planning contacts of each list.
 
-        Uses Planning `contacts.assignment_id` to map Planning emails → list.
-        Joins to ghl_contact via lowercase email. Only lists whose planned
-        contacts actually exist in GHL will show counts > 0.
+        Uses `webinar_contact_memberships.assignment_id` (per-webinar) to map
+        Planning emails → list. Joins to ghl_contact via lowercase email. Only
+        lists whose planned contacts actually exist in GHL will show counts > 0.
 
         Performance: every metric that shares a join shape is computed via
         FILTER (WHERE …) inside one grouped query — three batched queries
@@ -1597,6 +1628,7 @@ class GoHighLevelStatisticsSource:
             SELECT
                 m.assignment_id,
                 COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= :now_ts) AS calls_passed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
@@ -1633,6 +1665,7 @@ class GoHighLevelStatisticsSource:
                 continue
             m = out[aid]
             m["totalBookings"] = int(row["total_bookings"] or 0)
+            m["uniqueBookers"] = int(row["unique_bookers"] or 0)
             m["totalCallsDatePassed"] = int(row["calls_passed"] or 0)
             m["confirmed"] = int(row["confirmed"] or 0)
             m["shows"] = int(row["shows"] or 0)
@@ -1651,7 +1684,7 @@ class GoHighLevelStatisticsSource:
         default_zero = [
             "yesMarked", "maybeMarked", "gcalInvitedGhl",
             "yesBookings", "maybeBookings",
-            "totalBookings", "totalCallsDatePassed", "confirmed", "shows", "noShows",
+            "totalBookings", "uniqueBookers", "totalCallsDatePassed", "confirmed", "shows", "noShows",
             "canceled", "won", "disqualified", "qualified",
             "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
         ]
@@ -1755,6 +1788,7 @@ class GoHighLevelStatisticsSource:
         bk_sql = f"""
             SELECT {lln_expr} AS lln,
                 COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
@@ -1784,6 +1818,7 @@ class GoHighLevelStatisticsSource:
         for row in r.mappings().all():
             slot = raw.setdefault(row["lln"], {})
             slot["totalBookings"] = int(row["total_bookings"] or 0)
+            slot["uniqueBookers"] = int(row["unique_bookers"] or 0)
             slot["confirmed"] = int(row["confirmed"] or 0)
             slot["shows"] = int(row["shows"] or 0)
             slot["noShows"] = int(row["no_shows"] or 0)
@@ -1820,7 +1855,7 @@ class GoHighLevelStatisticsSource:
 
 
     async def _compute_per_employee_cells(
-        self, db: AsyncSession, w: Webinar,
+        self, db: AsyncSession, w: Webinar, bucket_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Per company-size funnel cells for a webinar's cold lists — the data
         behind the "Employee count" tab.
@@ -1833,12 +1868,20 @@ class GoHighLevelStatisticsSource:
         present, else a stored canonical employee_range label; everything else
         (foreign ranges, stray dates, no size) lands in "(no size)". Single
         dimension, so one cell per bucket — no source/vintage rollup.
+
+        When `bucket_id` is given, restrict to that segment (assignment's bucket),
+        producing the segment × company-size cross the Segments-tab drill-down and
+        suggested-range use. Default None = webinar-wide (the Employee count tab).
         """
         from sqlalchemy import text as sa_text
 
         wid = w.id
         N = w.number
         bid = w.broadcast_id
+        # Optional segment restriction: filter to one bucket via the assignment's
+        # bucket (matches the /segments per-bucket dimension). Bind name is
+        # distinct from `bid` (broadcast_id) to avoid collision.
+        seg_filter = " AND wla.bucket_id = CAST(:seg_bucket AS uuid)" if bucket_id else ""
         # wla.id IS NOT NULL keeps the LEFT-JOINed membership rows of DELETED
         # lists out of the cold funnels (legacy INNER-JOIN semantics) — without
         # it, a deleted NONJOINER list's contacts would leak in as "cold".
@@ -1885,10 +1928,13 @@ class GoHighLevelStatisticsSource:
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
             GROUP BY 1
         """
-        r = await db.execute(sa_text(inv_sql).bindparams(wid=wid))
+        inv_params = {"wid": wid}
+        if bucket_id:
+            inv_params["seg_bucket"] = bucket_id
+        r = await db.execute(sa_text(inv_sql).bindparams(**inv_params))
         for row in r.mappings().all():
             raw.setdefault(row["bucket"], {})["invited"] = int(row["invited"] or 0)
 
@@ -1909,10 +1955,13 @@ class GoHighLevelStatisticsSource:
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
                 JOIN webinargeek_subscribers wgs
                     ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
-                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
                 GROUP BY 1
             """
-            r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
+            wg_params = {"wid": wid, "bid": bid}
+            if bucket_id:
+                wg_params["seg_bucket"] = bucket_id
+            r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
             for row in r.mappings().all():
                 slot = raw.setdefault(row["bucket"], {})
                 slot["totalRegs"] = int(row["total_regs"] or 0)
@@ -1925,6 +1974,7 @@ class GoHighLevelStatisticsSource:
         bk_sql = f"""
             SELECT {bucket_expr} AS bucket,
                 COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
+                COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
@@ -1941,19 +1991,23 @@ class GoHighLevelStatisticsSource:
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             GROUP BY 1
         """
-        r = await db.execute(sa_text(bk_sql).bindparams(
-            wid=wid, N=N,
-            won_stage=DEAL_WON_STAGE_ID, dq_stage=DISQUALIFIED_STAGE_ID,
-            lq_great=LEAD_QUALITY_GREAT, lq_ok=LEAD_QUALITY_OK,
-            lq_barely=LEAD_QUALITY_BARELY, lq_dq=LEAD_QUALITY_BAD_DQ,
-        ))
+        bk_params = {
+            "wid": wid, "N": N,
+            "won_stage": DEAL_WON_STAGE_ID, "dq_stage": DISQUALIFIED_STAGE_ID,
+            "lq_great": LEAD_QUALITY_GREAT, "lq_ok": LEAD_QUALITY_OK,
+            "lq_barely": LEAD_QUALITY_BARELY, "lq_dq": LEAD_QUALITY_BAD_DQ,
+        }
+        if bucket_id:
+            bk_params["seg_bucket"] = bucket_id
+        r = await db.execute(sa_text(bk_sql).bindparams(**bk_params))
         for row in r.mappings().all():
             slot = raw.setdefault(row["bucket"], {})
             slot["totalBookings"] = int(row["total_bookings"] or 0)
+            slot["uniqueBookers"] = int(row["unique_bookers"] or 0)
             slot["confirmed"] = int(row["confirmed"] or 0)
             slot["shows"] = int(row["shows"] or 0)
             slot["noShows"] = int(row["no_shows"] or 0)
@@ -1984,7 +2038,13 @@ class GoHighLevelStatisticsSource:
         prev_date,
         current_date,
     ) -> dict[str, float | None]:
-        """Aggregated base metrics (sum over lists) + webinar-wide GHL/WG metrics."""
+        """DEPRECATED / UNUSED — not called from any live path (the active per-webinar
+        summary is `_summary_from_per_list`). Kept only for reference. Do NOT revive
+        without fixing attribution: `_compute_webinar_metrics` below keys sales purely
+        on the webinar NUMBER with no membership join, so it conflates same-number A/B
+        variants and predates the per-webinar `webinar_booking_attribution` model.
+
+        Aggregated base metrics (sum over lists) + webinar-wide GHL/WG metrics."""
         summary: dict[str, float | None] = {
             # Base — aggregate from lists
             "accountsNeeded": sum((a.accounts_used or 0) for a in assignments),

@@ -16,7 +16,8 @@ from sqlalchemy.orm import selectinload, undefer
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, assignment_dict, claimable_conditions,
-    compute_blocklist_counts_per_assignment, copy_dict,
+    compute_blocklist_counts_per_assignment, compute_blocklist_counts_per_bucket,
+    copy_dict, employee_count_filter,
     recompute_contact_caches, reconcile_legacy_slots, reuse_cutoff_to_ts, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
@@ -172,22 +173,30 @@ async def delete_webinar(
     # assignment-less memberships (their list was deleted earlier) still hold
     # contacts whose bucket remaining changes when this webinar goes away.
     affected_rows = (await db.execute(
-        select(WebinarContactMembership.contact_id, WebinarContactMembership.bucket_id)
+        select(
+            WebinarContactMembership.contact_id,
+            WebinarContactMembership.bucket_id,
+            WebinarContactMembership.status,
+        )
         .where(WebinarContactMembership.webinar_id == webinar_id)
     )).all()
     affected_ids = [r.contact_id for r in affected_rows]
     touched_bucket_ids.update(r.bucket_id for r in affected_rows if r.bucket_id)
+    # `released` = in-flight (not-yet-sent) memberships this delete frees. Counted
+    # from the membership rows, not the legacy Contact.assignment_id slot: a
+    # reuse-assigned contact's legacy slot points at its EARLIER webinar, so the
+    # slot-based count missed them and reported 0.
+    membership_released = sum(1 for r in affected_rows if r.status == "assigned")
 
     # Legacy slot dual-write: release 'assigned' contacts, clear assignment_id on
-    # 'used' ones. `released` is the count of not-yet-sent contacts freed.
-    total_released = 0
+    # 'used' ones. (The returned `released` count comes from membership_released
+    # above, which also captures reuse-assigned contacts the legacy slot misses.)
     if assignment_ids:
-        release_result = await db.execute(
+        await db.execute(
             update(Contact)
             .where(Contact.assignment_id.in_(assignment_ids), Contact.outreach_status == "assigned")
             .values(assignment_id=None, outreach_status="available", assigned_date=None)
         )
-        total_released = release_result.rowcount
 
         await db.execute(
             update(Contact)
@@ -222,7 +231,7 @@ async def delete_webinar(
         )
     await db.flush()
 
-    return {"deleted": True, "released": total_released}
+    return {"deleted": True, "released": membership_released}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -325,6 +334,14 @@ async def assign_bucket(
     else:
         country_filter = []
 
+    # Employee-count range filter (literal headcount), applied identically to the
+    # availability counts and the claim so volume validation matches what gets
+    # claimed. Contacts with unknown size (NULL employee_count) are excluded when
+    # a bound is set. None/None = no filter.
+    emp_filter = employee_count_filter(
+        getattr(body, "emp_min", None), getattr(body, "emp_max", None)
+    )
+
     if is_custom_list:
         # Validate custom list upload
         from db.models import UploadHistory
@@ -348,6 +365,7 @@ async def assign_bucket(
                 not_blocklisted,
                 *claimable,
                 *country_filter,
+                *emp_filter,
             )
         )
         available_count = available_count_result.scalar() or 0
@@ -391,6 +409,7 @@ async def assign_bucket(
                 not_blocklisted,
                 *claimable,
                 *country_filter,
+                *emp_filter,
             )
         )
         available_count = available_count_result.scalar() or 0
@@ -409,9 +428,35 @@ async def assign_bucket(
         title_copy = _pick_copy("title")
         desc_copy = _pick_copy("description")
 
-        countries = body.countries_override or ", ".join(bucket.countries or [])
-        emp = body.emp_range_override or bucket.emp_range or ""
-        desc_str = f"{bucket.name}, {emp} emp, {countries}"
+        # Name = bucket name + the ACTUAL applied filters (appended below). The
+        # bucket's own emp_range / countries are NOT used — they're aggregate
+        # bucket metadata that don't reflect the contacts (same reason those
+        # columns were removed from the Copy Generator); the real employee-size /
+        # country signal lives on the contacts and comes through the filters.
+        desc_str = bucket.name
+
+    # Append a compact summary of the ACTUAL applied claim filters (employee
+    # headcount range, country filter, reuse cutoff) to the list description, so
+    # the operator can tell from the list name alone what narrowed this list.
+    _fbits: list[str] = []
+    _emin = getattr(body, "emp_min", None)
+    _emax = getattr(body, "emp_max", None)
+    if _emin is not None and _emax is not None:
+        _fbits.append(f"{_emin}-{_emax} emp")
+    elif _emin is not None:
+        _fbits.append(f"{_emin}+ emp")
+    elif _emax is not None:
+        _fbits.append(f"≤{_emax} emp")
+    if body.filter_countries:
+        _fbits.append("/".join(body.filter_countries))
+    if cutoff_ts is not None:
+        if getattr(body, "reuse_before", None):
+            _rlabel = f"before {body.reuse_before.isoformat()}"
+        else:
+            _rlabel = body.reuse_cutoff or "reuse"
+        _fbits.append(f"reused-only {_rlabel}" if getattr(body, "reuse_only", False) else f"reuse {_rlabel}")
+    if _fbits:
+        desc_str = f"{desc_str} · " + " · ".join(_fbits)
 
     if available_count < body.volume:
         raise HTTPException(
@@ -464,91 +509,113 @@ async def assign_bucket(
     # `outreach_status == 'available'` rows, so rows already flipped to 'assigned' by an
     # earlier chunk drop out of the next chunk's candidate set and it advances onto
     # fresh rows.
+    # Base claim predicate — everything except the fresh/reused reuse gate, which
+    # is swapped in per-pool below so a mixed reuse can be balanced 50/50.
     if is_custom_list:
-        claim_where = (
+        base_claim_where = (
             Contact.upload_id == body.upload_id,
             Contact.bucket_id.is_(None),
             not_blocklisted,
-            *claimable,
             *country_filter,
+            *emp_filter,
         )
     else:
-        claim_where = (
+        base_claim_where = (
             Contact.bucket_id == body.bucket_id,
             not_blocklisted,
-            *claimable,
             *country_filter,
+            *emp_filter,
         )
 
-    # Claim by inserting one membership per contact into this webinar's list.
-    # UNIQUE(webinar_id, contact_id) + ON CONFLICT DO NOTHING makes a double-click
-    # race idempotent (the second request inserts 0). Bumping
-    # assigned_membership_count on the just-claimed rows drops them out of the
-    # next chunk's `claimable` candidate set (they're no longer in-flight-free),
-    # the membership-model analog of the old outreach_status re-check. The legacy
-    # single-slot columns are dual-written only for still-fresh contacts (guarded
-    # WHERE outreach_status='available') so reused contacts keep their prior
-    # 'used' slot for any read path not yet migrated to memberships.
     membership_source_bucket = body.bucket_id if not is_custom_list else None
     # asyncpg caps a statement at 32,767 bind params. The membership INSERT
     # binds 7 values per row, so 2,000 rows ≈ 14k params — safely under the cap
     # (5,000 rows × 7 = 35k blew it up on real-size assigns).
     CLAIM_CHUNK = 2000
-    claimed = 0
-    while claimed < body.volume:
-        chunk_limit = min(CLAIM_CHUNK, body.volume - claimed)
-        # FOR UPDATE SKIP LOCKED: the row locks are what prevents two CONCURRENT
-        # assigns to DIFFERENT webinars from claiming the same contacts (the
-        # ON CONFLICT unique key only guards the same webinar). A concurrent
-        # claim skips our locked rows, and once we commit, its next chunk sees
-        # assigned_membership_count > 0 and excludes them via `claimable`. This
-        # replaces the old EvalPlanQual outreach_status re-check.
-        candidate_ids = (await db.execute(
-            select(Contact.id).where(*claim_where).limit(chunk_limit)
-            .with_for_update(skip_locked=True)
-        )).scalars().all()
-        if not candidate_ids:
-            break
-        inserted_ids = (await db.execute(
-            pg_insert(WebinarContactMembership)
-            .values([
-                {
-                    "user_id": LLOYD_USER_ID,
-                    "contact_id": cid,
-                    "webinar_id": webinar_id,
-                    "assignment_id": assignment.id,
-                    "bucket_id": membership_source_bucket,
-                    "status": "assigned",
-                    "assigned_date": webinar.date,
-                }
-                for cid in candidate_ids
-            ])
-            .on_conflict_do_nothing(index_elements=["webinar_id", "contact_id"])
-            .returning(WebinarContactMembership.contact_id)
-        )).scalars().all()
-        n = len(inserted_ids)
-        if n:
-            await db.execute(
-                update(Contact)
-                .where(Contact.id.in_(inserted_ids))
-                .values(assigned_membership_count=Contact.assigned_membership_count + 1)
-            )
-            # Legacy slot dual-write — fresh contacts only.
-            await db.execute(
-                update(Contact)
-                .where(Contact.id.in_(inserted_ids), Contact.outreach_status == "available")
-                .values(
-                    assignment_id=assignment.id,
-                    outreach_status="assigned",
-                    assigned_date=webinar.date,
+
+    async def _claim_pool(where_conds, target: int) -> int:
+        """Claim up to ``target`` contacts matching ``where_conds`` into this
+        list; return how many were claimed.
+
+        Issued in chunks rather than one big UPDATE: a single statement claiming
+        tens of thousands of rows runs past Postgres' 120s statement_timeout (each
+        row is a non-HOT update rewriting ~9 indexes). Chunking keeps each statement
+        under the cap while staying in one transaction (still atomic).
+
+        UNIQUE(webinar_id, contact_id) + ON CONFLICT DO NOTHING makes a double-click
+        race idempotent. FOR UPDATE SKIP LOCKED stops two CONCURRENT assigns to
+        DIFFERENT webinars from grabbing the same contacts. Bumping
+        assigned_membership_count on claimed rows drops them out of the next chunk's
+        — and the next pool's — candidate set. The legacy single-slot columns are
+        dual-written only for still-fresh contacts (WHERE outreach_status='available')
+        so reused contacts keep their prior 'used' slot for un-migrated read paths."""
+        got = 0
+        while got < target:
+            chunk_limit = min(CLAIM_CHUNK, target - got)
+            candidate_ids = (await db.execute(
+                select(Contact.id).where(*where_conds).limit(chunk_limit)
+                .with_for_update(skip_locked=True)
+            )).scalars().all()
+            if not candidate_ids:
+                break
+            inserted_ids = (await db.execute(
+                pg_insert(WebinarContactMembership)
+                .values([
+                    {
+                        "user_id": LLOYD_USER_ID,
+                        "contact_id": cid,
+                        "webinar_id": webinar_id,
+                        "assignment_id": assignment.id,
+                        "bucket_id": membership_source_bucket,
+                        "status": "assigned",
+                        "assigned_date": webinar.date,
+                    }
+                    for cid in candidate_ids
+                ])
+                .on_conflict_do_nothing(index_elements=["webinar_id", "contact_id"])
+                .returning(WebinarContactMembership.contact_id)
+            )).scalars().all()
+            n = len(inserted_ids)
+            if n:
+                await db.execute(
+                    update(Contact)
+                    .where(Contact.id.in_(inserted_ids))
+                    .values(assigned_membership_count=Contact.assigned_membership_count + 1)
                 )
-            )
-        claimed += n
-        if n < chunk_limit:
-            # Fewer rows than requested → the bucket/list is exhausted (or a concurrent
-            # assign claimed the remainder). Stop instead of looping on an empty set;
-            # the reconciliation below trues up assignment.volume to what was claimed.
-            break
+                # Legacy slot dual-write — fresh contacts only.
+                await db.execute(
+                    update(Contact)
+                    .where(Contact.id.in_(inserted_ids), Contact.outreach_status == "available")
+                    .values(
+                        assignment_id=assignment.id,
+                        outreach_status="assigned",
+                        assigned_date=webinar.date,
+                    )
+                )
+            got += n
+            if n < chunk_limit:
+                # Fewer rows than requested → this pool is exhausted (or a concurrent
+                # assign claimed the remainder). Stop looping on an empty set.
+                break
+        return got
+
+    # Mixed reuse (a cutoff is set AND fresh are NOT excluded) → aim for a ~50/50
+    # fresh/reused split rather than whatever physical scan order happens to return,
+    # spilling to whichever pool has more when one runs short. Claiming reused first
+    # bumps their cache so they can't be re-grabbed by the fresh pool. Fresh-only and
+    # reuse-only modes have a single pool and claim straight through. fresh ∪ reused
+    # equals the unioned `claimable` set, so the volume pre-check above still holds.
+    mixed_reuse = cutoff_ts is not None and not bool(getattr(body, "reuse_only", False))
+    if mixed_reuse:
+        fresh_where = (*base_claim_where, *claimable_conditions(None, webinar_id))
+        reused_where = (*base_claim_where, *claimable_conditions(cutoff_ts, webinar_id, reuse_only=True))
+        claimed = await _claim_pool(reused_where, body.volume // 2)
+        claimed += await _claim_pool(fresh_where, body.volume - claimed)
+        if claimed < body.volume:
+            # A pool ran short — backfill the remainder from reused.
+            claimed += await _claim_pool(reused_where, body.volume - claimed)
+    else:
+        claimed = await _claim_pool((*base_claim_where, *claimable), body.volume)
 
     # Reconcile assignment.volume / .remaining with what was actually claimed.
     # The pre-claim available_count check (line ~328) can race against a
@@ -605,7 +672,17 @@ async def assign_bucket(
     assignment = reload_result.scalar_one()
     bl = await compute_blocklist_counts_per_assignment(db, [assignment.id])
     resp = assignment_dict(assignment, blocklist_counts=bl.get(assignment.id))
-    resp["bucket_remaining"] = bucket.remaining_contacts if bucket else None
+    # Return the SAME blocklist-adjusted remaining that GET /outreach/buckets
+    # serves (fresh baseline minus blocklisted-fresh), not the raw stored counter.
+    # The frontend writes this into b.remaining_contacts, which feeds the header
+    # AVAILABLE stat; returning the raw value made AVAILABLE drift upward in-session
+    # for buckets holding blocklisted-fresh contacts until a page reload.
+    if bucket:
+        bl_bucket = await compute_blocklist_counts_per_bucket(db, [bucket.id])
+        blocklisted_available = bl_bucket.get(bucket.id, {}).get("available", 0)
+        resp["bucket_remaining"] = max(0, (bucket.remaining_contacts or 0) - blocklisted_available)
+    else:
+        resp["bucket_remaining"] = None
     return resp
 
 

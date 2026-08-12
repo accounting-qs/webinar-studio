@@ -181,3 +181,111 @@ def derive_calls(appointments: Iterable[dict]) -> dict:
         "call2_appointment_date": (call2.get("start_time") if call2 else None),
         "call2_appointment_status": call2_status,
     }
+
+
+# ── Per-booking → webinar attribution ─────────────────────────────────────────
+#
+# GHL keeps one opportunity per contact and overwrites `webinar_source_number` on
+# each new booking; appointments carry no webinar tag and calendars are shared. So
+# to keep per-webinar sales history we resolve which webinar drove each booked call
+# here — authoritatively at sync time (source number is fresh for the just-booked
+# call), best-effort for the past. Pure/testable: callers pass normalized data.
+#
+# A `webinar` here is a dict: {webinar_id, number, variant_label, date (a date),
+# broadcast_id}. All datetimes are compared by calendar date against booked_at.
+
+ATTR_SOURCE_NUMBER = "source_number"
+ATTR_ATTENDED = "attended"
+ATTR_INVITED = "invited"
+ATTR_DATE_WINDOW = "date_window"
+ATTR_RESCHEDULE = "reschedule_inherit"
+ATTR_UNKNOWN = "unknown"
+
+
+def _most_recent_on_or_before(webinars: Iterable[dict], when: datetime) -> Optional[dict]:
+    """The webinar with the latest date at/before `when` (booking date)."""
+    d = when.date() if hasattr(when, "date") else when
+    eligible = [w for w in webinars if w.get("date") is not None and w["date"] <= d]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda w: w["date"])
+
+
+def _pick_variant(candidates: list[dict], member_ids: set) -> Optional[dict]:
+    """Resolve a webinar-number match to a single webinar. Prefer a variant the
+    contact is a member of; otherwise the earliest (stable) variant."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    member_hits = [w for w in candidates if w.get("webinar_id") in member_ids]
+    pool = member_hits or candidates
+    return min(pool, key=lambda w: (w.get("date") or _DATE_MAX, str(w.get("variant_label") or "")))
+
+
+_DATE_MAX = datetime.max.date()
+
+
+def attribute_booking(
+    *,
+    booked_at: Optional[datetime],
+    opp_webinar_number: Optional[int],
+    trust_source_number: bool,
+    member_webinars: list[dict],
+    attended_webinars: list[dict],
+    webinars_by_number: dict,
+    webinars_by_date: list[dict],
+    origin_webinar_id: Optional[str],
+) -> tuple[Optional[str], str]:
+    """Attribute one first-call booking to a webinar. Returns (webinar_id | None,
+    attribution_source). Priority cascade (see plan):
+
+    1. source_number  — the opp's current webinar_source_number, but only when
+       `trust_source_number` (this is the just-booked / latest call). A/B same
+       number resolves to the variant the contact is a member of.
+    2. attended       — the most recent webinar the contact ATTENDED on/before the
+       booking date.
+    3. invited        — the most recent webinar the contact was a MEMBER of on/before
+       the booking date.
+    4. reschedule     — no fresh engagement signal but the contact ALREADY has an
+       originating booking → treat this as a reschedule/follow-up and inherit that
+       webinar (so a re-book weeks later stays with the lead's original webinar
+       instead of falling into a later webinar's date window).
+    5. date_window    — first booking with no engagement signal → best-guess the
+       webinar whose [date, next-webinar-date) contains the booking date.
+    6. unknown        — nothing resolved (e.g. booked under a different email).
+    """
+    member_ids = {w.get("webinar_id") for w in member_webinars}
+
+    # 1. Source number (authoritative only for the latest/just-booked call).
+    if trust_source_number and opp_webinar_number is not None:
+        w = _pick_variant(webinars_by_number.get(opp_webinar_number, []), member_ids)
+        if w:
+            return w["webinar_id"], ATTR_SOURCE_NUMBER
+
+    if booked_at is not None:
+        # 2. Attended-in-window.
+        w = _most_recent_on_or_before(attended_webinars, booked_at)
+        if w:
+            return w["webinar_id"], ATTR_ATTENDED
+        # 3. Invited-in-window.
+        w = _most_recent_on_or_before(member_webinars, booked_at)
+        if w:
+            return w["webinar_id"], ATTR_INVITED
+
+    # 4. Reschedule/follow-up: no fresh signal, but we already know this lead's
+    #    origin webinar → keep it there rather than guess by date.
+    if origin_webinar_id is not None:
+        return origin_webinar_id, ATTR_RESCHEDULE
+
+    if booked_at is not None:
+        # 5. Date-window across ALL webinars (first one whose window contains booked_at).
+        d = booked_at.date()
+        dated = [w for w in webinars_by_date if w.get("date") is not None]
+        for i, w in enumerate(dated):
+            nxt = dated[i + 1]["date"] if i + 1 < len(dated) else _DATE_MAX
+            if w["date"] <= d < nxt:
+                return w["webinar_id"], ATTR_DATE_WINDOW
+
+    # 6. Unattributable.
+    return None, ATTR_UNKNOWN

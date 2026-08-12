@@ -111,6 +111,9 @@ export interface ApiBucket {
   /** Manual quality mark; null/absent when unmarked. Always present on server
    * responses; optional so client-built placeholder buckets can omit it. */
   quality?: BucketQuality | null;
+  /** User-set per-segment employee-count range (Statistics → Segments). */
+  stat_emp_min?: number | null;
+  stat_emp_max?: number | null;
   created_at: string | null;
   // included when ?include=copies
   titles?: ApiCopy[];
@@ -266,7 +269,7 @@ export async function createBucket(data: {
 
 export async function updateBucket(
   bucketId: string,
-  data: Partial<{ name: string; industry: string; total_contacts: number; remaining_contacts: number; countries: string[]; emp_range: string; quality: BucketQuality | null }>
+  data: Partial<{ name: string; industry: string; total_contacts: number; remaining_contacts: number; countries: string[]; emp_range: string; quality: BucketQuality | null; stat_emp_min: number | null; stat_emp_max: number | null }>
 ): Promise<ApiBucket> {
   const res = await fetch(`${API_URL}/outreach/buckets/${bucketId}`, {
     method: "PUT",
@@ -287,6 +290,17 @@ export async function updateBucketQuality(
   quality: BucketQuality | null,
 ): Promise<ApiBucket> {
   return updateBucket(bucketId, { quality });
+}
+
+/** Set (or clear, with null) a segment's employee-count range. Thin wrapper over
+ * updateBucket used by the Statistics → Segments dashboard. Either bound may be
+ * null (open range); both null clears the definition. */
+export async function updateBucketStatEmpRange(
+  bucketId: string,
+  statEmpMin: number | null,
+  statEmpMax: number | null,
+): Promise<ApiBucket> {
+  return updateBucket(bucketId, { stat_emp_min: statEmpMin, stat_emp_max: statEmpMax });
 }
 
 /* ── Outreach: Copies ──────────────────────────────────────────────────── */
@@ -754,6 +768,8 @@ export async function assignBucketToWebinar(
     countries_override?: string;
     emp_range_override?: string;
     filter_countries?: string[];
+    emp_min?: number;
+    emp_max?: number;
     reuse_cutoff?: string;
     reuse_before?: string;
     reuse_only?: boolean;
@@ -797,24 +813,41 @@ export async function fetchAssignCountries(
     .sort((a, b) => b.count - a.count);
 }
 
-/** Per-bucket claimable-remaining under a reuse filter. Returns { bucketId: count }.
- *  Used by the Planning assign panel to show a reuse-aware "remaining" above the
- *  bucket list (bucket TOTAL is unchanged; only remaining reflects the filter). */
+/** Per-bucket counts under the assign-panel filters. Returns two { bucketId: count }
+ *  maps: `remaining` (reuse-aware claimable) and `totals` (all matching contacts,
+ *  present only when a country/employee filter is active — otherwise the client
+ *  uses the static bucket.total_contacts). Both reflect the country/employee
+ *  filters; remaining also reflects the reuse cutoff. */
 export async function fetchBucketEligible(
-  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[] }
-): Promise<Record<string, number>> {
+  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[]; emp_min?: number; emp_max?: number }
+): Promise<{ remaining: Record<string, number>; totals: Record<string, number> }> {
   const qs = new URLSearchParams();
   if (params.reuse_cutoff) qs.set("reuse_cutoff", params.reuse_cutoff);
   if (params.reuse_before) qs.set("reuse_before", params.reuse_before);
   if (params.reuse_only) qs.set("reuse_only", "true");
   if (params.webinar_id) qs.set("webinar_id", params.webinar_id);
   for (const c of params.country ?? []) qs.append("country", c);
+  if (params.emp_min != null) qs.set("emp_min", String(params.emp_min));
+  if (params.emp_max != null) qs.set("emp_max", String(params.emp_max));
   const res = await fetch(`${API_URL}/outreach/buckets/eligible?${qs.toString()}`, {
     headers: jsonHeaders(),
   });
-  if (!res.ok) return {};
+  if (!res.ok) return { remaining: {}, totals: {} };
   const data = await res.json();
-  return data.buckets ?? {};
+  return { remaining: data.buckets ?? {}, totals: data.totals ?? {} };
+}
+
+export interface GoodAvailable { total: number; us_ca: number; europe: number; no_location: number; }
+
+/** Fresh "ideal" inventory for the Planning header: claimable contacts in
+ *  good/medium/unmarked buckets (excludes 'bad' + the 'disqualified' bucket),
+ *  each bucket's saved Segments employee range applied where set. Returns the
+ *  total plus geo splits (US+Canada, Europe, no-location); the splits are subsets
+ *  of the total. */
+export async function fetchGoodAvailable(): Promise<GoodAvailable> {
+  const res = await fetch(`${API_URL}/outreach/buckets/good-available`, { headers: authHeaders() });
+  if (!res.ok) return { total: 0, us_ca: 0, europe: 0, no_location: 0 };
+  return res.json();
 }
 
 export async function updateAssignment(
@@ -1479,6 +1512,7 @@ export interface StatisticsMetrics {
   total10MinPlus: number | null;
   total30MinPlus: number | null;
   totalBookings: number | null;
+  uniqueBookers: number | null;  // distinct booked contacts (displayed "Bookings")
   totalCallsDatePassed: number | null;
   confirmed: number | null;
   shows: number | null;
@@ -1671,6 +1705,10 @@ export interface SegmentFunnelRow {
   bucketName: string | null;
   /** Manual quality mark; null on Other/Total rows and unmarked buckets. */
   quality: BucketQuality | null;
+  /** User-set per-segment employee-count range (literal headcount); null when
+   * undefined or on the Other/Total rows. Either bound may be null (open range). */
+  statEmpMin?: number | null;
+  statEmpMax?: number | null;
   invites: number;
   regs: number;
   attendees10m: number;
@@ -1716,6 +1754,56 @@ export async function fetchStatisticsSegments(
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to fetch segment funnel");
+  return res.json();
+}
+
+/** One canonical company-size band's funnel counts for a single segment, summed
+ * across the selected webinars. Raw counts — percentages + the suggested range
+ * are derived on the client. */
+export interface SegmentEmployeeBand {
+  sizeLabel: string;
+  minEmp: number | null;
+  maxEmp: number | null;
+  invites: number;
+  regs: number;
+  attendees10m: number;
+  bookings: number;
+  confirmed: number;
+  shows: number;
+  noShows: number;
+  canceled: number;
+  won: number;
+  disqualified: number;
+  qualified: number;
+  leadQualityGreat: number;
+  leadQualityOk: number;
+  leadQualityBarelyPassable: number;
+  leadQualityBadDq: number;
+}
+
+export interface SegmentEmployeeResponse {
+  bucketId: string;
+  bucketName: string | null;
+  statEmpMin: number | null;
+  statEmpMax: number | null;
+  includedWebinarIds: string[];
+  bands: SegmentEmployeeBand[];
+}
+
+/** Live per-segment × company-size funnel for one bucket (drill-down + suggested
+ * range). Scope with the same webinar UUIDs as the Segments table; omit for all. */
+export async function fetchSegmentEmployee(
+  bucketId: string,
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<SegmentEmployeeResponse> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(
+    `${API_URL}/statistics/segments/${bucketId}/by-employee?${qs.toString()}`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error("Failed to fetch segment employee breakdown");
   return res.json();
 }
 
@@ -1974,6 +2062,7 @@ export interface ContactDrilldownResponse {
   assignment_id: string | null;
   unit: "contact" | "opportunity";
   total: number;
+  unique_total: number | null;  // distinct booked contacts (headline "unique bookers")
   items: ContactDrilldownItem[];
   available: boolean;
   reason: string | null;

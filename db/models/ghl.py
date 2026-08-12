@@ -185,6 +185,51 @@ class GHLWebinarStats(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class WebinarBookingAttribution(Base):
+    """Per-booking → webinar attribution that Webinar Studio OWNS, so it survives
+    GHL overwriting its single opportunity per contact.
+
+    One row per first-call `ghl_appointment` (`appointment_id` PK). GHL keeps a
+    single opportunity per contact and overwrites `webinar_source_number` on each
+    new booking; appointments preserve per-call date/status but carry no webinar
+    tag. So we capture which webinar drove each booked call here — at sync time
+    (`webinar_source_number` is authoritative for the just-booked call) and lock
+    it (`locked_at`) so a later overwrite can't move it. Past appointments are
+    backfilled best-effort via the attribution cascade. The sales funnel reads
+    this table instead of the (collapsed, latest-only) opportunity.
+    """
+    __tablename__ = "webinar_booking_attribution"
+
+    appointment_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(Text)
+    # App contact (lowercased-email match); NULL when the booking used a different
+    # email than any app/attendance identity — inherently unattributable.
+    contact_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False))
+    # Attributed webinar; NULL when no signal resolved (attribution_source='unknown').
+    webinar_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False))
+    # source_number | attended | invited | date_window | reschedule_inherit | unknown
+    attribution_source: Mapped[Optional[str]] = mapped_column(Text)
+    booked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # The call's scheduled time (appointment start_time) — powers "calls passed".
+    call_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    call_status: Mapped[Optional[str]] = mapped_column(Text)
+    # Snapshotted from the opportunity at capture time (all three are per-contact-
+    # latest on GHL, so we freeze them to the webinar that owned the call).
+    lead_quality: Mapped[Optional[str]] = mapped_column(Text)
+    won: Mapped[Optional[bool]] = mapped_column(Boolean)
+    disqualified: Mapped[Optional[bool]] = mapped_column(Boolean)
+    # Set once the attribution is trusted (capture-forward). A locked row is never
+    # re-attributed by a later sync, even after GHL overwrites the opportunity.
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_wba_webinar", "webinar_id"),
+        Index("ix_wba_contact", "ghl_contact_id"),
+        Index("ix_wba_app_contact", "contact_id"),
+    )
+
+
 class GHLSyncSettings(Base):
     __tablename__ = "ghl_sync_settings"
 

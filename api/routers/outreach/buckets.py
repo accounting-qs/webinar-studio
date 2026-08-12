@@ -17,7 +17,8 @@ from sqlalchemy.orm import selectinload
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, bucket_dict, claimable_conditions,
-    compute_blocklist_counts_per_bucket, copy_dict, reuse_cutoff_to_ts,
+    compute_blocklist_counts_per_bucket, copy_dict, employee_count_filter,
+    reuse_cutoff_to_ts,
 )
 from api.schemas import (
     BucketCreate, BucketMergeRequest, BucketUpdate, CopyBulkGenerateRequest,
@@ -110,6 +111,8 @@ async def bucket_eligible_counts(
     reuse_only: bool = Query(False),
     webinar_id: str | None = Query(None),
     country: list[str] | None = Query(None),
+    emp_min: int | None = Query(None),
+    emp_max: int | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
@@ -119,7 +122,8 @@ async def bucket_eligible_counts(
     bucket TOTAL is unchanged, but REMAINING reflects the reuse cutoff. Uses the
     exact same predicate the claim uses (via `claimable_conditions`) so the number
     ties out to what an assign would actually grab. Blocklisted contacts are
-    excluded; `country` mirrors the assign-form country filter.
+    excluded; `country` and `emp_min`/`emp_max` mirror the assign-form country and
+    employee-count filters so the shown remaining matches what a claim would grab.
     """
     from datetime import date as _date
 
@@ -136,6 +140,15 @@ async def bucket_eligible_counts(
     cutoff_ts = reuse_cutoff_to_ts(reuse_cutoff, parsed_before)
     claimable = claimable_conditions(cutoff_ts, webinar_id, reuse_only=reuse_only)
 
+    country_cond = None
+    if country:
+        blank_country = or_(Contact.country.is_(None), Contact.country == "")
+        country_cond = or_(
+            Contact.country.in_(country),
+            and_(blank_country, Contact.list_location.in_(country)),
+        )
+    emp_conds = employee_count_filter(emp_min, emp_max)
+
     conds = [
         Contact.user_id == LLOYD_USER_ID,
         Contact.bucket_id.isnot(None),
@@ -144,12 +157,9 @@ async def bucket_eligible_counts(
         ~Contact.is_blocklisted,
         *claimable,
     ]
-    if country:
-        blank_country = or_(Contact.country.is_(None), Contact.country == "")
-        conds.append(or_(
-            Contact.country.in_(country),
-            and_(blank_country, Contact.list_location.in_(country)),
-        ))
+    if country_cond is not None:
+        conds.append(country_cond)
+    conds.extend(emp_conds)
 
     result = await db.execute(
         select(Contact.bucket_id, sa_func.count())
@@ -157,7 +167,128 @@ async def bucket_eligible_counts(
         .group_by(Contact.bucket_id)
     )
     counts = {row[0]: int(row[1] or 0) for row in result}
-    return {"buckets": counts, "total": sum(counts.values())}
+
+    # When a country/employee filter is active, also return a per-bucket TOTAL
+    # that respects the SAME filter (all matching contacts, not just fresh) so the
+    # assign panel's Total column tracks the filter alongside Remaining. Skipped
+    # when no filter is set: an unfiltered GROUP BY over the whole contacts table
+    # is the exact aggregate list_buckets deliberately avoids for performance —
+    # the client uses the static bucket.total_contacts in that case.
+    totals: dict = {}
+    if country_cond is not None or emp_conds:
+        total_conds = [
+            Contact.user_id == LLOYD_USER_ID,
+            Contact.bucket_id.isnot(None),
+            ~Contact.is_blocklisted,
+        ]
+        if country_cond is not None:
+            total_conds.append(country_cond)
+        total_conds.extend(emp_conds)
+        total_result = await db.execute(
+            select(Contact.bucket_id, sa_func.count())
+            .where(*total_conds)
+            .group_by(Contact.bucket_id)
+        )
+        totals = {row[0]: int(row[1] or 0) for row in total_result}
+
+    return {"buckets": counts, "total": sum(counts.values()), "totals": totals}
+
+
+# Country-name buckets for the Good-Available geo split. Matched case-insensitively
+# on a letters-only normalization of the effective location, so dirty values like
+# "'United States']" still classify. Turkey/Russia are intentionally left out of
+# Europe (transcontinental) — adjust here if you want them counted.
+_GOOD_GEO_US_CA = {
+    "united states", "united states of america", "usa", "us", "u s a", "u s",
+    "america", "canada",
+}
+_GOOD_GEO_EUROPE = {
+    "united kingdom", "uk", "great britain", "england", "scotland", "wales",
+    "northern ireland", "ireland", "germany", "france", "netherlands",
+    "the netherlands", "italy", "spain", "sweden", "switzerland", "belgium",
+    "poland", "finland", "austria", "denmark", "norway", "portugal",
+    "czech republic", "czechia", "greece", "hungary", "romania", "slovakia",
+    "slovenia", "croatia", "bulgaria", "lithuania", "latvia", "estonia",
+    "luxembourg", "iceland", "malta", "cyprus", "ukraine", "serbia",
+    "liechtenstein", "monaco", "andorra", "san marino",
+}
+
+
+def _norm_location(s: str | None) -> str:
+    """Lowercase, keep only letters/spaces, collapse whitespace — repairs dirty
+    country values (e.g. "'United States']" -> "united states") for classifying."""
+    if not s:
+        return ""
+    import re
+    cleaned = re.sub(r"[^a-z ]", " ", s.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+@router.get("/buckets/good-available")
+async def good_available_counts(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Fresh 'ideal' inventory for the Planning header.
+
+    Counts claimable contacts in good/medium/unmarked buckets (excludes only
+    'bad' quality and the 'disqualified' bucket), with each bucket's saved
+    Statistics→Segments employee range applied where set — unknown-size contacts
+    are excluded when a range is set, and there's no size restriction when a
+    bucket has no range. 'Fresh' = never invited and not in-flight
+    (last_invited_at IS NULL, assigned_membership_count = 0), the same baseline
+    the bucket 'remaining' uses; blocklisted contacts are excluded.
+
+    Returns the total plus geo splits (US+Canada, Europe, no-location). The three
+    splits are subsets of the total — the rest of the world (APAC/LATAM/etc.) is
+    in the total but in none of the three splits.
+    """
+    # Per-bucket employee range: apply the saved range where set (excluding
+    # unknown-size contacts), otherwise no size restriction.
+    emp_ok = or_(
+        and_(OutreachBucket.stat_emp_min.is_(None), OutreachBucket.stat_emp_max.is_(None)),
+        and_(
+            Contact.employee_count.isnot(None),
+            or_(OutreachBucket.stat_emp_min.is_(None), Contact.employee_count >= OutreachBucket.stat_emp_min),
+            or_(OutreachBucket.stat_emp_max.is_(None), Contact.employee_count <= OutreachBucket.stat_emp_max),
+        ),
+    )
+    # Effective location: per-contact country, else list-level location.
+    loc_expr = sa_func.coalesce(
+        sa_func.nullif(sa_func.trim(Contact.country), ""),
+        sa_func.nullif(sa_func.trim(Contact.list_location), ""),
+    )
+    result = await db.execute(
+        select(loc_expr.label("loc"), sa_func.count())
+        .select_from(Contact)
+        .join(OutreachBucket, OutreachBucket.id == Contact.bucket_id)
+        .where(
+            Contact.user_id == LLOYD_USER_ID,
+            OutreachBucket.deleted_at.is_(None),
+            # good + medium + unmarked → exclude only 'bad'
+            or_(OutreachBucket.quality.is_(None), OutreachBucket.quality != "bad"),
+            sa_func.lower(OutreachBucket.name) != "disqualified",
+            # NOT form matches ix_contacts_claimable's partial predicate.
+            ~Contact.is_blocklisted,
+            Contact.last_invited_at.is_(None),
+            Contact.assigned_membership_count == 0,
+            emp_ok,
+        )
+        .group_by(loc_expr)
+    )
+
+    total = us_ca = europe = no_location = 0
+    for loc, cnt in result:
+        cnt = int(cnt or 0)
+        total += cnt
+        n = _norm_location(loc)
+        if not n:
+            no_location += cnt
+        elif n in _GOOD_GEO_US_CA:
+            us_ca += cnt
+        elif n in _GOOD_GEO_EUROPE:
+            europe += cnt
+    return {"total": total, "us_ca": us_ca, "europe": europe, "no_location": no_location}
 
 
 @router.post("/buckets", status_code=201)
@@ -233,6 +364,15 @@ async def update_bucket(
         )
         if clash.scalar_one_or_none():
             raise HTTPException(409, f"A bucket named '{new_name}' already exists.")
+
+    # Pre-check the employee-range invariant (mirrors the name-clash pre-check
+    # above) so an inverted range returns a friendly 400 instead of a 500 from
+    # the ck_outreach_buckets_stat_emp_range IntegrityError. Resolve against the
+    # bucket's current values since either bound may be omitted from this update.
+    eff_emp_min = updates["stat_emp_min"] if "stat_emp_min" in updates else bucket.stat_emp_min
+    eff_emp_max = updates["stat_emp_max"] if "stat_emp_max" in updates else bucket.stat_emp_max
+    if eff_emp_min is not None and eff_emp_max is not None and eff_emp_min > eff_emp_max:
+        raise HTTPException(400, "Employee-count min must be less than or equal to max.")
 
     for field, val in updates.items():
         setattr(bucket, field, val)

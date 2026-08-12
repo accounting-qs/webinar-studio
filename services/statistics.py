@@ -76,6 +76,12 @@ def compute_derived_metrics(
     used_fallback = actually_used is None or actually_used == 0
     inv = planned_invited if used_fallback else actually_used
 
+    # Booking-rate numerator: the displayed "Bookings" is unique bookers, so the
+    # rate metrics divide by unique bookers too. Fall back to total opportunities
+    # on pre-uniqueBookers snapshots (before the deploy recompute populates it).
+    _ub = m.get("uniqueBookers")
+    ub = _ub if _ub is not None else m.get("totalBookings")
+
     derived: dict[str, float | None] = {
         # Pass through all raw fields
         **m,
@@ -128,14 +134,11 @@ def compute_derived_metrics(
         "attend30MinPercent": _safe_div(
             m.get("total30MinPlus"), m.get("totalAttended")
         ),
-        # Sales
-        "bookingsPerAttended": _safe_div(
-            m.get("totalBookings"), m.get("totalAttended")
-        ),
-        "bookingsPerPast10Min": _safe_div(
-            m.get("totalBookings"), m.get("total10MinPlus")
-        ),
-        "totalBookingsPer1kInv": _safe_per1k(m.get("totalBookings"), inv),
+        # Sales — booking rates use unique bookers (see `ub` above); Show% keeps
+        # total opportunities since its numerator (shows) is per-opportunity.
+        "bookingsPerAttended": _safe_div(ub, m.get("totalAttended")),
+        "bookingsPerPast10Min": _safe_div(ub, m.get("total10MinPlus")),
+        "totalBookingsPer1kInv": _safe_per1k(ub, inv),
         "showPercent": _safe_div(m.get("shows"), m.get("totalBookings")),
         "closeRatePercent": _safe_div(m.get("won"), m.get("shows")),
         "qualPercent": _safe_div(m.get("qualified"), m.get("shows")),
@@ -155,7 +158,7 @@ _SUM_KEYS = [
     "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick", "maybeBookings",
     "selfRegMarked", "selfRegAttended", "selfReg10MinPlus", "selfRegBookings",
     "totalRegs", "totalAttended", "attendBySmsReminder",
-    "total10MinPlus", "total30MinPlus", "totalBookings",
+    "total10MinPlus", "total30MinPlus", "totalBookings", "uniqueBookers",
     "totalCallsDatePassed", "confirmed", "shows", "noShows", "canceled",
     "won", "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -463,7 +466,7 @@ async def get_statistics_webinar_one(
 # so the Segments dashboard can show Show% / Close% / Qual% and the underlying
 # counts per bucket.
 _FUNNEL_RAW_KEYS = (
-    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
     "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -579,6 +582,8 @@ async def get_statistics_segments(
     # the ids come from the user's own snapshots, so no extra user scoping is
     # needed. None for the "Other"/Total rows and any unmarked bucket.
     quality_by_bucket: dict[str, str | None] = {}
+    # Per-segment user-set employee range (Segments dashboard) shown alongside quality.
+    stat_emp_by_bucket: dict[str, tuple[int | None, int | None]] = {}
     bucket_ids = [k for k in agg if k is not None]
     if bucket_ids:
         from sqlalchemy import select
@@ -586,21 +591,28 @@ async def get_statistics_segments(
         from db.models import OutreachBucket
         async with AsyncSessionLocal() as db:
             res = await db.execute(
-                select(OutreachBucket.id, OutreachBucket.quality).where(
-                    OutreachBucket.id.in_(bucket_ids)
-                )
+                select(
+                    OutreachBucket.id, OutreachBucket.quality,
+                    OutreachBucket.stat_emp_min, OutreachBucket.stat_emp_max,
+                ).where(OutreachBucket.id.in_(bucket_ids))
             )
-            quality_by_bucket = {row[0]: row[1] for row in res.all()}
+            for row in res.all():
+                quality_by_bucket[row[0]] = row[1]
+                stat_emp_by_bucket[row[0]] = (row[2], row[3])
 
     def _shape(slot: dict[str, Any]) -> dict[str, Any]:
+        _emp = stat_emp_by_bucket.get(slot["bucketId"], (None, None))
         return {
             "bucketId": slot["bucketId"],
             "bucketName": slot.get("bucketName"),
             "quality": quality_by_bucket.get(slot["bucketId"]),
+            "statEmpMin": _emp[0],
+            "statEmpMax": _emp[1],
             "invites": int(slot["invited"] or 0),
             "regs": int(slot["totalRegs"] or 0),
             "attendees10m": int(slot["total10MinPlus"] or 0),
             "bookings": int(slot["totalBookings"] or 0),
+            "uniqueBookers": int(slot.get("uniqueBookers") or 0),
             "confirmed": int(slot["confirmed"] or 0),
             "shows": int(slot["shows"] or 0),
             "noShows": int(slot["noShows"] or 0),
@@ -647,6 +659,118 @@ async def get_statistics_segments(
     }
 
 
+# Canonical company-size bands (mirror _EMPLOYEE_BUCKETS in
+# api/routers/outreach/uploads.py) with literal headcount bounds, for the
+# per-segment drill-down + suggested range. Upper bound inclusive; "10000+" open
+# (maxEmp None). "(no size)" is appended separately when present.
+_EMPLOYEE_BANDS: tuple[tuple[str, int | None, int | None], ...] = (
+    ("0 - 2", 0, 2), ("3 - 5", 3, 5), ("6 - 10", 6, 10), ("11 - 20", 11, 20),
+    ("21 - 50", 21, 50), ("51 - 100", 51, 100), ("101 - 200", 101, 200),
+    ("201 - 500", 201, 500), ("501 - 1000", 501, 1000), ("1001 - 2000", 1001, 2000),
+    ("2001 - 5000", 2001, 5000), ("5001 - 10000", 5001, 10000), ("10000+", 10000, None),
+)
+
+
+async def get_statistics_segment_employee(
+    bucket_id: str,
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Live per-segment × company-size funnel for one bucket, summed across the
+    selected webinars. Powers the Segments-tab drill-down and the data-driven
+    suggested employee range (conversion: calls + lead-quality tiers + won).
+
+    Computed on demand (NOT from snapshots) so no recompute is needed; scoped to
+    one bucket so the funnel queries stay small. Returns raw per-band counts —
+    the frontend derives percentages and the suggested range from them, matching
+    the client-side quality-reco pattern. None if the bucket does not exist.
+
+    Note: runs the three funnel queries once per included webinar, so a very wide
+    webinar selection means more queries — acceptable for an on-click drill-down
+    into a single segment.
+    """
+    from sqlalchemy import select, text as sa_text
+    from db.session import AsyncSessionLocal
+    from db.models import OutreachBucket, Webinar
+    from services.ghl_statistics_source import (
+        GoHighLevelStatisticsSource, SOURCE_FUNNEL_RAW_KEYS,
+    )
+
+    # Same passed-webinar set (+ optional filter) as /segments.
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    all_ids = [s.get("webinarId") for s in passed if s.get("webinarId")]
+    if webinar_ids:
+        wanted = set(webinar_ids)
+        target_ids = [i for i in all_ids if i in wanted]
+    else:
+        target_ids = all_ids
+
+    src = GoHighLevelStatisticsSource()
+    agg: dict[str, dict[str, int]] = {}
+    async with AsyncSessionLocal() as db:
+        bucket = (await db.execute(
+            select(OutreachBucket).where(OutreachBucket.id == bucket_id)
+        )).scalar_one_or_none()
+        if bucket is None:
+            return None
+        # Perf pragmas (mirror _build_raw_webinar), scoped to this transaction.
+        await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
+        await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
+        webinars = list((await db.execute(
+            select(Webinar).where(Webinar.id.in_(target_ids))
+        )).scalars().all()) if target_ids else []
+        for w in webinars:
+            cells = await src._compute_per_employee_cells(db, w, bucket_id=bucket_id)
+            for cell in cells:
+                label = cell.get("bucket")
+                if not label:
+                    continue
+                slot = agg.setdefault(label, {k: 0 for k in SOURCE_FUNNEL_RAW_KEYS})
+                metrics = cell.get("metrics") or {}
+                for k in SOURCE_FUNNEL_RAW_KEYS:
+                    slot[k] += int(metrics.get(k) or 0)
+
+    def _band(label: str, min_emp: int | None, max_emp: int | None, raw: dict[str, int]) -> dict[str, Any]:
+        return {
+            "sizeLabel": label,
+            "minEmp": min_emp,
+            "maxEmp": max_emp,
+            "invites": int(raw.get("invited") or 0),
+            "regs": int(raw.get("totalRegs") or 0),
+            "attendees10m": int(raw.get("total10MinPlus") or 0),
+            "bookings": int(raw.get("totalBookings") or 0),
+            "uniqueBookers": int(raw.get("uniqueBookers") or 0),
+            "confirmed": int(raw.get("confirmed") or 0),
+            "shows": int(raw.get("shows") or 0),
+            "noShows": int(raw.get("noShows") or 0),
+            "canceled": int(raw.get("canceled") or 0),
+            "won": int(raw.get("won") or 0),
+            "disqualified": int(raw.get("disqualified") or 0),
+            "qualified": int(raw.get("qualified") or 0),
+            "leadQualityGreat": int(raw.get("leadQualityGreat") or 0),
+            "leadQualityOk": int(raw.get("leadQualityOk") or 0),
+            "leadQualityBarelyPassable": int(raw.get("leadQualityBarelyPassable") or 0),
+            "leadQualityBadDq": int(raw.get("leadQualityBadDq") or 0),
+        }
+
+    empty = {k: 0 for k in SOURCE_FUNNEL_RAW_KEYS}
+    # Every canonical band in order (0-filled when absent), so the drill-down
+    # always shows the full size vocabulary; "(no size)" appended when present.
+    bands = [_band(label, mn, mx, agg.get(label, empty)) for label, mn, mx in _EMPLOYEE_BANDS]
+    if "(no size)" in agg:
+        bands.append(_band("(no size)", None, None, agg["(no size)"]))
+
+    return {
+        "bucketId": bucket.id,
+        "bucketName": bucket.name,
+        "statEmpMin": bucket.stat_emp_min,
+        "statEmpMax": bucket.stat_emp_max,
+        "includedWebinarIds": target_ids,
+        "bands": bands,
+    }
+
+
 # ---------------------------------------------------------------------------
 # By-source funnel aggregation (By List Source tab)
 # ---------------------------------------------------------------------------
@@ -654,7 +778,7 @@ async def get_statistics_segments(
 # ghl_statistics_source.SOURCE_FUNNEL_RAW_KEYS). Percentages are derived from
 # these sums downstream (never averaged), same convention as the Segments tab.
 _SOURCE_RAW_KEYS = (
-    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings",
+    "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
     "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -669,6 +793,7 @@ def _shape_source_funnel(raw: dict[str, Any]) -> dict[str, int]:
         "regs": int(raw.get("totalRegs") or 0),
         "attendees10m": int(raw.get("total10MinPlus") or 0),
         "bookings": int(raw.get("totalBookings") or 0),
+        "uniqueBookers": int(raw.get("uniqueBookers") or 0),
         "confirmed": int(raw.get("confirmed") or 0),
         "shows": int(raw.get("shows") or 0),
         "noShows": int(raw.get("noShows") or 0),

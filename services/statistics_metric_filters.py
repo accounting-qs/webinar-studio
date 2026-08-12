@@ -103,9 +103,14 @@ def spec_for_metric(
         if not (prev_date and current_date):
             return MetricSpec(unavailable=True)
         return MetricSpec(
+            # Half-open window (prev, current] — MUST match the dashboard tile's
+            # window in ghl_statistics_source.py (`> :sr_start AND <= :sr_end`).
+            # Using [prev, current) here dropped every contact whose event landed
+            # on the webinar's own date, so the drill-down list came up short of
+            # the clicked tile.
             where_clauses=[
-                "g.webinar_registration_in_form_date >= :sr_start",
-                "g.webinar_registration_in_form_date < :sr_end",
+                "g.webinar_registration_in_form_date > :sr_start",
+                "g.webinar_registration_in_form_date <= :sr_end",
             ],
             params={"sr_start": prev_date, "sr_end": current_date},
         )
@@ -114,8 +119,9 @@ def spec_for_metric(
             return MetricSpec(unavailable=True)
         return MetricSpec(
             where_clauses=[
-                "g.webinar_registration_in_form_date >= :sr_start",
-                "g.webinar_registration_in_form_date < :sr_end",
+                # (prev, current] — match the dashboard tile window (see selfRegMarked).
+                "g.webinar_registration_in_form_date > :sr_start",
+                "g.webinar_registration_in_form_date <= :sr_end",
                 "g.booked_call_webinar_series = :N",
             ],
             params={"sr_start": prev_date, "sr_end": current_date, "N": N},
@@ -125,8 +131,9 @@ def spec_for_metric(
             return MetricSpec(unavailable=True)
         return MetricSpec(
             where_clauses=[
-                "g.cold_calendar_unsubscribe_date >= :unsub_start",
-                "g.cold_calendar_unsubscribe_date < :unsub_end",
+                # (prev, current] — match the dashboard tile window (see selfRegMarked).
+                "g.cold_calendar_unsubscribe_date > :unsub_start",
+                "g.cold_calendar_unsubscribe_date <= :unsub_end",
             ],
             params={"unsub_start": prev_date, "unsub_end": current_date},
         )
@@ -154,8 +161,9 @@ def spec_for_metric(
         elif metric.startswith("selfReg"):
             if not (prev_date and current_date):
                 return MetricSpec(unavailable=True)
-            wheres.append("g.webinar_registration_in_form_date >= :sr_start")
-            wheres.append("g.webinar_registration_in_form_date < :sr_end")
+            # (prev, current] — match the dashboard tile window (see selfRegMarked).
+            wheres.append("g.webinar_registration_in_form_date > :sr_start")
+            wheres.append("g.webinar_registration_in_form_date <= :sr_end")
             params["sr_start"] = prev_date
             params["sr_end"] = current_date
         # Min-minutes filter
@@ -180,7 +188,9 @@ def spec_for_metric(
             params={"N": N, **(extra_params or {})},
         )
 
-    if metric == "totalBookings":
+    if metric in ("totalBookings", "uniqueBookers"):
+        # Same opportunity drill-down; the modal headlines the distinct-contact
+        # count (unique_total) and shows total opportunities as the reference.
         return opp_spec("TRUE")
     if metric == "totalCallsDatePassed":
         return opp_spec(
@@ -379,12 +389,14 @@ def build_webinar_wide_opp_query(
         LIMIT :limit
     """
 
+    # Two counts: `total` = distinct opportunities (all bookings, the reference),
+    # `unique_total` = distinct booked contacts (the headline "unique bookers").
     count_sql = f"""
-        SELECT COUNT(*) FROM (
-            SELECT DISTINCT o.ghl_opportunity_id
-            FROM ghl_opportunity o
-            LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
-            WHERE {where}
-        ) sub
+        SELECT
+            COUNT(DISTINCT o.ghl_opportunity_id) AS total,
+            COUNT(DISTINCT g.ghl_contact_id) AS unique_total
+        FROM ghl_opportunity o
+        LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
+        WHERE {where}
     """
     return list_sql, count_sql, params

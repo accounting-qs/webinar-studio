@@ -29,6 +29,11 @@ class BucketUpdate(BaseModel):
     # Manual segment-quality label. Pass null to clear the mark. Validated here
     # and by the ck_outreach_buckets_quality DB constraint.
     quality: Optional[Literal["good", "medium", "bad"]] = None
+    # User-set per-segment employee-count range (literal headcount) from the
+    # Statistics → Segments dashboard. Send a bound to set it, null to clear it
+    # (only fields present in the request body are applied — exclude_unset).
+    stat_emp_min: Optional[int] = None
+    stat_emp_max: Optional[int] = None
 
 
 # ── Copies ─────────────────────────────────────────────────────────────────
@@ -124,6 +129,12 @@ class AssignRequest(BaseModel):
     # The frontend expands region shortcuts (Europe / USA / Canada) into concrete
     # country strings before sending, so this is always a flat list of countries.
     filter_countries: list[str] | None = None
+    # Employee-count range filter for the claim (literal headcount). Only contacts
+    # whose raw employee_count is within [emp_min, emp_max] are eligible. Either
+    # bound may be omitted for an open range; None/None = no filter. Contacts with
+    # unknown size (NULL employee_count) are excluded when a bound is set.
+    emp_min: int | None = None
+    emp_max: int | None = None
     # Reuse filter (Planning page, chosen above the bucket list). Controls which
     # contacts are eligible to claim:
     #   None / "never" / "fresh"  → fresh only (never invited) — the default,

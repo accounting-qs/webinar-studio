@@ -266,7 +266,7 @@ const DRILLDOWN_KEYS = new Set([
   "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick", "maybeBookings",
   "selfRegMarked", "selfRegAttended", "selfReg10MinPlus", "selfRegBookings",
   "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus", "attendBySmsReminder",
-  "totalBookings", "totalCallsDatePassed", "confirmed", "shows", "noShows",
+  "totalBookings", "uniqueBookers", "totalCallsDatePassed", "confirmed", "shows", "noShows",
   "canceled", "won", "disqualified", "qualified",
   "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
 ]);
@@ -548,6 +548,11 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
   }
   // avgProjectedDealSize is an average of child values, not a sum.
   m["avgProjectedDealSize"] = _avgOrNull(rows, "avgProjectedDealSize");
+  // totalBookings is no longer a displayed column (the "Bookings" column now
+  // keys uniqueBookers), so the loop above doesn't sum it — but Show%'s
+  // denominator and the booking-rate fallback still need it. Sum the raw field
+  // (present on every child row) explicitly, else aggregate rows blank Show%.
+  m["totalBookings"] = _sumOrNull(rows, "totalBookings");
 
   const au = m["actuallyUsed"];
   const inv = au == null || au === 0 ? (m["invited"] ?? null) : au;
@@ -580,9 +585,12 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
     attend10MinPercent: _safeDiv(g("total10MinPlus"), g("totalAttended")),
     total30MinPlusPer1kInv: _safePer1k(g("total30MinPlus"), inv),
     attend30MinPercent: _safeDiv(g("total30MinPlus"), g("totalAttended")),
-    bookingsPerAttended: _safeDiv(g("totalBookings"), g("totalAttended")),
-    bookingsPerPast10Min: _safeDiv(g("totalBookings"), g("total10MinPlus")),
-    totalBookingsPer1kInv: _safePer1k(g("totalBookings"), inv),
+    // Booking rates divide by unique bookers (the displayed "Bookings"); fall
+    // back to total opportunities on pre-uniqueBookers snapshots. Show% keeps
+    // total opps — its numerator (shows) is per-opportunity.
+    bookingsPerAttended: _safeDiv(g("uniqueBookers") ?? g("totalBookings"), g("totalAttended")),
+    bookingsPerPast10Min: _safeDiv(g("uniqueBookers") ?? g("totalBookings"), g("total10MinPlus")),
+    totalBookingsPer1kInv: _safePer1k(g("uniqueBookers") ?? g("totalBookings"), inv),
     showPercent: _safeDiv(g("shows"), g("totalBookings")),
     closeRatePercent: _safeDiv(g("won"), g("shows")),
     qualPercent: _safeDiv(g("qualified"), g("shows")),
@@ -1247,7 +1255,8 @@ export function StatisticsPage() {
   const globalStats = useMemo(() => {
     const totalInvited = webinars.reduce((s, w) => s + (w.summary.invited ?? 0), 0);
     const totalAttended = webinars.reduce((s, w) => s + (w.summary.totalAttended ?? 0), 0);
-    const totalBookings = webinars.reduce((s, w) => s + (w.summary.totalBookings ?? 0), 0);
+    // "Bookings" tile = unique bookers (distinct contacts), matching the funnel column.
+    const totalBookings = webinars.reduce((s, w) => s + (w.summary.uniqueBookers ?? w.summary.totalBookings ?? 0), 0);
     const totalWon = webinars.reduce((s, w) => s + (w.summary.won ?? 0), 0);
     return { totalInvited, totalAttended, totalBookings, totalWon };
   }, [webinars]);

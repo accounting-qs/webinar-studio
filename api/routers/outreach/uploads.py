@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy import pool
 
 from api.auth import require_auth
-from api.routers.outreach._helpers import LLOYD_USER_ID
+from api.routers.outreach._helpers import LLOYD_USER_ID, fix_mojibake
 from api.schemas import ImportStartCreate
 from db.models import UploadHistory, ContactCustomField, Contact, OutreachBucket, BlocklistEntry
 from db.session import get_db
@@ -513,13 +513,20 @@ async def confirm_upload(
         if resp.status_code not in (200, 206):
             raise HTTPException(500, f"Failed to read CSV from Storage: {resp.status_code}")
 
-    text = resp.text
+    # Decode as UTF-8 to match the import path exactly (httpx's auto-detection
+    # can otherwise pick latin-1 and add a mojibake layer the import won't).
+    text = resp.content.decode("utf-8", errors="replace")
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines:
         raise HTTPException(400, "CSV file appears empty")
 
-    headers = _parse_csv_line(lines[0])
-    preview_rows = [_parse_csv_line(lines[i]) for i in range(1, min(6, len(lines)))]
+    # Repair upstream double-encoded UTF-8 so the preview shows what will be
+    # stored (import applies the same fix_mojibake per value).
+    headers = [fix_mojibake(h) for h in _parse_csv_line(lines[0])]
+    preview_rows = [
+        [fix_mojibake(v) for v in _parse_csv_line(lines[i])]
+        for i in range(1, min(6, len(lines)))
+    ]
 
     # Estimate total rows from file size and average row length
     if len(lines) > 1 and file_size > 0:
@@ -750,12 +757,15 @@ async def get_upload_headers(
         if resp.status_code not in (200, 206):
             raise HTTPException(500, "Failed to read CSV from Storage")
 
-    text = resp.text
+    text = resp.content.decode("utf-8", errors="replace")
     lines = text.split("\n")
     lines = [l.strip() for l in lines if l.strip()]
 
-    headers = _parse_csv_line(lines[0])
-    preview_rows = [_parse_csv_line(lines[i]) for i in range(1, min(6, len(lines)))]
+    headers = [fix_mojibake(h) for h in _parse_csv_line(lines[0])]
+    preview_rows = [
+        [fix_mojibake(v) for v in _parse_csv_line(lines[i])]
+        for i in range(1, min(6, len(lines)))
+    ]
 
     return {
         "id": upload.id,
@@ -1088,7 +1098,9 @@ async def _process_csv_import(
         csv_file = open(tmp_path, "r", encoding="utf-8", errors="replace")
         reader = csv.reader(csv_file)
         try:
-            csv_headers = [h.strip() for h in next(reader)]
+            # fix_mojibake here so header keys match the (repaired) preview keys
+            # the user mapped against in confirm_upload / fetch_upload_headers.
+            csv_headers = [fix_mojibake(h.strip()) for h in next(reader)]
         except StopIteration:
             csv_file.close()
             raise Exception("CSV file is empty")
@@ -1209,6 +1221,10 @@ async def _process_csv_import(
                 value = parsed[col_idx].strip() if col_idx < len(parsed) else ""
                 if not value:
                     continue
+                # Repair upstream double-encoded UTF-8 (e.g. a Korean name that
+                # arrived as "ÃªÂ¹â‚¬…"). No-op for clean text; numeric fields
+                # never carry the 'Ã'/'Â' markers so it can't corrupt them.
+                value = fix_mojibake(value)
                 if target == "bucket":
                     contact["bucket_name"] = value
                     contact["bucket_id"] = bucket_cache.get(value)

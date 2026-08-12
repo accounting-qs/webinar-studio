@@ -121,18 +121,54 @@ async def _recompute_caches(chunk: int) -> None:
     print(f"Step 2 caches: scanned={scanned} changed={changed}")
 
 
+# (name, CREATE DDL) — both partial, built CONCURRENTLY. Names are hardcoded
+# constants (safe to interpolate into the invalid-check / DROP statements).
+_INDEXES: list[tuple[str, str]] = [
+    (
+        # NOT form: the claim/eligible queries emit `NOT is_blocklisted`, and
+        # the planner only proves partial-index implication on an exact match.
+        "ix_contacts_claimable",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_contacts_claimable "
+        "ON contacts (bucket_id, last_invited_at) "
+        "WHERE NOT is_blocklisted AND assigned_membership_count = 0",
+    ),
+    (
+        # Serves GET /outreach/buckets/good-available, which runs on every
+        # Planning load and groups fresh claimable contacts by location. Lead with
+        # user_id (the query's equality filter) so the whole SELECT — user_id,
+        # bucket_id, and the INCLUDEd group-by / emp-filter columns — comes from
+        # the index and it can be an index-only scan (no heap-fetch of the ~fresh
+        # population, which would risk the 120s cap). Without user_id in the index
+        # the planner must hit the heap to check it, defeating index-only.
+        "ix_contacts_good_avail",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_contacts_good_avail "
+        "ON contacts (user_id, bucket_id) INCLUDE (country, list_location, employee_count) "
+        "WHERE NOT is_blocklisted AND assigned_membership_count = 0 "
+        "AND last_invited_at IS NULL",
+    ),
+]
+
+
 async def _create_index() -> None:
     async with engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-        print("Creating ix_contacts_claimable CONCURRENTLY (may take a while)…")
-        # NOT form: the claim/eligible queries emit `NOT is_blocklisted`, and
-        # the planner only proves partial-index implication on an exact match.
-        await conn.exec_driver_sql(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_contacts_claimable "
-            "ON contacts (bucket_id, last_invited_at) "
-            "WHERE NOT is_blocklisted AND assigned_membership_count = 0"
-        )
-        print("  index ready.")
+        # Supabase caps statements at ~120s by default, which kills a large
+        # CONCURRENTLY build; lift it for this DDL session (same as migration 017).
+        await conn.exec_driver_sql("SET statement_timeout = 0")
+        for name, ddl in _INDEXES:
+            # A prior CONCURRENTLY build killed mid-flight leaves an INVALID index
+            # of this name; a plain `IF NOT EXISTS` would then silently skip
+            # forever. Drop the dead index first so this run actually rebuilds it.
+            invalid = await conn.exec_driver_sql(
+                "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+                f"WHERE c.relname = '{name}' AND NOT i.indisvalid"
+            )
+            if invalid.first():
+                print(f"  found INVALID {name} from a prior failed build — dropping it")
+                await conn.exec_driver_sql(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+            print(f"Creating {name} CONCURRENTLY (may take a while)…")
+            await conn.exec_driver_sql(ddl)
+            print(f"  {name} ready.")
 
 
 async def main(chunk: int, skip_index: bool) -> None:

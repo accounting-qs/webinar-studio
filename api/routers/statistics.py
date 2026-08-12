@@ -45,6 +45,7 @@ class StatisticsMetrics(BaseModel):
     total10MinPlus: float | None = None
     total30MinPlus: float | None = None
     totalBookings: float | None = None
+    uniqueBookers: float | None = None  # distinct booked contacts (displayed "Bookings")
     totalCallsDatePassed: float | None = None
     confirmed: float | None = None
     shows: float | None = None
@@ -223,6 +224,7 @@ class ContactDrilldownResponse(BaseModel):
     assignment_id: str | None = None
     unit: str  # "contact" | "opportunity"
     total: int
+    unique_total: int | None = None  # distinct booked contacts (headline "unique bookers")
     items: list[ContactDrilldownItem]
     available: bool
     reason: str | None = None
@@ -331,10 +333,13 @@ async def list_contacts_for_metric(
         # were never in an outreach list. Per-list drilldowns (assignment set)
         # and contact-unit metrics keep the outreach-list-scoped query, which
         # already matches their per-list counts.
+        unique_total: int | None = None
         if spec.unit == "opportunity" and assignment is None:
             list_sql, count_sql, params = build_webinar_wide_opp_query(spec, w.number, limit=limit)
             count_params = {k: v for k, v in params.items() if k != "limit"}
-            total = int((await db.execute(text(count_sql).bindparams(**count_params))).scalar() or 0)
+            crow = (await db.execute(text(count_sql).bindparams(**count_params))).mappings().first()
+            total = int((crow or {}).get("total") or 0)
+            unique_total = int((crow or {}).get("unique_total") or 0)
             r = await db.execute(text(list_sql).bindparams(**params))
             rows = r.mappings().all()
         else:
@@ -342,6 +347,8 @@ async def list_contacts_for_metric(
             r = await db.execute(text(sql).bindparams(**params))
             rows = r.mappings().all()
             total = len(rows)
+            if spec.unit == "opportunity":
+                unique_total = len({row.get("ghl_contact_id") for row in rows if row.get("ghl_contact_id")})
 
         from integrations.ghl_client import get_ghl_location_id
         loc = (await get_ghl_location_id()) or ""
@@ -388,6 +395,7 @@ async def list_contacts_for_metric(
             "assignment_id": assignment,
             "unit": spec.unit,
             "total": total,
+            "unique_total": unique_total,
             "items": items,
             "available": True,
             "reason": None,
@@ -651,6 +659,10 @@ class SegmentFunnelRow(BaseModel):
     # Manual quality label: "good" | "medium" | "bad". None on the Other/Total
     # rows and on any bucket the operator hasn't marked yet.
     quality: str | None = None
+    # User-set per-segment employee-count range (literal headcount). None = undefined
+    # or on the Other/Total rows. Either bound may be None for an open range.
+    statEmpMin: int | None = None
+    statEmpMax: int | None = None
     invites: int
     regs: int
     attendees10m: int
@@ -693,6 +705,57 @@ async def get_statistics_segments(source: str = "auto", webinars: str | None = N
     data = await stats_svc.get_statistics_segments(source=source, webinar_ids=ids or None)
     meta = await _resolve_meta(source)
     return {**data, "meta": meta}
+
+
+class SegmentEmployeeBand(BaseModel):
+    """One canonical company-size band's funnel counts for a single segment,
+    summed across the selected webinars. Raw counts — the frontend derives the
+    percentages and the suggested range from these sums."""
+    sizeLabel: str
+    minEmp: int | None = None  # literal headcount lower bound (None only for "(no size)")
+    maxEmp: int | None = None  # upper bound; None = open ("10000+") or "(no size)"
+    invites: int = 0
+    regs: int = 0
+    attendees10m: int = 0
+    bookings: int = 0
+    confirmed: int = 0
+    shows: int = 0
+    noShows: int = 0
+    canceled: int = 0
+    won: int = 0
+    disqualified: int = 0
+    qualified: int = 0
+    leadQualityGreat: int = 0
+    leadQualityOk: int = 0
+    leadQualityBarelyPassable: int = 0
+    leadQualityBadDq: int = 0
+
+
+class SegmentEmployeeResponse(BaseModel):
+    bucketId: str
+    bucketName: str | None = None
+    statEmpMin: int | None = None
+    statEmpMax: int | None = None
+    includedWebinarIds: list[str] = []
+    bands: list[SegmentEmployeeBand]
+
+
+@router.get("/segments/{bucket_id}/by-employee", response_model=SegmentEmployeeResponse)
+async def get_statistics_segment_by_employee(
+    bucket_id: str, source: str = "auto", webinars: str | None = None
+):
+    """Per-segment × company-size funnel for one bucket, live across the selected
+    webinars. Powers the Segments-tab drill-down and the data-driven suggested
+    employee range (conversion: booked calls + lead-quality tiers + won).
+    `webinars` is a comma-separated list of Webinar UUIDs; omit for all passed."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_segment_employee(
+        bucket_id=bucket_id, source=source, webinar_ids=ids or None
+    )
+    if data is None:
+        raise HTTPException(404, "Segment (bucket) not found")
+    return data
 
 
 # ---------------------------------------------------------------------------

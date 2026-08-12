@@ -15,6 +15,59 @@ from db.models import (
 LLOYD_USER_ID = "9baf8117-db65-4f30-87a5-a76cf4f23d82"
 
 
+# ── Mojibake repair ───────────────────────────────────────────────────────
+#
+# Some source CSVs arrive with names/companies already double-encoded upstream
+# (UTF-8 bytes mis-read as cp1252/latin-1, sometimes twice — e.g. the Korean
+# name "김진형" shows up as "ÃªÂ¹â‚¬Ã¬Â§â€žÃ­Ëœâ€¢"). The import decodes the file
+# faithfully as UTF-8, so garbage in the file lands verbatim in the DB. This is
+# the same repair the offline firmographics pipeline uses
+# (scripts/build_firmo_staging.py); keep the two in sync.
+try:
+    import ftfy as _ftfy
+except ImportError:
+    _ftfy = None
+
+
+def _manual_unwind(s: str) -> str:
+    """cp1252/latin-1 round-trip unwind, fired only on the 'Ã'/'Â' lead-byte
+    artifacts and accepted only when that marker count strictly drops. Loops so
+    double-encoded strings are fully recovered. Nordic letters like 'Å' are NOT
+    markers — they're valid repair output."""
+    def _markers(x: str) -> int:
+        return x.count("Ã") + x.count("Â")
+
+    for _ in range(3):
+        if "Ã" not in s and "Â" not in s:
+            break
+        best = s
+        for enc in ("cp1252", "latin-1"):
+            try:
+                cand = s.encode(enc).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+            if _markers(cand) < _markers(best):
+                best = cand
+        if best == s:
+            break
+        s = best
+    return s
+
+
+def fix_mojibake(s: str) -> str:
+    """Repair double-encoded UTF-8 (mojibake), e.g. 'dÃ©lÃ©guÃ©' -> 'délégué'.
+
+    Only strings carrying the 'Ã'/'Â' lead-byte artifacts are touched, so clean
+    input is returned unchanged. ftfy runs first when available (segment-aware —
+    handles emoji/mixed-script rows), then a manual cp1252/latin-1 unwind cleans
+    up anything it leaves."""
+    if not s or ("Ã" not in s and "Â" not in s):
+        return s
+    if _ftfy is not None:
+        s = _ftfy.fix_text(s)
+    return _manual_unwind(s)
+
+
 # ── Reusable-contacts helpers ─────────────────────────────────────────────
 #
 # Invitation state lives in webinar_contact_memberships (one row per contact ↔
@@ -103,6 +156,24 @@ def claimable_conditions(
             WebinarContactMembership.contact_id == Contact.id,
             WebinarContactMembership.webinar_id == target_webinar_id,
         ).exists())
+    return conds
+
+
+def employee_count_filter(emp_min=None, emp_max=None):
+    """WHERE predicates (list) for a literal employee-count range filter.
+
+    Filters on the raw `contacts.employee_count` (headcount), so "5 to 10" means
+    exactly 5–10 employees. Either bound may be omitted for an open range; both
+    omitted → [] (no filter). Contacts with unknown size (NULL employee_count) are
+    excluded whenever a bound is set — there is no list-level size fallback, unlike
+    country's list_location. Applied identically to the eligible count and the claim
+    so volume validation matches what actually gets claimed.
+    """
+    conds = []
+    if emp_min is not None:
+        conds.append(Contact.employee_count >= emp_min)
+    if emp_max is not None:
+        conds.append(Contact.employee_count <= emp_max)
     return conds
 
 
@@ -307,6 +378,8 @@ def bucket_dict(
         "emp_range": b.emp_range,
         "source_file": b.source_file,
         "quality": b.quality,
+        "stat_emp_min": b.stat_emp_min,
+        "stat_emp_max": b.stat_emp_max,
         "copies_count": {"titles": len(titles), "descriptions": len(descs)},
         "has_primary_title": any(c.is_primary for c in titles),
         "has_primary_description": any(c.is_primary for c in descs),

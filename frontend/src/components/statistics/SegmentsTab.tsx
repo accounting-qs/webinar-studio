@@ -3,8 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchStatisticsSegments,
+  fetchSegmentEmployee,
   updateBucketQuality,
+  updateBucketStatEmpRange,
   type BucketQuality,
+  type SegmentEmployeeBand,
+  type SegmentEmployeeResponse,
   type SegmentFunnelResponse,
   type SegmentFunnelRow,
   type SegmentFunnelWebinar,
@@ -68,7 +72,17 @@ type FunnelCells = {
   leadQualityBadDq: number;
 };
 
-function deriveCells(r: SegmentFunnelRow): FunnelCells {
+/** Raw count fields deriveCells needs — satisfied by BOTH a segment row and an
+ * employee-size band, so the drill-down reuses the exact same cells + heatmap. */
+type RawFunnelCounts = {
+  invites: number; regs: number; attendees10m: number; bookings: number;
+  confirmed: number; shows: number; noShows: number; canceled: number; won: number;
+  disqualified: number; qualified: number;
+  leadQualityGreat: number; leadQualityOk: number;
+  leadQualityBarelyPassable: number; leadQualityBadDq: number;
+};
+
+function deriveCells(r: RawFunnelCounts): FunnelCells {
   return {
     invites: r.invites,
     regs: r.regs,
@@ -233,6 +247,30 @@ export function SegmentsTab() {
     [refresh],
   );
 
+  // Set/clear a segment's employee-count range. Optimistic patch then persist,
+  // mirroring setSegmentQuality. Either bound may be null (open); both null clears.
+  const setSegmentEmpRange = useCallback(
+    async (bucketId: string, statEmpMin: number | null, statEmpMax: number | null) => {
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              segments: prev.segments.map((s) =>
+                s.bucketId === bucketId ? { ...s, statEmpMin, statEmpMax } : s,
+              ),
+            }
+          : prev,
+      );
+      try {
+        await updateBucketStatEmpRange(bucketId, statEmpMin, statEmpMax);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        refresh();
+      }
+    },
+    [refresh],
+  );
+
   // Apply a quality to several buckets at once (bulk approve / override). Same
   // optimistic-then-persist pattern as setSegmentQuality; on any failure surface
   // the error and reload to resync.
@@ -331,8 +369,15 @@ export function SegmentsTab() {
             segments={data.segments}
             totals={data.totals}
             includedCount={data.includedWebinarIds.length - data.pendingWebinarIds.length}
+            // Drill-down live-computes; scope it to the SAME snapshot-backed
+            // webinars the segment rows sum (exclude pending), so the per-size
+            // breakdown + suggested range tie out to the row they explain.
+            includedWebinarIds={data.includedWebinarIds.filter(
+              (id) => !data.pendingWebinarIds.includes(id),
+            )}
             onSetQuality={setSegmentQuality}
             onBulkSetQuality={setSegmentQualities}
+            onSetEmpRange={setSegmentEmpRange}
           />
         </div>
       )}
@@ -441,16 +486,20 @@ function FunnelTable({
   segments,
   totals,
   includedCount,
+  includedWebinarIds,
   onSetQuality,
   onBulkSetQuality,
+  onSetEmpRange,
 }: {
   segments: SegmentFunnelRow[];
   totals: SegmentFunnelRow;
   includedCount: number;
+  includedWebinarIds: string[];
   onSetQuality: (bucketId: string, quality: BucketQuality | null) => void;
   onBulkSetQuality: (
     updates: { bucketId: string; quality: BucketQuality }[],
   ) => void;
+  onSetEmpRange: (bucketId: string, statEmpMin: number | null, statEmpMax: number | null) => void;
 }) {
   // Default to invites desc — matches the server's initial ordering.
   const [sortKey, setSortKey] = useState<SortKey>("invites");
@@ -645,6 +694,11 @@ function FunnelTable({
           {/* Row 1: section-wrapper group bands */}
           <tr>
             <th className={groupHeadCorner} />
+            {/* Two leading non-numeric columns (Quality, Employee range) live
+                outside COLUMN_GROUPS — empty bands above them keep the column
+                count aligned with the label + body rows. */}
+            <th className={`${groupHeadBase} text-center border-l border-zinc-200 dark:border-zinc-800`} />
+            <th className={`${groupHeadBase} text-center border-l border-zinc-200 dark:border-zinc-800`} />
             {COLUMN_GROUPS.map((g) => (
               <th
                 key={g.group}
@@ -659,7 +713,7 @@ function FunnelTable({
           <tr>
             <th
               onClick={() => handleSort("segment")}
-              className={`${headCorner} text-left min-w-[220px]`}
+              className={`${headCorner} text-left min-w-[200px]`}
             >
               <span className="inline-flex items-center gap-1">
                 <input
@@ -674,6 +728,19 @@ function FunnelTable({
                 Segment
                 <SortArrow active={sortKey === "segment"} dir={sortDir} />
               </span>
+            </th>
+            <th
+              className={`${headBase} text-left border-l border-zinc-200 dark:border-zinc-800`}
+              style={{ cursor: "default" }}
+            >
+              Quality
+            </th>
+            <th
+              className={`${headBase} text-left border-l border-zinc-200 dark:border-zinc-800`}
+              style={{ cursor: "default" }}
+              title="User-set employee-count range for this segment. Click a row to see the size breakdown + a suggested range."
+            >
+              Employee range
             </th>
             {NUMERIC_COLUMNS.map((col, idx) => (
               <th
@@ -700,11 +767,17 @@ function FunnelTable({
             const pending = !!(s.bucketId && s.quality === null && reco);
             return (
               <SegmentRow
-                key={s.bucketId}
+                // Include the drill-down scope in the key so changing the webinar
+                // selection remounts the row — collapsing + invalidating any open
+                // drill-down so it refetches for the new selection (never shows
+                // stale counts). Stable across plain refreshes (same id set).
+                key={`${s.bucketId}#${includedWebinarIds.join(",")}`}
                 row={s}
                 colStats={colStats}
                 isOther={false}
                 onSetQuality={onSetQuality}
+                onSetEmpRange={onSetEmpRange}
+                includedWebinarIds={includedWebinarIds}
                 reco={reco}
                 pending={pending}
                 checked={s.bucketId ? selectedPending.has(s.bucketId) : false}
@@ -842,11 +915,17 @@ function SuggestionChip({
   );
 }
 
+// Segment + Quality + Employee range — the non-numeric leading columns. Kept in
+// sync with the header rows and the TotalsRow placeholders.
+const LEADING_COL_COUNT = 3;
+
 function SegmentRow({
   row,
   colStats,
   isOther,
   onSetQuality,
+  onSetEmpRange,
+  includedWebinarIds,
   reco,
   pending,
   checked,
@@ -856,71 +935,435 @@ function SegmentRow({
   colStats: Record<CellKey, number[]>;
   isOther: boolean;
   onSetQuality?: (bucketId: string, quality: BucketQuality | null) => void;
+  onSetEmpRange?: (bucketId: string, statEmpMin: number | null, statEmpMax: number | null) => void;
+  includedWebinarIds?: string[];
   reco?: Recommendation | null;
   pending?: boolean;
   checked?: boolean;
   onToggle?: () => void;
 }) {
   const c = deriveCells(row);
+  const canExpand = !isOther && !!row.bucketId;
+  const [expanded, setExpanded] = useState(false);
+  const [drill, setDrill] = useState<SegmentEmployeeResponse | null>(null);
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState<string | null>(null);
+
+  // Lazy-load the size breakdown on first expand; cache it for later toggles.
+  const toggleExpand = useCallback(() => {
+    if (!canExpand) return;
+    setExpanded((prev) => {
+      const next = !prev;
+      if (next && !drill && !drillLoading) {
+        setDrillLoading(true);
+        setDrillError(null);
+        fetchSegmentEmployee(row.bucketId!, includedWebinarIds ?? null)
+          .then((d) => setDrill(d))
+          .catch((e) => setDrillError(e instanceof Error ? e.message : String(e)))
+          .finally(() => setDrillLoading(false));
+      }
+      return next;
+    });
+  }, [canExpand, drill, drillLoading, row.bucketId, includedWebinarIds]);
+
   return (
-    <tr className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
-      <td
-        className={`sticky left-0 z-20 bg-white dark:bg-zinc-950 px-3 py-2 text-left ${
-          isOther
-            ? "text-zinc-500 italic"
-            : "text-zinc-800 dark:text-zinc-200 font-medium"
-        }`}
-        title={row.bucketName ?? ""}
-      >
-        <div className="flex items-center gap-2">
-          {pending && onToggle ? (
-            <input
-              type="checkbox"
-              checked={!!checked}
-              onChange={onToggle}
-              title="Select for bulk approve"
-              className="accent-violet-500 align-middle cursor-pointer"
+    <>
+      <tr className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
+        {/* Segment: bulk checkbox + expand chevron + name */}
+        <td
+          className={`sticky left-0 z-20 bg-white dark:bg-zinc-950 px-3 py-2 text-left ${
+            isOther
+              ? "text-zinc-500 italic"
+              : "text-zinc-800 dark:text-zinc-200 font-medium"
+          }`}
+          title={row.bucketName ?? ""}
+        >
+          <div className="flex items-center gap-2">
+            {pending && onToggle ? (
+              <input
+                type="checkbox"
+                checked={!!checked}
+                onChange={onToggle}
+                title="Select for bulk approve"
+                className="accent-violet-500 align-middle cursor-pointer"
+              />
+            ) : (
+              !isOther && <span className="inline-block w-[13px] shrink-0" />
+            )}
+            {canExpand ? (
+              <button
+                onClick={toggleExpand}
+                title="Show company-size breakdown + suggested range"
+                className="shrink-0 w-3 text-[10px] text-zinc-400 hover:text-violet-500"
+              >
+                {expanded ? "▼" : "▶"}
+              </button>
+            ) : (
+              !isOther && <span className="inline-block w-3 shrink-0" />
+            )}
+            <span className="truncate">{row.bucketName ?? "—"}</span>
+          </div>
+        </td>
+        {/* Quality: suggestion chip + colored select (moved out of Segment) */}
+        <td className="px-3 py-2 border-l border-zinc-200 dark:border-zinc-800/60">
+          {!isOther && row.bucketId && onSetQuality ? (
+            <div className="flex items-center gap-1.5">
+              {pending && reco && (
+                <SuggestionChip
+                  reco={reco}
+                  onApprove={() => onSetQuality(row.bucketId!, reco.quality)}
+                />
+              )}
+              <QualitySelect
+                value={row.quality}
+                onChange={(q) => onSetQuality(row.bucketId!, q)}
+              />
+            </div>
+          ) : null}
+        </td>
+        {/* Employee range: inline min/max editor */}
+        <td className="px-3 py-2 border-l border-zinc-200 dark:border-zinc-800/60 whitespace-nowrap">
+          {!isOther && row.bucketId && onSetEmpRange ? (
+            <EmpRangeEditor
+              statEmpMin={row.statEmpMin ?? null}
+              statEmpMax={row.statEmpMax ?? null}
+              onSave={(mn, mx) => onSetEmpRange(row.bucketId!, mn, mx)}
             />
-          ) : (
-            !isOther && <span className="inline-block w-[13px] shrink-0" />
-          )}
-          <span className="truncate">{row.bucketName ?? "—"}</span>
-          {!isOther && row.bucketId && onSetQuality && pending && reco && (
-            <SuggestionChip
-              reco={reco}
-              onApprove={() => onSetQuality(row.bucketId!, reco.quality)}
+          ) : null}
+        </td>
+        {NUMERIC_COLUMNS.map((col, idx) => {
+          const v = c[col.key];
+          const sorted = colStats[col.key];
+          // For negative-signal columns the "best" (bold-emphasized) extreme is
+          // the low end, and the heatmap greens the low end too.
+          const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
+          // Heat only the named segment rows; the "Other (no bucket)" catch-all
+          // isn't part of the comparison set.
+          const bg = isOther ? undefined : heatBg(v, sorted, col.lowerIsBetter);
+          return (
+            <td
+              key={col.key}
+              style={bg ? { backgroundColor: bg } : undefined}
+              className={`${COL} ${leaderCls(v, best)} ${
+                isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
+              }`}
+            >
+              {col.fmt(c)}
+            </td>
+          );
+        })}
+      </tr>
+      {expanded && canExpand && (
+        <tr className="bg-zinc-50 dark:bg-zinc-900/40">
+          <td colSpan={LEADING_COL_COUNT + NUMERIC_COLUMNS.length} className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800">
+            <SegmentDrilldown
+              data={drill}
+              loading={drillLoading}
+              error={drillError}
+              currentMin={row.statEmpMin ?? null}
+              currentMax={row.statEmpMax ?? null}
+              onApplyRange={(mn, mx) =>
+                onSetEmpRange && row.bucketId && onSetEmpRange(row.bucketId, mn, mx)
+              }
             />
-          )}
-          {!isOther && row.bucketId && onSetQuality && (
-            <QualitySelect
-              value={row.quality}
-              onChange={(q) => onSetQuality(row.bucketId!, q)}
-            />
-          )}
-        </div>
-      </td>
-      {NUMERIC_COLUMNS.map((col, idx) => {
-        const v = c[col.key];
-        const sorted = colStats[col.key];
-        // For negative-signal columns the "best" (bold-emphasized) extreme is
-        // the low end, and the heatmap greens the low end too.
-        const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
-        // Heat only the named segment rows; the "Other (no bucket)" catch-all
-        // isn't part of the comparison set.
-        const bg = isOther ? undefined : heatBg(v, sorted, col.lowerIsBetter);
-        return (
-          <td
-            key={col.key}
-            style={bg ? { backgroundColor: bg } : undefined}
-            className={`${COL} ${leaderCls(v, best)} ${
-              isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""
-            }`}
-          >
-            {col.fmt(c)}
           </td>
-        );
-      })}
-    </tr>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/* ── Per-segment employee-range editor + drill-down ──────────────────────── */
+
+/** Inline min/max editor for a segment's employee range. Commits on blur / Enter
+ * (only when changed) so it doesn't fire a PUT per keystroke. Empty = open bound;
+ * both empty clears the definition. */
+function EmpRangeEditor({
+  statEmpMin,
+  statEmpMax,
+  onSave,
+}: {
+  statEmpMin: number | null;
+  statEmpMax: number | null;
+  onSave: (mn: number | null, mx: number | null) => void;
+}) {
+  const toStr = (n: number | null) => (n != null ? String(n) : "");
+  // Local draft, seeded from the persisted range. Resynced from props DURING
+  // RENDER (React's "adjust state when a prop changes" pattern) rather than a
+  // key-remount, so an external change (Apply-suggested / Clear) updates the
+  // inputs WITHOUT unmounting them — which would steal focus mid-entry. A user's
+  // own commit sets props to the value they already typed, so this is a no-op then.
+  const [mn, setMn] = useState(toStr(statEmpMin));
+  const [mx, setMx] = useState(toStr(statEmpMax));
+  const [prevMin, setPrevMin] = useState(statEmpMin);
+  const [prevMax, setPrevMax] = useState(statEmpMax);
+  if (statEmpMin !== prevMin) {
+    setPrevMin(statEmpMin);
+    setMn(toStr(statEmpMin));
+  }
+  if (statEmpMax !== prevMax) {
+    setPrevMax(statEmpMax);
+    setMx(toStr(statEmpMax));
+  }
+
+  // Clamp negatives to 0 on entry (type=number min=0 doesn't block typed "-5"),
+  // so a fat-fingered negative can't silently parse to null and clear a set bound.
+  const onNumChange = (setter: (s: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value;
+    setter(v === "" ? "" : String(Math.max(0, parseInt(v, 10) || 0)));
+  };
+  const parse = (s: string): number | null => {
+    if (s.trim() === "") return null;
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const commit = () => {
+    const nMn = parse(mn);
+    const nMx = parse(mx);
+    // Skip an inverted range (backend also rejects it with a 400) so a transient
+    // min>max mid-edit doesn't fire a doomed request.
+    if (nMn != null && nMx != null && nMn > nMx) return;
+    if (nMn !== statEmpMin || nMx !== statEmpMax) onSave(nMn, nMx);
+  };
+  const inputCls =
+    "w-14 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 rounded px-1.5 py-0.5 text-[11px] tabular-nums focus:outline-none focus:ring-1 focus:ring-violet-500";
+  return (
+    <div className="flex items-center gap-1">
+      <input
+        type="number"
+        min={0}
+        placeholder="min"
+        value={mn}
+        onChange={onNumChange(setMn)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+        className={inputCls}
+      />
+      <span className="text-zinc-400 text-[10px]">–</span>
+      <input
+        type="number"
+        min={0}
+        placeholder="max"
+        value={mx}
+        onChange={onNumChange(setMx)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+        className={inputCls}
+      />
+    </div>
+  );
+}
+
+/* ── Suggested employee range (conversion-led: calls + lead quality + won) ── */
+
+/** Per-band invite gate for the suggested range — bands thinner than this are
+ * too noisy to weigh. Lower than the segment-level MIN_INVITES_FOR_RECO since a
+ * single size band is much smaller than the whole segment. Tunable. */
+const MIN_BAND_INVITES_FOR_RECO = 1_000;
+// Conversion weighting: booked calls + lead-quality tiers + won (user-chosen).
+const EMP_CALLS_WEIGHT = 0.4;
+const EMP_LQ_WEIGHT = 0.35;
+const EMP_WON_WEIGHT = 0.25;
+// Lead-quality tier points, best → worst (Bad/DQ contributes nothing).
+const LQ_GREAT_PTS = 3;
+const LQ_OK_PTS = 2;
+const LQ_BARELY_PTS = 1;
+
+type EmpRangeReco = { minEmp: number; maxEmp: number | null; bandCount: number };
+
+function bandCalls(b: SegmentEmployeeBand): number {
+  return b.confirmed + b.shows;
+}
+function bandLqPoints(b: SegmentEmployeeBand): number {
+  return (
+    LQ_GREAT_PTS * b.leadQualityGreat +
+    LQ_OK_PTS * b.leadQualityOk +
+    LQ_BARELY_PTS * b.leadQualityBarelyPassable
+  );
+}
+
+/** Suggested employee range for a segment: the contiguous span of canonical size
+ * bands whose blended conversion score is at/above the segment's own average.
+ * Scores each qualifying band on booked-calls, lead-quality points, and won —
+ * each normalized to the segment benchmark (only terms with a positive benchmark
+ * count, so a segment with no wons still gets a call/quality-based suggestion).
+ * Falls back to attendance-per-invite when there is no conversion signal at all.
+ * null when no band clears the volume gate or nothing beats the average. */
+function computeEmpRangeRecommendation(bands: SegmentEmployeeBand[]): EmpRangeReco | null {
+  const cand = bands.filter((b) => b.minEmp !== null && b.invites >= MIN_BAND_INVITES_FOR_RECO);
+  if (cand.length === 0) return null;
+  let inv = 0, calls = 0, lq = 0, won = 0, att = 0;
+  for (const b of cand) {
+    inv += b.invites;
+    calls += bandCalls(b);
+    lq += bandLqPoints(b);
+    won += b.won;
+    att += b.attendees10m;
+  }
+  if (inv <= 0) return null;
+  const benchCalls = calls / inv;
+  const benchLq = lq / inv;
+  const benchWon = won / inv;
+  const benchAtt = att / inv;
+  const hasConv = benchCalls > 0 || benchLq > 0 || benchWon > 0;
+
+  const score = (b: SegmentEmployeeBand): number => {
+    if (b.invites <= 0) return 0;
+    if (!hasConv) return benchAtt > 0 ? b.attendees10m / b.invites / benchAtt : 0;
+    let s = 0, w = 0;
+    if (benchCalls > 0) { s += EMP_CALLS_WEIGHT * (bandCalls(b) / b.invites / benchCalls); w += EMP_CALLS_WEIGHT; }
+    if (benchLq > 0) { s += EMP_LQ_WEIGHT * (bandLqPoints(b) / b.invites / benchLq); w += EMP_LQ_WEIGHT; }
+    if (benchWon > 0) { s += EMP_WON_WEIGHT * (b.won / b.invites / benchWon); w += EMP_WON_WEIGHT; }
+    return w > 0 ? s / w : 0;
+  };
+
+  const good = cand.filter((b) => score(b) >= 1);
+  if (good.length === 0) return null;
+  // Contiguous span from the lowest to the highest qualifying band (fills any
+  // interior gap so the result is one usable range). "10000+" has maxEmp null → open top.
+  const lo = good.reduce((a, b) => (a.minEmp! <= b.minEmp! ? a : b));
+  const hi = good.reduce((a, b) => ((a.maxEmp ?? Infinity) >= (b.maxEmp ?? Infinity) ? a : b));
+  return { minEmp: lo.minEmp!, maxEmp: hi.maxEmp, bandCount: good.length };
+}
+
+/** Expanded drill-down under a segment row: the funnel per canonical company-size
+ * band + a one-click "suggested range" (conversion-led). Rows within the
+ * segment's current stat_emp range are highlighted. */
+function SegmentDrilldown({
+  data,
+  loading,
+  error,
+  currentMin,
+  currentMax,
+  onApplyRange,
+}: {
+  data: SegmentEmployeeResponse | null;
+  loading: boolean;
+  error: string | null;
+  currentMin: number | null;
+  currentMax: number | null;
+  onApplyRange: (mn: number | null, mx: number | null) => void;
+}) {
+  if (loading) return <div className="text-[11px] text-zinc-500">Loading company-size breakdown…</div>;
+  if (error) return <div className="text-[11px] text-red-500">{error}</div>;
+  if (!data) return null;
+
+  const reco = computeEmpRangeRecommendation(data.bands);
+  const inRange = (b: SegmentEmployeeBand): boolean =>
+    b.minEmp !== null &&
+    (currentMin == null || (b.maxEmp ?? Infinity) >= currentMin) &&
+    (currentMax == null || b.minEmp <= currentMax);
+  const fmtRange = (mn: number | null, mx: number | null): string =>
+    `${mn ?? 0}${mx == null ? "+" : `–${mx}`}`;
+
+  // Per-size cells + a heatmap scaled WITHIN this segment's size bands, so the
+  // color shows which employee size performs best per metric (independent of the
+  // main per-bucket scale). "(no size)" is excluded from the ranking — a catch-all,
+  // like the main table's "Other (no bucket)".
+  const bandCells = data.bands.map(deriveCells);
+  const rankedCells = data.bands
+    .map((b, i) => ({ b, c: bandCells[i] }))
+    .filter(({ b }) => b.sizeLabel !== "(no size)")
+    .map(({ c }) => c);
+  const colStats = {} as Record<CellKey, number[]>;
+  for (const col of NUMERIC_COLUMNS) {
+    const vals: number[] = [];
+    for (const c of rankedCells) {
+      const v = c[col.key];
+      if (v !== null) vals.push(v);
+    }
+    vals.sort((a, b) => a - b);
+    colStats[col.key] = vals;
+  }
+  const DRILL_COL = "px-2 py-1 text-right tabular-nums whitespace-nowrap";
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300">
+          Company-size breakdown
+        </span>
+        {reco ? (
+          <span className="inline-flex items-center gap-1" title="Suggested from booked calls + lead quality + won, per size band vs the segment average">
+            <span className="rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400">
+              Suggested: {fmtRange(reco.minEmp, reco.maxEmp)}
+            </span>
+            <button
+              onClick={() => onApplyRange(reco.minEmp, reco.maxEmp)}
+              className="rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
+            >
+              Apply
+            </button>
+          </span>
+        ) : (
+          <span className="text-[10px] text-zinc-400">Not enough conversion data for a suggestion</span>
+        )}
+        {(currentMin != null || currentMax != null) && (
+          <button
+            onClick={() => onApplyRange(null, null)}
+            className="text-[10px] text-zinc-500 hover:underline"
+          >
+            Clear range
+          </button>
+        )}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="text-[11px] border-collapse">
+          <thead>
+            {/* Group band — mirrors the main table's section headers */}
+            <tr className="text-[9px] font-bold text-zinc-400 uppercase">
+              <th className="px-2 py-1" />
+              {COLUMN_GROUPS.map((g) => (
+                <th key={g.group} colSpan={g.span} className="px-2 py-1 text-center border-l border-zinc-200 dark:border-zinc-800/60 whitespace-nowrap">
+                  {g.group}
+                </th>
+              ))}
+            </tr>
+            <tr className="text-zinc-500">
+              <th className="text-left px-2 py-1 font-medium">Size</th>
+              {NUMERIC_COLUMNS.map((col, idx) => (
+                <th
+                  key={col.key}
+                  title={col.title}
+                  className={`text-right px-2 py-1 font-medium whitespace-nowrap ${isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""}`}
+                >
+                  {col.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.bands.map((b, i) => {
+              const c = bandCells[i];
+              const isNoSize = b.sizeLabel === "(no size)";
+              const highlighted = inRange(b);
+              return (
+                <tr key={b.sizeLabel} className={isNoSize ? "text-zinc-400" : ""}>
+                  <td className={`text-left px-2 py-1 whitespace-nowrap font-medium ${highlighted ? "bg-violet-500/10" : ""}`}>
+                    {b.sizeLabel}
+                  </td>
+                  {NUMERIC_COLUMNS.map((col, idx) => {
+                    const v = c[col.key];
+                    const sorted = colStats[col.key];
+                    const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
+                    const bg = isNoSize ? undefined : heatBg(v, sorted, col.lowerIsBetter);
+                    return (
+                      <td
+                        key={col.key}
+                        style={bg ? { backgroundColor: bg } : undefined}
+                        className={`${DRILL_COL} ${!isNoSize && sorted.length ? leaderCls(v, best) : ""} ${isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""}`}
+                      >
+                        {col.fmt(c)}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -941,6 +1384,9 @@ function TotalsRow({
           {includedCount} webinar{includedCount === 1 ? "" : "s"}
         </span>
       </td>
+      {/* Quality + Employee-range placeholders (non-numeric leading columns) */}
+      <td className="bg-zinc-100 dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800/60" />
+      <td className="bg-zinc-100 dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800/60" />
       {NUMERIC_COLUMNS.map((col, idx) => (
         <td
           key={col.key}

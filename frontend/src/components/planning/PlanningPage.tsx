@@ -2,7 +2,7 @@
 
 import { useState, useMemo, useCallback, useRef, useEffect, type ReactNode } from "react";
 import {
-  fetchBuckets, fetchSenders, fetchWebinars, fetchWebinarLists,
+  fetchBuckets, fetchSenders, fetchWebinars, fetchWebinarLists, fetchGoodAvailable, type GoodAvailable,
   assignBucketToWebinar, createWebinar as apiCreateWebinar,
   updateSender as apiUpdateSender, fetchBucketCopies, generateCopies,
   createSender as apiCreateSender, deleteAssignment as apiDeleteAssignment,
@@ -670,6 +670,7 @@ function MultiCountryDropdown({
 
 export function PlanningPage() {
   const [buckets, setBuckets] = useState<AvailableBucket[]>([]);
+  const [goodAvail, setGoodAvail] = useState<GoodAvailable | null>(null);
   const [senders, setSenders] = useState<Sender[]>([]);
   const [editingSenders, setEditingSenders] = useState(false);
   const [webinars, setWebinars] = useState<Webinar[]>([]);
@@ -748,12 +749,13 @@ export function PlanningPage() {
     let cancelled = false;
     async function loadData() {
       try {
-        const [bucketsRes, sendersRes, webinarsRes] = await Promise.all([
-          fetchBuckets(), fetchSenders(), fetchWebinars(),
+        const [bucketsRes, sendersRes, webinarsRes, goodAvailRes] = await Promise.all([
+          fetchBuckets(), fetchSenders(), fetchWebinars(), fetchGoodAvailable(),
         ]);
         if (cancelled) return;
 
         setBuckets(bucketsRes.buckets);
+        setGoodAvail(goodAvailRes);
         setSenders(sendersRes.senders.map(apiSenderToLocal));
 
         // Build campaign rows from metadata only — lists are hydrated lazily.
@@ -933,6 +935,11 @@ export function PlanningPage() {
   // Empty = no filter. `assignAvailCountries` are the options for the selected source.
   const [assignFilterCountries, setAssignFilterCountries] = useState<string[]>([]);
   const [assignAvailCountries, setAssignAvailCountries] = useState<AssignCountry[]>([]);
+  // Employee-count filter (literal headcount range), shown under the country
+  // filter. "" = no bound. Either bound narrows the per-bucket "remaining" and
+  // the claim; contacts with unknown size are excluded when a bound is set.
+  const [assignFilterEmpMin, setAssignFilterEmpMin] = useState<number | "">("");
+  const [assignFilterEmpMax, setAssignFilterEmpMax] = useState<number | "">("");
   // Reuse filter (shown above the bucket list). "never" = fresh contacts only
   // (the default, same as before). Other values also include contacts whose last
   // sent-invite is older than the cutoff. `assignEligible` holds the reuse-aware
@@ -947,6 +954,10 @@ export function PlanningPage() {
   // stored fresh baseline). When loaded, buckets ABSENT from the map have zero
   // eligible contacts and must show 0 — not their fresh baseline.
   const [assignEligible, setAssignEligible] = useState<Record<string, number> | null>(null);
+  // Per-bucket filter-aware TOTAL (all matching contacts, not just fresh); only
+  // populated when a country/employee filter is active — otherwise fall back to
+  // the static bucket.total_contacts.
+  const [assignEligibleTotals, setAssignEligibleTotals] = useState<Record<string, number> | null>(null);
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
@@ -967,30 +978,45 @@ export function PlanningPage() {
     return () => { cancelled = true; };
   }, [assignSource, assignTab]);
 
+  // The webinar the assign panel is actually showing for. The panel opens either
+  // explicitly (+ Assign → assigningWebinarId) OR automatically for an expanded
+  // webinar that has no lists yet (see the render gate: `assigningWebinarId === w.id
+  // || w.lists.length === 0`). The eligible/remaining effect must key off BOTH,
+  // otherwise a fresh 0-list webinar shows the panel but the filter counts never
+  // recompute (assigningWebinarId stays null).
+  const activeAssignWebinarId = useMemo(() => {
+    if (assigningWebinarId) return assigningWebinarId;
+    const auto = webinars.find((w) => w.expanded && w.listsLoaded && w.lists.length === 0);
+    return auto ? auto.id : null;
+  }, [assigningWebinarId, webinars]);
+
   // Reuse-aware per-bucket "remaining": refetched whenever the reuse cutoff, the
   // country filter, or the webinar being assigned changes. Only meaningful while
   // an assign panel is open. When cutoff = "never" this equals the fresh baseline
   // already on each bucket, so the panel falls back to bucket.remaining_contacts.
   useEffect(() => {
-    if (!assigningWebinarId) { setAssignEligible(null); return; }
+    if (!activeAssignWebinarId) { setAssignEligible(null); setAssignEligibleTotals(null); return; }
     // Custom mode needs a date before it can query.
-    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); return; }
+    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); setAssignEligibleTotals(null); return; }
     let cancelled = false;
     // Invalidate immediately so a filter change never shows the PREVIOUS
     // filter's counts while the new fetch is in flight (brief fresh-baseline
     // fallback instead of stale-wrong numbers).
     setAssignEligible(null);
+    setAssignEligibleTotals(null);
     fetchBucketEligible({
       reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
       reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
       reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
-      webinar_id: assigningWebinarId,
+      webinar_id: activeAssignWebinarId,
       country: assignFilterCountries.length ? assignFilterCountries : undefined,
+      emp_min: assignFilterEmpMin === "" ? undefined : assignFilterEmpMin,
+      emp_max: assignFilterEmpMax === "" ? undefined : assignFilterEmpMax,
     })
-      .then((m) => { if (!cancelled) setAssignEligible(m); })
-      .catch(() => { if (!cancelled) setAssignEligible(null); });
+      .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); } })
+      .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); } });
     return () => { cancelled = true; };
-  }, [assigningWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, eligibleRefresh]);
+  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket. When the eligible map is loaded, a
   // bucket ABSENT from it has zero eligible contacts under the current filter —
@@ -1000,6 +1026,20 @@ export function PlanningPage() {
     (b: { id: string; remaining_contacts: number }) =>
       assignEligible ? (assignEligible[b.id] ?? 0) : b.remaining_contacts,
     [assignEligible],
+  );
+
+  // Whether a contact-level filter is narrowing the pool (drives whether TOTAL
+  // uses the filter-aware count or the static bucket size).
+  const assignFilterActive =
+    assignFilterCountries.length > 0 || assignFilterEmpMin !== "" || assignFilterEmpMax !== "";
+
+  // Filter-aware TOTAL for a bucket: when a country/employee filter is active use
+  // the server's per-bucket total under that filter (absent bucket ⇒ 0); with no
+  // filter fall back to the stored bucket size.
+  const bucketTotal = useCallback(
+    (b: { id: string; total_contacts: number }) =>
+      assignFilterActive && assignEligibleTotals ? (assignEligibleTotals[b.id] ?? 0) : b.total_contacts,
+    [assignFilterActive, assignEligibleTotals],
   );
 
   // Full option set for the filter: countries present in the source (with counts,
@@ -1093,6 +1133,37 @@ export function PlanningPage() {
     return Math.max(0, sender.accounts - used);
   }, [senders, getAccountsUsedForSender]);
 
+  // Once the operator hand-edits the CONTACTS volume we must not silently
+  // overwrite it — e.g. a background `fetchBuckets()` resolving would otherwise
+  // re-fire the sync effect below and clobber the typed value. Reset the flag on
+  // any user-intent change (bucket/sender/pacing/filters/webinar) so those still
+  // re-auto-fill. Declared BEFORE the sync effect so it runs first on shared deps.
+  const volumeTouchedRef = useRef(false);
+  useEffect(() => {
+    volumeTouchedRef.current = false;
+  }, [assignBucket, assignSender, assignSendPerAcct, assignDays, assignFilterEmpMin, assignFilterEmpMax, assignFilterCountries, activeAssignWebinarId]);
+
+  // Keep the CONTACTS (volume) in sync with the selected bucket's FILTERED
+  // remaining — capped by the chosen sender's capacity — whenever the filters or
+  // sender change, so the number to assign always reflects what's claimable now
+  // (previously it only re-synced on bucket re-select). A manual edit to the
+  // volume field persists until the next filter/sender/bucket change.
+  useEffect(() => {
+    if (assignTab !== "buckets" || !assignBucket) return;
+    if (volumeTouchedRef.current) return;  // operator typed a custom volume — leave it
+    const b = buckets.find((x) => x.id === assignBucket);
+    if (!b) return;
+    let vol = bucketRemaining(b);
+    const s = assignSender ? senders.find((x) => x.id === assignSender) : undefined;
+    if (s && activeAssignWebinarId) {
+      const spa = assignSendPerAcct > 0 ? assignSendPerAcct : s.sendPerAccount;
+      const d = assignDays > 0 ? assignDays : s.daysPerWeek;
+      const maxVol = getAvailableAccounts(activeAssignWebinarId, assignSender) * spa * d;
+      if (vol > maxVol && maxVol > 0) vol = maxVol;
+    }
+    setAssignVolume(vol);
+  }, [assignTab, assignBucket, bucketRemaining, assignSender, senders, assignSendPerAcct, assignDays, activeAssignWebinarId, getAvailableAccounts, buckets]);
+
   /* ── Handlers ──────────────────────────────────────────────────────── */
 
   const toggleWebinar = (id: string) => {
@@ -1122,8 +1193,16 @@ export function PlanningPage() {
       setAssignEligible(null);
       setAssignFilterCountries([]);
       setAssignAvailCountries([]);
+      setAssignFilterEmpMin("");
+      setAssignFilterEmpMax("");
       // Load custom lists
       fetchCustomLists().then(({ lists }) => setCustomLists(lists)).catch(() => {});
+      // Refresh buckets so the employee-range prefill (and remaining counts)
+      // reflect any Segments edits made since the page loaded — the bucket list
+      // is held in state and would otherwise be stale mid-session.
+      fetchBuckets().then(({ buckets: fresh }) => setBuckets(fresh)).catch(() => {});
+      // Keep the "Good Available" inventory in sync with the same edits/assigns.
+      fetchGoodAvailable().then(setGoodAvail).catch(() => {});
     }
   };
 
@@ -1392,6 +1471,8 @@ export function PlanningPage() {
     let requestData: Parameters<typeof assignBucketToWebinar>[1];
 
     const filterCountries = assignFilterCountries.length ? assignFilterCountries : undefined;
+    const empMin = assignFilterEmpMin === "" ? undefined : assignFilterEmpMin;
+    const empMax = assignFilterEmpMax === "" ? undefined : assignFilterEmpMax;
     if (isCustomListAssign) {
       requestData = {
         upload_id: assignCustomList,
@@ -1401,6 +1482,8 @@ export function PlanningPage() {
         send_per_account: sendPerAcct,
         days: assignDays,
         filter_countries: filterCountries,
+        emp_min: empMin,
+        emp_max: empMax,
       };
     } else {
       const bucket = buckets.find((b) => b.id === assignBucket);
@@ -1423,6 +1506,8 @@ export function PlanningPage() {
         countries_override: countries,
         emp_range_override: empRange,
         filter_countries: filterCountries,
+        emp_min: empMin,
+        emp_max: empMax,
         reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
         reuse_before: assignReuseCutoff === "custom" ? (assignReuseBefore || undefined) : undefined,
         reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
@@ -1472,7 +1557,7 @@ export function PlanningPage() {
       assignInFlightRef.current = null;
       setAssignInFlight(null);
     }
-  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignAccounts, assignSendPerAcct, assignDays, buckets, senders, assignReuseCutoff, assignReuseBefore, assignReuseOnly, bucketRemaining]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, assignAccounts, assignSendPerAcct, assignDays, buckets, senders, assignReuseCutoff, assignReuseBefore, assignReuseOnly, bucketRemaining]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
@@ -2048,6 +2133,10 @@ export function PlanningPage() {
                 { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200" },
                 { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400" },
                 { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400" },
+                { label: "Good Avail", value: (goodAvail?.total ?? 0).toLocaleString(), color: "text-teal-400" },
+                { label: "Good US+CA", value: (goodAvail?.us_ca ?? 0).toLocaleString(), color: "text-teal-400" },
+                { label: "Good EU", value: (goodAvail?.europe ?? 0).toLocaleString(), color: "text-teal-400" },
+                { label: "Good No-loc", value: (goodAvail?.no_location ?? 0).toLocaleString(), color: "text-teal-400" },
                 { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400" },
               ].map((s) => (
                 <div key={s.label} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40">
@@ -2117,20 +2206,20 @@ export function PlanningPage() {
 
       {/* ── Webinar table ──────────────────────────────────────────── */}
       {!loadingData && <div className="overflow-x-auto">
-        <table className="w-full text-xs min-w-[1600px]">
+        <table className="w-full text-xs min-w-[1180px]">
           <thead>
             <tr className="bg-zinc-50 dark:bg-zinc-900/90 border-b border-zinc-200 dark:border-zinc-800/40">
               <th className="w-8 px-2 py-2"></th>
               <th className="w-8 px-1 py-2"></th>
-              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[130px]">Webinar #</th>
+              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[112px]">Webinar #</th>
               <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Status</th>
-              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[320px]">Description of List</th>
+              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] w-[160px] max-w-[160px]">Description of List</th>
               <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] w-[130px] max-w-[130px]">Bucket</th>
               <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Sender</th>
               <th className="text-right px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">List Size</th>
               <th className="text-right px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Remaining</th>
-              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[250px]">Title</th>
-              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[250px]">Description</th>
+              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[150px]">Title</th>
+              <th className="text-left px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px] min-w-[150px]">Description</th>
               <th className="text-right px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Accts</th>
               <th className="text-center px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Copies</th>
               <th className="text-center px-2 py-2 text-zinc-500 font-semibold uppercase tracking-wider text-[10px]">Setup</th>
@@ -2358,7 +2447,7 @@ export function PlanningPage() {
                               </div>
                             </div>
                             {assignTab === "buckets" ? (
-                              <span className="text-[10px] text-zinc-500">{buckets.filter((b) => bucketRemaining(b) > 0).length} buckets available · {buckets.reduce((s, b) => s + (bucketRemaining(b) || 0), 0).toLocaleString()} contacts</span>
+                              <span className="text-[10px] text-zinc-500">{buckets.filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b)).length} buckets available · {buckets.filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b)).reduce((s, b) => s + (bucketRemaining(b) || 0), 0).toLocaleString()} contacts</span>
                             ) : (
                               <span className="text-[10px] text-zinc-500">{customLists.length} custom lists available</span>
                             )}
@@ -2435,9 +2524,59 @@ export function PlanningPage() {
                             <span className="text-[10px] text-zinc-500 mt-4">
                               {assignFilterCountries.length === 0
                                 ? "No filter — assigning from all countries"
-                                : assignSource
+                                : (assignSource && assignReuseCutoff === "never" && assignFilterEmpMin === "" && assignFilterEmpMax === "")
+                                  // assignAvailCountries counts the FRESH pool only and is NOT narrowed
+                                  // by the reuse cutoff or the employee-count filter, so the precise
+                                  // per-country number is meaningful only in fresh-only mode with no
+                                  // employee bound. Otherwise the bucket "remaining" rows below already
+                                  // reflect the correct reuse+country+employee eligible count.
                                   ? `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match in this ${assignTab === "custom_lists" ? "list" : "bucket"}`
                                   : "Narrowing bucket remaining below to the selected countries"}
+                            </span>
+                          </div>
+
+                          {/* Assignment form — employee-count filter (literal headcount).
+                              Placed under the country filter; narrows the per-bucket
+                              "remaining" and the claim to contacts whose employee_count is
+                              within [min, max]. Contacts with unknown size are excluded when
+                              a bound is set. Bucket TOTAL is unchanged. */}
+                          <div className="flex items-center gap-3 mb-2">
+                            <div>
+                              <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Employee count filter</label>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  placeholder="Min"
+                                  value={assignFilterEmpMin}
+                                  onChange={(e) => setAssignFilterEmpMin(e.target.value === "" ? "" : Math.max(0, parseInt(e.target.value) || 0))}
+                                  className="w-24 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500"
+                                />
+                                <span className="text-[10px] text-zinc-500">to</span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  placeholder="Max"
+                                  value={assignFilterEmpMax}
+                                  onChange={(e) => setAssignFilterEmpMax(e.target.value === "" ? "" : Math.max(0, parseInt(e.target.value) || 0))}
+                                  className="w-24 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500"
+                                />
+                                {(assignFilterEmpMin !== "" || assignFilterEmpMax !== "") && (
+                                  <button
+                                    type="button"
+                                    onClick={() => { setAssignFilterEmpMin(""); setAssignFilterEmpMax(""); }}
+                                    className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 text-xs px-1"
+                                    title="Clear employee filter"
+                                  >✕</button>
+                                )}
+                              </div>
+                            </div>
+                            <span className="text-[10px] text-zinc-500 mt-4">
+                              {assignFilterEmpMin === "" && assignFilterEmpMax === ""
+                                ? "No filter — all company sizes"
+                                : (assignFilterEmpMin !== "" && assignFilterEmpMax !== "" && assignFilterEmpMin > assignFilterEmpMax)
+                                  ? "Min is greater than Max — no contacts will match"
+                                  : "Narrowing bucket remaining below to this employee-count range (contacts with no size are excluded)"}
                             </span>
                           </div>
 
@@ -2457,6 +2596,12 @@ export function PlanningPage() {
                                     let vol = bucketRemaining(b);
                                     setAssignCountries((b.countries || []).join(", "));
                                     setAssignEmpRange(b.emp_range || "");
+                                    // Prefill the employee-count filter from the segment's
+                                    // saved range (Statistics → Segments). Null/absent clears
+                                    // it (no filter). Changing these re-runs the eligible
+                                    // effect, so remaining counts adjust automatically.
+                                    setAssignFilterEmpMin(b.stat_emp_min ?? "");
+                                    setAssignFilterEmpMax(b.stat_emp_max ?? "");
                                     setAssignAccounts(0);
                                     // If sender already selected, cap volume to what available accounts can handle
                                     if (assignSender) {
@@ -2472,7 +2617,7 @@ export function PlanningPage() {
                                     setAssignVolume(vol);
                                   }
                                 }}
-                                options={buckets.filter((b) => bucketRemaining(b) > 0).map((b) => ({
+                                options={buckets.filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b)).map((b) => ({
                                   value: b.id,
                                   label: `${b.name} (${bucketRemaining(b).toLocaleString()} remaining)`,
                                   badge: b.copies_count.titles > 0 && b.copies_count.descriptions > 0 ? "Copy ✓" : undefined,
@@ -2514,7 +2659,7 @@ export function PlanningPage() {
                             </div>
                             <div className="w-32">
                               <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Contacts</label>
-                              <input type="number" value={assignVolume || ""} onChange={(e) => { setAssignVolume(parseInt(e.target.value) || 0); setAssignAccounts(0); }} className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500" />
+                              <input type="number" value={assignVolume || ""} onChange={(e) => { volumeTouchedRef.current = true; setAssignVolume(parseInt(e.target.value) || 0); setAssignAccounts(0); }} className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500" />
                             </div>
                             <button onClick={() => handleAssign(w.id)} disabled={(assignTab === "custom_lists" ? !assignCustomList : !assignBucket) || !assignSender || assignVolume <= 0 || assignInFlight === w.id || (assignTab === "buckets" && assignReuseCutoff === "custom" && !assignReuseBefore)}
                               className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-200 dark:disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-wait text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap inline-flex items-center gap-1.5">
@@ -2622,7 +2767,7 @@ export function PlanningPage() {
                                   <thead>
                                     {(() => {
                                       const availBuckets = buckets.filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b));
-                                      const totalSum = availBuckets.reduce((s, b) => s + b.total_contacts, 0);
+                                      const totalSum = availBuckets.reduce((s, b) => s + bucketTotal(b), 0);
                                       const remainSum = availBuckets.reduce((s, b) => s + bucketRemaining(b), 0);
                                       return (
                                         <tr className="bg-zinc-100 dark:bg-zinc-800/40">
@@ -2635,14 +2780,17 @@ export function PlanningPage() {
                                   </thead>
                                   <tbody className="divide-y divide-zinc-800/20">
                                     {buckets
-                                      .filter((b) => bucketRemaining(b) > 0)
+                                      .filter((b) => bucketRemaining(b) > 0 && !isDisqualifiedBucket(b))
                                       .slice()
-                                      .sort((a, b) => Number(isDisqualifiedBucket(a)) - Number(isDisqualifiedBucket(b)))
                                       .map((b) => (
                                       <tr key={b.id} onClick={() => {
                                         setAssignBucket(b.id);
                                         setAssignCountries((b.countries || []).join(", "));
                                         setAssignEmpRange(b.emp_range || "");
+                                        // Prefill the employee-count filter from the segment's
+                                        // saved range, same as the dropdown selection.
+                                        setAssignFilterEmpMin(b.stat_emp_min ?? "");
+                                        setAssignFilterEmpMax(b.stat_emp_max ?? "");
                                         setAssignAccounts(0);
                                         let vol = bucketRemaining(b);
                                         if (assignSender) {
@@ -2667,7 +2815,7 @@ export function PlanningPage() {
                                             )}
                                           </span>
                                         </td>
-                                        <td className="px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400">{b.total_contacts.toLocaleString()}</td>
+                                        <td className="px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400">{bucketTotal(b).toLocaleString()}</td>
                                         <td className="px-3 py-1.5 text-right font-mono text-violet-400">{bucketRemaining(b).toLocaleString()}</td>
                                       </tr>
                                     ))}
@@ -2768,9 +2916,9 @@ export function PlanningPage() {
                         )}
                       </td>
                       <td className="px-2 py-1.5"></td>
-                      <td className="px-2 py-1.5">
-                        <div className="flex items-center gap-1.5">
-                          <span className={l.isNonjoiners || l.isNoListData ? "text-zinc-500" : "text-zinc-800 dark:text-zinc-300"}>{l.description}</span>
+                      <td className="px-2 py-1.5 max-w-[160px]">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span title={l.description} className={`truncate ${l.isNonjoiners || l.isNoListData ? "text-zinc-500" : "text-zinc-800 dark:text-zinc-300"}`}>{l.description}</span>
                           {!l.isNonjoiners && !l.isNoListData && (
                             l.listUrl ? (
                               <a href={l.listUrl} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} title={l.listUrl}
@@ -2833,7 +2981,7 @@ export function PlanningPage() {
                       <td className="px-2 py-1.5">
                         {l.title ? (
                           <div
-                            className="max-w-[240px] cursor-pointer group/title"
+                            className="max-w-[150px] cursor-pointer group/title"
                             onClick={() => openVariationsModal(l.id, w.id, "title")}
                           >
                             {(() => {
@@ -2874,7 +3022,7 @@ export function PlanningPage() {
                           const descText = selectedDesc?.text || "";
                           return descText ? (
                             <div
-                              className="max-w-[240px] cursor-pointer group/desc"
+                              className="max-w-[150px] cursor-pointer group/desc"
                               onClick={() => openVariationsModal(l.id, w.id, "description")}
                             >
                               {selectedDesc && (

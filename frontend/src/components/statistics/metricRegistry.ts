@@ -478,27 +478,27 @@ export const METRIC_COLUMNS: MetricColumn[] = [
 
   // ── Sales ──
   {
-    key: "totalBookings", label: "Bookings", group: "Sales", format: "number",
-    description: "All calls booked for this webinar — UNION of opp-level and contact-level signals (distinct opportunities).",
+    key: "uniqueBookers", label: "Bookings", group: "Sales", format: "number",
+    description: "Distinct contacts who booked a call for this webinar (unique bookers). Click for the breakdown — the modal also shows total opportunities.",
     fieldsUsed: [F_OPP_WEBINAR_SRC, { ...F_CONTACT_BOOKED_CALL, filter: "= {N} (fallback when opp field empty)" }],
   },
   {
     key: "bookingsPerAttended", label: "Book/Att", group: "Sales", format: "ratio",
-    formulaText: "totalBookings / totalAttended",
-    formulaSources: ["totalBookings", "totalAttended"],
-    description: "Bookings per attendee.",
+    formulaText: "uniqueBookers / totalAttended",
+    formulaSources: ["uniqueBookers", "totalAttended"],
+    description: "Unique bookers per attendee.",
   },
   {
     key: "bookingsPerPast10Min", label: "Book/10m", group: "Sales", format: "ratio",
-    formulaText: "totalBookings / total10MinPlus",
-    formulaSources: ["totalBookings", "total10MinPlus"],
-    description: "Bookings per 10-minute viewer.",
+    formulaText: "uniqueBookers / total10MinPlus",
+    formulaSources: ["uniqueBookers", "total10MinPlus"],
+    description: "Unique bookers per 10-minute viewer.",
   },
   {
     key: "totalBookingsPer1kInv", label: "Book/1k", group: "Sales", format: "per1k",
-    formulaText: "totalBookings / (actuallyUsed (fallback invited) / 1000)",
-    formulaSources: ["totalBookings", "actuallyUsed", "invited"],
-    description: "Bookings per 1,000 (Actually Used; falls back to Invited when Actually Used is 0).",
+    formulaText: "uniqueBookers / (actuallyUsed (fallback invited) / 1000)",
+    formulaSources: ["uniqueBookers", "actuallyUsed", "invited"],
+    description: "Unique bookers per 1,000 (Actually Used; falls back to Invited when Actually Used is 0).",
   },
   {
     key: "totalCallsDatePassed", label: "Calls", group: "Sales", format: "number",

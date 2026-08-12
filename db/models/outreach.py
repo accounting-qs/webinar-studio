@@ -22,6 +22,12 @@ class OutreachBucket(Base):
     # Manual quality label (good/medium/bad) set on the Statistics → Segments
     # dashboard and shown read-only on the Planning bucket picker. NULL = unmarked.
     quality: Mapped[Optional[str]] = mapped_column(String(20))
+    # User-set employee-count range (literal headcount) for this segment, defined on
+    # the Statistics → Segments dashboard. Drives the per-segment drill-down + the
+    # data-driven "suggested range". NULL = undefined. Either bound may be NULL for
+    # an open range. Distinct from `emp_range` (the bucket's free-text source range).
+    stat_emp_min: Mapped[Optional[int]] = mapped_column(Integer)
+    stat_emp_max: Mapped[Optional[int]] = mapped_column(Integer)
     merged_into_bucket_id: Mapped[Optional[str]] = mapped_column(
         UUID(as_uuid=False), ForeignKey("outreach_buckets.id", ondelete="SET NULL")
     )
