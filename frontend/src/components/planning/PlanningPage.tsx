@@ -2574,6 +2574,32 @@ export function PlanningPage() {
                                     title="Clear employee filter"
                                   >✕</button>
                                 )}
+                                {(() => {
+                                  // Selected bucket's saved Segments range — offered as a
+                                  // recommendation with an explicit Apply, never auto-applied.
+                                  const b = buckets.find((x) => x.id === assignBucket);
+                                  if (!b || (b.stat_emp_min == null && b.stat_emp_max == null)) return null;
+                                  const applied =
+                                    assignFilterEmpMin === (b.stat_emp_min ?? "") &&
+                                    assignFilterEmpMax === (b.stat_emp_max ?? "");
+                                  if (applied) return null;
+                                  return (
+                                    <span className="flex items-center gap-1.5 ml-1">
+                                      <span className="text-[10px] text-violet-400/80 whitespace-nowrap">
+                                        Segment range: {b.stat_emp_min ?? 0} – {b.stat_emp_max ?? "∞"}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setAssignFilterEmpMin(b.stat_emp_min ?? "");
+                                          setAssignFilterEmpMax(b.stat_emp_max ?? "");
+                                        }}
+                                        className="text-[10px] px-1.5 py-0.5 rounded border border-violet-500/40 text-violet-400 hover:bg-violet-500/10 whitespace-nowrap"
+                                        title="Apply the segment's saved employee range as the filter"
+                                      >Apply</button>
+                                    </span>
+                                  );
+                                })()}
                               </div>
                             </div>
                             <span className="text-[10px] text-zinc-500 mt-4">
@@ -2601,12 +2627,9 @@ export function PlanningPage() {
                                     let vol = bucketRemaining(b);
                                     setAssignCountries((b.countries || []).join(", "));
                                     setAssignEmpRange(b.emp_range || "");
-                                    // Prefill the employee-count filter from the segment's
-                                    // saved range (Statistics → Segments). Null/absent clears
-                                    // it (no filter). Changing these re-runs the eligible
-                                    // effect, so remaining counts adjust automatically.
-                                    setAssignFilterEmpMin(b.stat_emp_min ?? "");
-                                    setAssignFilterEmpMax(b.stat_emp_max ?? "");
+                                    // The segment's saved employee range is NOT auto-applied —
+                                    // it surfaces as a recommendation chip next to the employee
+                                    // filter with an Apply button (user-controlled).
                                     setAssignAccounts(0);
                                     // If sender already selected, cap volume to what available accounts can handle
                                     if (assignSender) {
@@ -2802,10 +2825,8 @@ export function PlanningPage() {
                                         setAssignBucket(b.id);
                                         setAssignCountries((b.countries || []).join(", "));
                                         setAssignEmpRange(b.emp_range || "");
-                                        // Prefill the employee-count filter from the segment's
-                                        // saved range, same as the dropdown selection.
-                                        setAssignFilterEmpMin(b.stat_emp_min ?? "");
-                                        setAssignFilterEmpMax(b.stat_emp_max ?? "");
+                                        // Saved segment range is a recommendation chip, not an
+                                        // auto-applied filter (same as the dropdown selection).
                                         setAssignAccounts(0);
                                         let vol = bucketRemaining(b);
                                         if (assignSender) {
