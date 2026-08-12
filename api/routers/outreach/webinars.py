@@ -560,6 +560,10 @@ async def assign_bucket(
     # (5,000 rows × 7 = 35k blew it up on real-size assigns).
     CLAIM_CHUNK = 2000
 
+    # Fresh (never-invited) contacts claimed across all pools — feeds the exact
+    # bucket-remaining decrement below instead of a whole-bucket recount.
+    fresh_claimed = {"n": 0}
+
     async def _claim_pool(where_conds, target: int) -> int:
         """Claim up to ``target`` contacts matching ``where_conds`` into this
         list; return how many were claimed.
@@ -609,8 +613,10 @@ async def assign_bucket(
                     .where(Contact.id.in_(inserted_ids))
                     .values(assigned_membership_count=Contact.assigned_membership_count + 1)
                 )
-                # Legacy slot dual-write — fresh contacts only.
-                await db.execute(
+                # Legacy slot dual-write — fresh contacts only. Its rowcount IS
+                # the number of fresh (never-invited) contacts this chunk took,
+                # which the bucket-remaining decrement below relies on.
+                legacy_res = await db.execute(
                     update(Contact)
                     .where(Contact.id.in_(inserted_ids), Contact.outreach_status == "available")
                     .values(
@@ -619,6 +625,7 @@ async def assign_bucket(
                         assigned_date=webinar.date,
                     )
                 )
+                fresh_claimed["n"] += legacy_res.rowcount or 0
             got += n
             if n < chunk_limit:
                 # Fewer rows than requested → this pool is exhausted (or a concurrent
@@ -662,20 +669,16 @@ async def assign_bucket(
         assignment.remaining = claimed
         await db.flush()
 
-    # Update bucket remaining counter (only for bucket assignments) to the fresh
-    # baseline — never-invited, not-in-flight contacts. Recomputed from live
-    # counts rather than `available_count - claimed`, since available_count was
-    # the reuse-filtered pool (may include previously-used contacts) and doesn't
-    # equal the fresh remaining.
+    # Update bucket remaining counter (only for bucket assignments): decrement
+    # by the fresh contacts this claim actually took (the legacy dual-write's
+    # rowcount — exact, no scan). The previous whole-bucket recount omitted the
+    # blocklist predicate, so no partial index applied and it heap-scanned the
+    # bucket — timing out at the END of big assigns and rolling back an
+    # otherwise-successful claim (seen live at webinars.py:671 on prod).
     if bucket:
-        fresh_remaining = (await db.execute(
-            select(sa_func.count()).where(
-                Contact.bucket_id == bucket.id,
-                Contact.last_invited_at.is_(None),
-                Contact.assigned_membership_count == 0,
-            )
-        )).scalar() or 0
-        bucket.remaining_contacts = fresh_remaining
+        bucket.remaining_contacts = max(
+            0, (bucket.remaining_contacts or 0) - fresh_claimed["n"]
+        )
 
     # Log copy usage
     if title_copy:
