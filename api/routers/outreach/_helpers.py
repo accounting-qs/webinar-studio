@@ -129,16 +129,11 @@ def claimable_conditions(
     (bucket/upload) predicates are applied by the caller.
     """
     conds = [Contact.assigned_membership_count == 0]
-    # TRANSITION-ONLY guard (remove with the legacy-column drop migration):
-    # between running migration 064 and the backfill script, contacts still
-    # carry only the legacy slot (caches 0/NULL). Without this, a slot-'used'
-    # contact would look fresh and be claimable immediately. The predicate is
-    # a no-op once the backfill has stamped the caches.
-    conds.append(~and_(
-        Contact.outreach_status.in_(("assigned", "used")),
-        Contact.last_invited_at.is_(None),
-        Contact.assigned_membership_count == 0,
-    ))
+    # (The 064→backfill TRANSITION guard that lived here was removed after the
+    # 2026-08-12 prod backfill fully stamped the caches — verified 0 rows where
+    # the legacy slot was busy while the caches read fresh. It referenced
+    # outreach_status, which no partial index covers, forcing a heap fetch per
+    # candidate row and pushing /buckets/eligible past the 120s statement cap.)
     if cutoff_ts is None:
         # Fresh-only. reuse_only without a cutoff would be the empty set, so it
         # is ignored here (the UI hides the checkbox for "never").
