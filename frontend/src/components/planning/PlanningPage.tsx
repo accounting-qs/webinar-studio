@@ -958,6 +958,10 @@ export function PlanningPage() {
   // populated when a country/employee filter is active — otherwise fall back to
   // the static bucket.total_contacts.
   const [assignEligibleTotals, setAssignEligibleTotals] = useState<Record<string, number> | null>(null);
+  // True while a per-bucket eligible/totals fetch is in flight — drives the
+  // loading treatment on the assign table's Total/Remaining numbers so a
+  // filter change visibly distinguishes "still fetching" from "final".
+  const [assignEligibleLoading, setAssignEligibleLoading] = useState(false);
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
@@ -995,15 +999,16 @@ export function PlanningPage() {
   // an assign panel is open. When cutoff = "never" this equals the fresh baseline
   // already on each bucket, so the panel falls back to bucket.remaining_contacts.
   useEffect(() => {
-    if (!activeAssignWebinarId) { setAssignEligible(null); setAssignEligibleTotals(null); return; }
+    if (!activeAssignWebinarId) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); return; }
     // Custom mode needs a date before it can query.
-    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); setAssignEligibleTotals(null); return; }
+    if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); return; }
     let cancelled = false;
     // Invalidate immediately so a filter change never shows the PREVIOUS
     // filter's counts while the new fetch is in flight (brief fresh-baseline
     // fallback instead of stale-wrong numbers).
     setAssignEligible(null);
     setAssignEligibleTotals(null);
+    setAssignEligibleLoading(true);
     fetchBucketEligible({
       reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
       reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
@@ -1013,8 +1018,8 @@ export function PlanningPage() {
       emp_min: assignFilterEmpMin === "" ? undefined : assignFilterEmpMin,
       emp_max: assignFilterEmpMax === "" ? undefined : assignFilterEmpMax,
     })
-      .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); } })
-      .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); } });
+      .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); setAssignEligibleLoading(false); } })
+      .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); } });
     return () => { cancelled = true; };
   }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, eligibleRefresh]);
 
@@ -2772,8 +2777,18 @@ export function PlanningPage() {
                                       return (
                                         <tr className="bg-zinc-100 dark:bg-zinc-800/40">
                                           <th className="text-left px-3 py-1.5 text-zinc-500 font-medium">Bucket <span className="text-zinc-400 font-normal">{availBuckets.length}</span></th>
-                                          <th className="text-right px-3 py-1.5 text-zinc-500 font-medium">Total <span className="text-zinc-400 font-normal">{totalSum.toLocaleString()}</span></th>
-                                          <th className="text-right px-3 py-1.5 text-zinc-500 font-medium">Remaining <span className="text-violet-400/70 font-normal">{remainSum.toLocaleString()}</span></th>
+                                          <th className="text-right px-3 py-1.5 text-zinc-500 font-medium">
+                                            Total{" "}
+                                            {assignEligibleLoading
+                                              ? <span className="inline-block w-3 h-3 align-middle border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" aria-label="updating" />
+                                              : <span className="text-zinc-400 font-normal">{totalSum.toLocaleString()}</span>}
+                                          </th>
+                                          <th className="text-right px-3 py-1.5 text-zinc-500 font-medium">
+                                            Remaining{" "}
+                                            {assignEligibleLoading
+                                              ? <span className="inline-block w-3 h-3 align-middle border-2 border-violet-400 border-t-transparent rounded-full animate-spin" aria-label="updating" />
+                                              : <span className="text-violet-400/70 font-normal">{remainSum.toLocaleString()}</span>}
+                                          </th>
                                         </tr>
                                       );
                                     })()}
@@ -2815,8 +2830,8 @@ export function PlanningPage() {
                                             )}
                                           </span>
                                         </td>
-                                        <td className="px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400">{bucketTotal(b).toLocaleString()}</td>
-                                        <td className="px-3 py-1.5 text-right font-mono text-violet-400">{bucketRemaining(b).toLocaleString()}</td>
+                                        <td className={`px-3 py-1.5 text-right font-mono text-zinc-600 dark:text-zinc-400${assignEligibleLoading ? " opacity-40 animate-pulse" : ""}`}>{bucketTotal(b).toLocaleString()}</td>
+                                        <td className={`px-3 py-1.5 text-right font-mono text-violet-400${assignEligibleLoading ? " opacity-40 animate-pulse" : ""}`}>{bucketRemaining(b).toLocaleString()}</td>
                                       </tr>
                                     ))}
                                   </tbody>
