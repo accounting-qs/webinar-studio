@@ -1486,9 +1486,13 @@ export function PlanningPage() {
 
     const filterCountries = assignFilterCountries.length ? assignFilterCountries : undefined;
     // Compact label for the list NAME: fully-selected regions collapse to their
-    // region name ("Europe") instead of 42 slash-joined countries.
+    // region name ("Europe") instead of 42 slash-joined countries. MUST collapse
+    // against the SAME option array the dropdown's region toggle selects from
+    // (assignLocationOptions = present + full world list) — collapsing against
+    // the present-only subset let sub-regions match while the wider region
+    // missed a variant, producing "DACH/BENELUX/<36 countries>".
     const filterCountriesLabel = filterCountries
-      ? collapseCountriesForLabel(filterCountries, assignAvailCountries.map((c) => c.country)).join("/")
+      ? collapseCountriesForLabel(filterCountries, assignLocationOptions.map((o) => o.country)).join("/")
       : undefined;
     const empMin = assignFilterEmpMin === "" ? undefined : assignFilterEmpMin;
     const empMax = assignFilterEmpMax === "" ? undefined : assignFilterEmpMax;
