@@ -1041,7 +1041,7 @@ class GoHighLevelStatisticsSource:
                 FROM webinargeek_subscribers wgs
                 JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)
                 LEFT JOIN njcsv c ON c.email = LOWER(wgs.email)
-                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
+                LEFT JOIN ghl_contact g ON g.email = wgs.email
                 WHERE wgs.broadcast_id = :bid
             """).bindparams(**wg_att_params))
             wrow = r.mappings().one_or_none()
@@ -1084,7 +1084,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE c.resp = 'yes')   AS yes_bookings,
                     COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE c.resp = 'maybe') AS maybe_bookings
                 FROM nj_emails_cte njx
-                JOIN ghl_contact g ON LOWER(g.email) = njx.email
+                JOIN ghl_contact g ON g.email = njx.email
                 JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
                 LEFT JOIN njcsv c ON c.email = njx.email
                 WHERE (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
@@ -1133,7 +1133,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT e.email) FILTER (WHERE {sr_pred})        AS self_reg_marked
                 FROM nj_emails_cte e
                 LEFT JOIN njcsv c ON c.email = e.email
-                LEFT JOIN ghl_contact g ON LOWER(g.email) = e.email
+                LEFT JOIN ghl_contact g ON g.email = e.email
             """).bindparams(**marked_params))
             mrow = r.mappings().one_or_none()
             if mrow:
@@ -1379,7 +1379,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
                 LEFT JOIN planned p ON p.email = LOWER(wgs.email)
-                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
+                LEFT JOIN ghl_contact g ON g.email = wgs.email
                 {wg_nj_join_sql}
                 WHERE wgs.broadcast_id = :bid
                   AND p.email IS NULL
@@ -1672,7 +1672,7 @@ class GoHighLevelStatisticsSource:
                 COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {unsub_filter}) AS unsubscribes
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
-            LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            LEFT JOIN ghl_contact g ON g.email = c.email
             WHERE m.webinar_id = CAST(:wid AS uuid)
               {_AIDS_PRED}
             GROUP BY m.assignment_id
@@ -1734,10 +1734,10 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
-                JOIN contacts c ON LOWER(c.email) = LOWER(wgs.email)
+                JOIN contacts c ON c.email = wgs.email
                 JOIN webinar_contact_memberships m
                   ON m.contact_id = c.id AND m.webinar_id = CAST(:wid AS uuid)
-                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+                LEFT JOIN ghl_contact g ON g.email = c.email
                 WHERE wgs.broadcast_id = :bid
                 GROUP BY m.assignment_id
             """
@@ -1951,7 +1951,7 @@ class GoHighLevelStatisticsSource:
                 JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
                 JOIN webinargeek_subscribers wgs
-                    ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
+                    ON wgs.email = c.email AND wgs.broadcast_id = :bid
                 WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
                 GROUP BY 1
             """
@@ -1985,7 +1985,7 @@ class GoHighLevelStatisticsSource:
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            JOIN ghl_contact g ON g.email = c.email
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
             WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
@@ -2148,7 +2148,7 @@ class GoHighLevelStatisticsSource:
                 JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
                 JOIN webinargeek_subscribers wgs
-                    ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
+                    ON wgs.email = c.email AND wgs.broadcast_id = :bid
                 WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
                 GROUP BY 1
             """
@@ -2183,7 +2183,7 @@ class GoHighLevelStatisticsSource:
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+            JOIN ghl_contact g ON g.email = c.email
             JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
             WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
               AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
@@ -2395,7 +2395,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
-                LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
+                LEFT JOIN ghl_contact g ON g.email = wgs.email
                 WHERE wgs.broadcast_id = :bid
             """
             r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
