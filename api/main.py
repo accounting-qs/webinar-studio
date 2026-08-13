@@ -16,6 +16,16 @@ async def lifespan(app: FastAPI):
     logger.info("Webinar Studio starting up")
     # Tables are managed by Alembic migrations — do not create_all here
 
+    # Pre-warm the (bucket × location) totals rollup in the background so the
+    # first country-filtered eligible request never pays the chunked build.
+    try:
+        import asyncio as _a
+
+        from api.routers.outreach.buckets import _totals_rollup
+        app.state._rollup_prewarm = _a.create_task(_totals_rollup())
+    except Exception:
+        logger.exception("totals-rollup prewarm failed to start (non-fatal)")
+
     # Resume in-flight imports orphaned by a backend restart. Each import worker
     # writes processed_rows to its upload row every batch, so we can skip the
     # CSV reader past that point and continue. If we can't resume (missing

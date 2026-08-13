@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, bucket_dict, claimable_conditions,
+    LLOYD_USER_ID, NO_LOCATION_SENTINEL, bucket_dict, claimable_conditions,
     compute_blocklist_counts_per_bucket, copy_dict, country_filter_conditions,
     employee_count_filter, reuse_cutoff_to_ts,
 )
@@ -146,6 +146,107 @@ def patch_eligible_cache_after_claim(
             ts,
             {**resp, "buckets": buckets_map, "total": sum(buckets_map.values())},
         )
+
+
+# 10-min rollup of ALL-STATUSES contact counts by (bucket, effective location):
+# one un-predicated index scan builds it, then ANY country include/exclude
+# totals combo is in-process arithmetic — no 42-value IN evaluated against
+# 4.4M rows per request (that pushed pure-exclude totals past the 120s cap).
+# Effective location mirrors country_filter_conditions: per-contact country,
+# else list_location; "" both → the no-location sentinel.
+_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None}
+_TOTALS_ROLLUP_TTL = 600.0
+
+
+async def _build_rollup() -> dict:
+    """One (bucket, effective-location) count rollup, built in bucket-group
+    chunks so no single statement approaches the 120s cap (the whole-table
+    GROUP BY measured ~120s)."""
+    from db.session import AsyncSessionLocal as _S
+    from sqlalchemy import text as _text
+
+    async with _S() as s:
+        sizes = (await s.execute(_text(
+            "SELECT id, GREATEST(total_contacts, 1) FROM outreach_buckets "
+            "WHERE user_id = CAST(:uid AS uuid) AND deleted_at IS NULL"
+        ), {"uid": str(LLOYD_USER_ID)})).all()
+    # Greedy-pack buckets into ≤500k-contact chunks (each scan = seconds).
+    chunks: list[list] = []
+    cur: list = []
+    cur_n = 0
+    for bid, n in sorted(sizes, key=lambda r: -r[1]):
+        if cur and cur_n + n > 500_000:
+            chunks.append(cur)
+            cur, cur_n = [], 0
+        cur.append(bid)
+        cur_n += n
+    if cur:
+        chunks.append(cur)
+
+    data: dict = {}
+    for chunk in chunks:
+        async with _S() as s:
+            rows = (await s.execute(_text("""
+                SELECT bucket_id,
+                       CASE WHEN country IS NOT NULL AND country <> '' THEN country
+                            WHEN list_location IS NOT NULL AND list_location <> '' THEN list_location
+                            ELSE :noloc END AS loc,
+                       count(*) AS n
+                FROM contacts
+                WHERE user_id = CAST(:uid AS uuid) AND NOT is_blocklisted
+                  AND bucket_id = ANY(CAST(:bids AS uuid[]))
+                GROUP BY bucket_id, 2
+            """), {
+                "uid": str(LLOYD_USER_ID),
+                "noloc": NO_LOCATION_SENTINEL,
+                "bids": [str(b) for b in chunk],
+            })).all()
+        for bid, loc, n in rows:
+            data.setdefault(bid, {})[loc] = int(n or 0)
+    return data
+
+
+async def _totals_rollup(*, allow_stale: bool = True):
+    """Serve the rollup, stale-while-revalidate: a fresh copy returns as-is; a
+    stale copy is returned immediately while a background task rebuilds; only
+    the very first call (no copy at all) builds inline."""
+    import asyncio as _a
+    import time as _t
+
+    fresh = _TOTALS_ROLLUP["data"] is not None and (
+        _t.monotonic() - _TOTALS_ROLLUP["ts"]) < _TOTALS_ROLLUP_TTL
+    if fresh:
+        return _TOTALS_ROLLUP["data"]
+
+    async def _rebuild():
+        try:
+            built = await _build_rollup()
+            _TOTALS_ROLLUP["data"] = built
+            _TOTALS_ROLLUP["ts"] = _t.monotonic()
+        finally:
+            _TOTALS_ROLLUP["building"] = None
+
+    if _TOTALS_ROLLUP["data"] is not None and allow_stale:
+        if _TOTALS_ROLLUP["building"] is None:
+            _TOTALS_ROLLUP["building"] = _a.create_task(_rebuild())
+        return _TOTALS_ROLLUP["data"]
+    # first-ever build (or stale disallowed): build inline, dedup with any
+    # in-flight rebuild
+    if _TOTALS_ROLLUP["building"] is None:
+        _TOTALS_ROLLUP["building"] = _a.create_task(_rebuild())
+    await _TOTALS_ROLLUP["building"]
+    return _TOTALS_ROLLUP["data"]
+
+
+def _totals_from_rollup(data, include=None, exclude=None) -> dict:
+    """Per-bucket totals for a country set from the rollup. include: sum of
+    matching locations; exclude: bucket total − matching sum."""
+    sel = set(include or exclude or [])
+    out: dict = {}
+    for bid, locs in data.items():
+        matched = sum(n for loc, n in locs.items() if loc in sel)
+        out[bid] = matched if include else max(0, sum(locs.values()) - matched)
+    return out
 
 
 @router.get("/buckets/eligible")
@@ -296,9 +397,17 @@ async def bucket_eligible_counts(
     # when no filter is set: an unfiltered GROUP BY over the whole contacts table
     # is the exact aggregate list_buckets deliberately avoids for performance —
     # the client uses the static bucket.total_contacts in that case.
+    # Country-only totals come from the rollup (arithmetic, no scan). The
+    # per-request totals queries below remain only for emp-filtered combos.
+    rollup_totals = None
+    if (country or country_exclude) and not emp_conds:
+        rollup_totals = _totals_from_rollup(
+            await _totals_rollup(), include=country, exclude=country_exclude,
+        )
+
     totals_stmt = None
     totals_minus_stmt = None
-    if country_conds or emp_conds or pure_exclude:
+    if rollup_totals is None and (country_conds or emp_conds or pure_exclude):
         total_conds = [
             Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id.isnot(None),
@@ -341,7 +450,7 @@ async def bucket_eligible_counts(
             if _bid in counts:
                 counts[_bid] = max(0, counts[_bid] - _cnt)
         idx += 1
-    totals: dict = {}
+    totals: dict = rollup_totals if rollup_totals is not None else {}
     if totals_stmt is not None:
         totals = results[idx]
         idx += 1
