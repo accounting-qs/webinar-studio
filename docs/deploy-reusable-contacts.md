@@ -1,5 +1,26 @@
 # Prod deploy checklist — merging `reusable-contacts` → `main`
 
+> **ROLLOUT EXECUTED 2026-08-12/13.** Everything below is DONE on prod except
+> where noted. Post-deploy incident notes + extra fixes shipped during rollout:
+> - Migrations 064/065/066 applied; memberships backfilled (3,780,053); cache
+>   reconcile 4,515,253 scanned / 1,975,014 fixed (drift 0); indexes
+>   `ix_contacts_claimable`, `ix_contacts_good_avail`, `ix_contacts_bucket_filters`
+>   built CONCURRENTLY; VACUUM (ANALYZE) run.
+> - Supabase's 120s statement cap is UNLIFTABLE from the app (pooler re-caps
+>   sessions; server_settings stripped). Every whole-webinar stats statement was
+>   made to FIT instead: per-list batches chunked ≤25k members/statement, Batch B
+>   (WG attendance) + Batch C (opportunities) inverted to drive from the small
+>   side, NLD planned-set materialized into an indexed session temp table
+>   (commits 8ec5083, b8d9f8b).
+> - /buckets/eligible + assign fixed for the same reason: predicates on
+>   contacts.id defeat the covering partial indexes → member-overlap subtraction
+>   pattern; assign's post-claim bucket recount replaced with an exact decrement
+>   (commits d4986e5, bcea97b, a542124).
+> - UI added during rollout: eligible-count loading indicators; segment employee
+>   range shown as a recommendation chip + Apply (no auto-fill) (cdf3b3c, 345d7ac).
+> - Snapshots: all webinars recomputed with real `uniqueBookers` (the temporary
+>   uniqueBookers:=totalBookings patch is superseded as each webinar recomputes).
+
 Everything that must happen on prod when this branch is rolled out. This branch
 bundles several features that were built/tested together: the reusable-contacts
 (multi-webinar membership) model, the Planning employee-count filter, the
@@ -41,7 +62,7 @@ Already committed on the branch: `064_add_webinar_contact_memberships.py`,
 
 ## 1. Dependencies
 
-- ⬜ **`ftfy==6.3.1`** added to `requirements.txt`. Render runs
+- ✅ **`ftfy==6.3.1`** added to `requirements.txt`. Render runs
   `pip install -r requirements.txt` on deploy, so this is automatic — just
   confirm the build picked it up (mojibake repair silently degrades without it:
   double-encoded CJK names won't fully recover).
@@ -50,32 +71,32 @@ Already committed on the branch: `064_add_webinar_contact_memberships.py`,
 
 Applies, in order:
 
-- ⬜ `063_weekly_report_settings` — **no-op** on prod (the `report_settings`
+- ✅ `063_weekly_report_settings` — **no-op** on prod (the `report_settings`
   table was pre-created via idempotent DDL). Included because prod's
   alembic_version predates it.
-- ⬜ `064_add_webinar_contact_memberships` — creates the
+- ✅ `064_add_webinar_contact_memberships` — creates the
   `webinar_contact_memberships` junction + `contacts` cache columns
   (`assigned_membership_count`, `times_invited`, `last_invited_at`).
-- ⬜ `065_add_bucket_stat_emp_range` — additive nullable `stat_emp_min` /
+- ✅ `065_add_bucket_stat_emp_range` — additive nullable `stat_emp_min` /
   `stat_emp_max` on `outreach_buckets` (fast, metadata-only).
-- ⬜ `066_add_webinar_booking_attribution` — new `webinar_booking_attribution`
+- ✅ `066_add_webinar_booking_attribution` — new `webinar_booking_attribution`
   table (per-booking → webinar attribution that survives GHL overwriting its
   single opportunity). Additive (new table only), safe on current prod.
 
 ## 3. Data backfills / scripts (run **after** migrations, in this order)
 
-- ⬜ **Reusable-contacts backfill** — `python -m scripts.backfill_reusable_contacts`
+- ✅ **Reusable-contacts backfill** — `python -m scripts.backfill_reusable_contacts`
   Idempotent, keyset-chunked (under the 120s statement_timeout), builds
   `ix_contacts_claimable` **and** `ix_contacts_good_avail` (the latter makes the
   Planning "Good Available" header aggregate an index-only scan) CONCURRENTLY. The
   index step now lifts `statement_timeout` for its DDL session and drops+rebuilds
   an INVALID index left by any prior killed build, so a re-run recovers instead of
   silently skipping. Until it runs, reuse counts read as empty.
-  - ⬜ After it finishes, run **`VACUUM (ANALYZE) contacts`** — the backfill's bulk
+  - ✅ After it finishes, run **`VACUUM (ANALYZE) contacts`** — the backfill's bulk
     cache writes leave the visibility map stale, and `ix_contacts_good_avail` only
     delivers its index-only scan (verified via `EXPLAIN`) once the VM is all-visible;
     ANALYZE also refreshes stats so the planner picks the new indexes.
-- ⬜ **Mojibake repair** — `python -m scripts.fix_contact_mojibake --dry-run`
+- ✅ **Mojibake repair** — `python -m scripts.fix_contact_mojibake --dry-run`
   then rerun without the flag.
   *(Being run NOW on prod ahead of the merge — see §5. Only re-run at merge time
   to catch any newly-imported bad rows in the interim.)*
