@@ -240,10 +240,19 @@ async def bucket_eligible_counts(
     # webinar), which keeps the big scan index-only. Equivalent to the old
     # in-query NOT-member predicate: base(claimable) − overlap(claimable ∧
     # member) = claimable ∧ ¬member, per bucket.
+    # Overlap can be skipped entirely in fresh-only mode (cutoff_ts None): an
+    # 'assigned' member has assigned_membership_count > 0 and a 'used' member
+    # has last_invited_at set, so NO member of any webinar can be in the fresh
+    # base count — the subtraction is provably zero. This matters: the overlap
+    # probes one contact row per member of the target webinar, and a big
+    # webinar (150k+ members) turned every filter change into minutes of heap
+    # probes. With a reuse cutoff only 'used' members can overlap (assigned
+    # ones stay excluded by amc>0), so restrict the probe set to those.
     overlap_stmt = None
-    if webinar_id is not None:
+    if webinar_id is not None and cutoff_ts is not None:
         overlap_conds = [
             WebinarContactMembership.webinar_id == webinar_id,
+            WebinarContactMembership.status == "used",
             Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id.isnot(None),
             ~Contact.is_blocklisted,

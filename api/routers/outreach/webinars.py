@@ -330,14 +330,21 @@ async def assign_bucket(
 
     async def _member_overlap_count(*source_conds) -> int:
         """Contacts already members of this webinar that would otherwise be
-        counted available — driven from the membership side (tiny for a fresh
-        webinar)."""
+        counted available. Provably ZERO in fresh-only mode (an 'assigned'
+        member has assigned_membership_count > 0, a 'used' member has
+        last_invited_at set — both fail the fresh predicate), so skip the probe
+        entirely; with a reuse cutoff only 'used' members can overlap. Matters
+        because the probe costs one contact heap read per member — minutes on a
+        150k+-member webinar."""
+        if cutoff_ts is None:
+            return 0
         res = await db.execute(
             select(sa_func.count())
             .select_from(WebinarContactMembership)
             .join(Contact, Contact.id == WebinarContactMembership.contact_id)
             .where(
                 WebinarContactMembership.webinar_id == webinar_id,
+                WebinarContactMembership.status == "used",
                 *source_conds,
             )
         )
