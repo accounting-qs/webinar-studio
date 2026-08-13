@@ -530,12 +530,17 @@ function MultiCountryDropdown({
   onChange,
   placeholder = "All countries",
   className = "",
+  mode,
+  onModeChange,
 }: {
   options: AssignCountry[];
   value: string[];
   onChange: (value: string[]) => void;
   placeholder?: string;
   className?: string;
+  /** Optional include/exclude mode toggle (shown when onModeChange is given). */
+  mode?: "include" | "exclude";
+  onModeChange?: (m: "include" | "exclude") => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -576,8 +581,10 @@ function MultiCountryDropdown({
 
   const summary =
     value.length === 0 ? placeholder
-    : value.length === 1 ? value[0]
-    : `${value.length} countries`;
+    : mode === "exclude"
+      ? (value.length === 1 ? `Excluding ${value[0]}` : `Excluding ${value.length} countries`)
+      : value.length === 1 ? value[0]
+      : `${value.length} countries`;
 
   return (
     <div ref={ref} className={`relative ${className}`}>
@@ -604,7 +611,21 @@ function MultiCountryDropdown({
 
       {open && (
         <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700/60 rounded-lg shadow-xl shadow-black/10 dark:shadow-black/40 flex flex-col max-h-[300px]">
-          <div className="p-1.5 border-b border-zinc-200 dark:border-zinc-800/60 shrink-0">
+          <div className="p-1.5 border-b border-zinc-200 dark:border-zinc-800/60 shrink-0 space-y-1.5">
+            {onModeChange && (
+              <div className="flex rounded-md overflow-hidden border border-zinc-300 dark:border-zinc-700/60 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => onModeChange("include")}
+                  className={`flex-1 px-2 py-1 ${mode !== "exclude" ? "bg-violet-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"}`}
+                >Include</button>
+                <button
+                  type="button"
+                  onClick={() => onModeChange("exclude")}
+                  className={`flex-1 px-2 py-1 ${mode === "exclude" ? "bg-rose-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"}`}
+                >Exclude</button>
+              </div>
+            )}
             <input
               type="text"
               value={query}
@@ -934,6 +955,10 @@ export function PlanningPage() {
   // Country/region filter: which contact countries are eligible for this claim.
   // Empty = no filter. `assignAvailCountries` are the options for the selected source.
   const [assignFilterCountries, setAssignFilterCountries] = useState<string[]>([]);
+  // Country-filter mode: "include" narrows to the selected locations,
+  // "exclude" removes them from the pool (same selection list + region
+  // shortcuts either way).
+  const [assignCountryMode, setAssignCountryMode] = useState<"include" | "exclude">("include");
   const [assignAvailCountries, setAssignAvailCountries] = useState<AssignCountry[]>([]);
   // Employee-count filter (literal headcount range), shown under the country
   // filter. "" = no bound. Either bound narrows the per-bucket "remaining" and
@@ -1023,14 +1048,15 @@ export function PlanningPage() {
       reuse_before: assignReuseCutoff === "custom" ? assignReuseBefore : undefined,
       reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
       webinar_id: activeAssignWebinarId,
-      country: assignFilterCountries.length ? assignFilterCountries : undefined,
+      country: assignCountryMode === "include" && assignFilterCountries.length ? assignFilterCountries : undefined,
+      country_exclude: assignCountryMode === "exclude" && assignFilterCountries.length ? assignFilterCountries : undefined,
       emp_min: debEmpMin === "" ? undefined : debEmpMin,
       emp_max: debEmpMax === "" ? undefined : debEmpMax,
     })
       .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); setAssignEligibleLoading(false); } })
       .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); } });
     return () => { cancelled = true; };
-  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, debEmpMin, debEmpMax, eligibleRefresh]);
+  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignCountryMode, debEmpMin, debEmpMax, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket. When the eligible map is loaded, a
   // bucket ABSENT from it has zero eligible contacts under the current filter —
@@ -1061,7 +1087,9 @@ export function PlanningPage() {
   const assignLocationOptions = useMemo(() => {
     const present = new Set(assignAvailCountries.map((c) => c.country));
     const extra = COUNTRIES.filter((c) => !present.has(c)).map((c) => ({ country: c, count: 0 }));
-    return [...assignAvailCountries, ...extra];
+    // "(No location)" = contacts with no location data at all — selectable in
+    // both include and exclude mode (backend sentinel).
+    return [{ country: "(No location)", count: 0 }, ...assignAvailCountries, ...extra];
   }, [assignAvailCountries]);
 
   const updateSender = async (id: string, field: keyof Sender, value: number) => {
@@ -1155,7 +1183,7 @@ export function PlanningPage() {
   const volumeTouchedRef = useRef(false);
   useEffect(() => {
     volumeTouchedRef.current = false;
-  }, [assignBucket, assignSender, assignSendPerAcct, assignDays, assignFilterEmpMin, assignFilterEmpMax, assignFilterCountries, activeAssignWebinarId]);
+  }, [assignBucket, assignSender, assignSendPerAcct, assignDays, assignFilterEmpMin, assignFilterEmpMax, assignFilterCountries, assignCountryMode, activeAssignWebinarId]);
 
   // Keep the CONTACTS (volume) in sync with the selected bucket's FILTERED
   // remaining — capped by the chosen sender's capacity — whenever the filters or
@@ -1206,6 +1234,7 @@ export function PlanningPage() {
       setAssignReuseOnly(false);
       setAssignEligible(null);
       setAssignFilterCountries([]);
+      setAssignCountryMode("include");
       setAssignAvailCountries([]);
       setAssignFilterEmpMin("");
       setAssignFilterEmpMax("");
@@ -1484,15 +1513,19 @@ export function PlanningPage() {
 
     let requestData: Parameters<typeof assignBucketToWebinar>[1];
 
-    const filterCountries = assignFilterCountries.length ? assignFilterCountries : undefined;
+    const filterCountries = assignCountryMode === "include" && assignFilterCountries.length ? assignFilterCountries : undefined;
+    const filterCountriesExclude = assignCountryMode === "exclude" && assignFilterCountries.length ? assignFilterCountries : undefined;
     // Compact label for the list NAME: fully-selected regions collapse to their
     // region name ("Europe") instead of 42 slash-joined countries. MUST collapse
     // against the SAME option array the dropdown's region toggle selects from
     // (assignLocationOptions = present + full world list) — collapsing against
     // the present-only subset let sub-regions match while the wider region
     // missed a variant, producing "DACH/BENELUX/<36 countries>".
-    const filterCountriesLabel = filterCountries
-      ? collapseCountriesForLabel(filterCountries, assignLocationOptions.map((o) => o.country)).join("/")
+    const filterCountriesLabel = (filterCountries || filterCountriesExclude)
+      ? collapseCountriesForLabel(
+          (filterCountries || filterCountriesExclude)!,
+          assignLocationOptions.map((o) => o.country),
+        ).join("/")
       : undefined;
     const empMin = assignFilterEmpMin === "" ? undefined : assignFilterEmpMin;
     const empMax = assignFilterEmpMax === "" ? undefined : assignFilterEmpMax;
@@ -1505,6 +1538,7 @@ export function PlanningPage() {
         send_per_account: sendPerAcct,
         days: assignDays,
         filter_countries: filterCountries,
+        filter_countries_exclude: filterCountriesExclude,
         filter_countries_label: filterCountriesLabel,
         emp_min: empMin,
         emp_max: empMax,
@@ -1530,6 +1564,7 @@ export function PlanningPage() {
         countries_override: countries,
         emp_range_override: empRange,
         filter_countries: filterCountries,
+        filter_countries_exclude: filterCountriesExclude,
         filter_countries_label: filterCountriesLabel,
         emp_min: empMin,
         emp_max: empMax,
@@ -2552,19 +2587,23 @@ export function PlanningPage() {
                                 options={assignLocationOptions}
                                 value={assignFilterCountries}
                                 onChange={setAssignFilterCountries}
+                                mode={assignCountryMode}
+                                onModeChange={setAssignCountryMode}
                               />
                             </div>
                             <span className="text-[10px] text-zinc-500 mt-4">
                               {assignFilterCountries.length === 0
                                 ? "No filter — assigning from all countries"
-                                : (assignSource && assignReuseCutoff === "never" && assignFilterEmpMin === "" && assignFilterEmpMax === "")
-                                  // assignAvailCountries counts the FRESH pool only and is NOT narrowed
-                                  // by the reuse cutoff or the employee-count filter, so the precise
-                                  // per-country number is meaningful only in fresh-only mode with no
-                                  // employee bound. Otherwise the bucket "remaining" rows below already
-                                  // reflect the correct reuse+country+employee eligible count.
-                                  ? `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match in this ${assignTab === "custom_lists" ? "list" : "bucket"}`
-                                  : "Narrowing bucket remaining below to the selected countries"}
+                                : assignCountryMode === "exclude"
+                                  ? `Excluding the selected location${assignFilterCountries.length === 1 ? "" : "s"} from the pool`
+                                  : (assignSource && assignReuseCutoff === "never" && assignFilterEmpMin === "" && assignFilterEmpMax === "")
+                                    // assignAvailCountries counts the FRESH pool only and is NOT narrowed
+                                    // by the reuse cutoff or the employee-count filter, so the precise
+                                    // per-country number is meaningful only in fresh-only mode with no
+                                    // employee bound. Otherwise the bucket "remaining" rows below already
+                                    // reflect the correct reuse+country+employee eligible count.
+                                    ? `${assignAvailCountries.filter((c) => assignFilterCountries.includes(c.country)).reduce((s, c) => s + c.count, 0).toLocaleString()} contacts match in this ${assignTab === "custom_lists" ? "list" : "bucket"}`
+                                    : "Narrowing bucket remaining below to the selected countries"}
                             </span>
                           </div>
 

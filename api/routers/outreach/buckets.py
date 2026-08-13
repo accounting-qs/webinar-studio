@@ -17,8 +17,8 @@ from sqlalchemy.orm import selectinload
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, bucket_dict, claimable_conditions,
-    compute_blocklist_counts_per_bucket, copy_dict, employee_count_filter,
-    reuse_cutoff_to_ts,
+    compute_blocklist_counts_per_bucket, copy_dict, country_filter_conditions,
+    employee_count_filter, reuse_cutoff_to_ts,
 )
 from api.schemas import (
     BucketCreate, BucketMergeRequest, BucketUpdate, CopyBulkGenerateRequest,
@@ -118,7 +118,7 @@ def invalidate_eligible_cache() -> None:
 
 def patch_eligible_cache_after_claim(
     bucket_id, claimed: int, *, reuse_cutoff, reuse_before, reuse_only,
-    webinar_id, country, emp_min, emp_max,
+    webinar_id, country, country_exclude, emp_min, emp_max,
 ) -> None:
     """Exact-patch instead of a blanket clear after an assign: every claimed
     contact matched the claim's own filter combo, so under THAT combo the
@@ -128,7 +128,9 @@ def patch_eligible_cache_after_claim(
     Keeps the operator's assign-assign-assign loop on a warm cache."""
     match_key = (
         reuse_cutoff, reuse_before, reuse_only, webinar_id,
-        tuple(sorted(country)) if country else None, emp_min, emp_max,
+        tuple(sorted(country)) if country else None,
+        tuple(sorted(country_exclude)) if country_exclude else None,
+        emp_min, emp_max,
     )
     bid = str(bucket_id)
     for key in list(_ELIGIBLE_CACHE.keys()):
@@ -153,6 +155,7 @@ async def bucket_eligible_counts(
     reuse_only: bool = Query(False),
     webinar_id: str | None = Query(None),
     country: list[str] | None = Query(None),
+    country_exclude: list[str] | None = Query(None),
     emp_min: int | None = Query(None),
     emp_max: int | None = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -183,7 +186,9 @@ async def bucket_eligible_counts(
 
     cache_key = (
         reuse_cutoff, reuse_before, reuse_only, webinar_id,
-        tuple(sorted(country)) if country else None, emp_min, emp_max,
+        tuple(sorted(country)) if country else None,
+        tuple(sorted(country_exclude)) if country_exclude else None,
+        emp_min, emp_max,
     )
     hit = _ELIGIBLE_CACHE.get(cache_key)
     if hit and (_time.monotonic() - hit[0]) < _ELIGIBLE_TTL:
@@ -198,13 +203,7 @@ async def bucket_eligible_counts(
     # side) and subtracted per bucket.
     claimable = claimable_conditions(cutoff_ts, None, reuse_only=reuse_only)
 
-    country_cond = None
-    if country:
-        blank_country = or_(Contact.country.is_(None), Contact.country == "")
-        country_cond = or_(
-            Contact.country.in_(country),
-            and_(blank_country, Contact.list_location.in_(country)),
-        )
+    country_conds = country_filter_conditions(country, country_exclude)
     emp_conds = employee_count_filter(emp_min, emp_max)
 
     conds = [
@@ -215,8 +214,7 @@ async def bucket_eligible_counts(
         ~Contact.is_blocklisted,
         *claimable,
     ]
-    if country_cond is not None:
-        conds.append(country_cond)
+    conds.extend(country_conds)
     conds.extend(emp_conds)
 
     # The 1-3 aggregates below are independent — run them CONCURRENTLY on their
@@ -251,8 +249,7 @@ async def bucket_eligible_counts(
             ~Contact.is_blocklisted,
             *claimable,
         ]
-        if country_cond is not None:
-            overlap_conds.append(country_cond)
+        overlap_conds.extend(country_conds)
         overlap_conds.extend(emp_conds)
         overlap_stmt = (
             select(Contact.bucket_id, sa_func.count())
@@ -269,14 +266,13 @@ async def bucket_eligible_counts(
     # is the exact aggregate list_buckets deliberately avoids for performance —
     # the client uses the static bucket.total_contacts in that case.
     totals_stmt = None
-    if country_cond is not None or emp_conds:
+    if country_conds or emp_conds:
         total_conds = [
             Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id.isnot(None),
             ~Contact.is_blocklisted,
         ]
-        if country_cond is not None:
-            total_conds.append(country_cond)
+        total_conds.extend(country_conds)
         total_conds.extend(emp_conds)
         totals_stmt = (
             select(Contact.bucket_id, sa_func.count())

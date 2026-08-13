@@ -17,7 +17,7 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, assignment_dict, claimable_conditions,
     compute_blocklist_counts_per_assignment, compute_blocklist_counts_per_bucket,
-    copy_dict, employee_count_filter,
+    copy_dict, country_filter_conditions, employee_count_filter,
     recompute_contact_caches, reconcile_legacy_slots, reuse_cutoff_to_ts, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
@@ -347,15 +347,9 @@ async def assign_bucket(
     # the claim query so volume validation matches what gets claimed. A contact
     # matches if its per-contact `country` is in the selected set, OR — as a
     # second-level scan when country is blank — its list-level `list_location` is.
-    if body.filter_countries:
-        sel = body.filter_countries
-        blank_country = or_(Contact.country.is_(None), Contact.country == "")
-        country_filter = [or_(
-            Contact.country.in_(sel),
-            and_(blank_country, Contact.list_location.in_(sel)),
-        )]
-    else:
-        country_filter = []
+    country_filter = country_filter_conditions(
+        body.filter_countries, getattr(body, "filter_countries_exclude", None),
+    )
 
     # Employee-count range filter (literal headcount), applied identically to the
     # availability counts and the claim so volume validation matches what gets
@@ -477,6 +471,8 @@ async def assign_bucket(
     if body.filter_countries:
         # Prefer the compact region label ("Europe") over 42 joined countries.
         _fbits.append(getattr(body, "filter_countries_label", None) or "/".join(body.filter_countries))
+    elif getattr(body, "filter_countries_exclude", None):
+        _fbits.append("excl. " + (getattr(body, "filter_countries_label", None) or "/".join(body.filter_countries_exclude)))
     if cutoff_ts is not None:
         if getattr(body, "reuse_before", None):
             _rlabel = f"before {body.reuse_before.isoformat()}"
@@ -744,6 +740,7 @@ async def assign_bucket(
         reuse_only=bool(getattr(body, "reuse_only", False)),
         webinar_id=webinar_id,
         country=body.filter_countries,
+        country_exclude=getattr(body, "filter_countries_exclude", None),
         emp_min=getattr(body, "emp_min", None),
         emp_max=getattr(body, "emp_max", None),
     )

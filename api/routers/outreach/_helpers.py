@@ -161,6 +161,53 @@ def claimable_conditions(
     return conds
 
 
+# Sentinel the frontend sends to mean "contacts with no location data at all"
+# (blank country AND blank list_location). Selectable in both include and
+# exclude mode of the assign country filter.
+NO_LOCATION_SENTINEL = "(No location)"
+
+
+def country_filter_conditions(include=None, exclude=None):
+    """WHERE predicates (list) for the assign country filter, in include and/or
+    exclude form. A contact matches a country set when its per-contact `country`
+    is in the set, OR — when country is blank — its list-level `list_location`
+    is. The NO_LOCATION_SENTINEL entry matches contacts with NO location data at
+    all (blank country AND blank list_location).
+
+    Exclude keeps every contact that does NOT match the set — including
+    no-location contacts (unless the sentinel is excluded too), which needs
+    NULL-safe negation: `country IN (...)` is NULL for NULL countries, and
+    NOT(NULL) would silently drop those rows, so the match is coalesced first.
+    Applied identically to the eligible counts and the claim.
+    """
+    conds = []
+    blank_country = or_(Contact.country.is_(None), Contact.country == "")
+    blank_all = and_(
+        blank_country,
+        or_(Contact.list_location.is_(None), Contact.list_location == ""),
+    )
+
+    def match_expr(vals):
+        names = [v for v in vals if v != NO_LOCATION_SENTINEL]
+        parts = []
+        if names:
+            parts.append(Contact.country.in_(names))
+            parts.append(and_(blank_country, Contact.list_location.in_(names)))
+        if NO_LOCATION_SENTINEL in vals:
+            parts.append(blank_all)
+        return or_(*parts) if parts else None
+
+    if include:
+        m = match_expr(include)
+        if m is not None:
+            conds.append(sa_func.coalesce(m, False))
+    if exclude:
+        m = match_expr(exclude)
+        if m is not None:
+            conds.append(~sa_func.coalesce(m, False))
+    return conds
+
+
 def employee_count_filter(emp_min=None, emp_max=None):
     """WHERE predicates (list) for a literal employee-count range filter.
 

@@ -129,6 +129,10 @@ class AssignRequest(BaseModel):
     # The frontend expands region shortcuts (Europe / USA / Canada) into concrete
     # country strings before sending, so this is always a flat list of countries.
     filter_countries: list[str] | None = None
+    # Exclude form of the country filter: contacts whose effective location IS in
+    # this list are NOT eligible. "(No location)" excludes contacts with no
+    # location data at all. Same matching rules as filter_countries.
+    filter_countries_exclude: list[str] | None = None
     # Compact human label for the country filter, used ONLY in the created list's
     # name (e.g. "Europe" instead of 42 slash-joined countries). The frontend
     # collapses fully-selected region shortcuts into their region name; the claim
