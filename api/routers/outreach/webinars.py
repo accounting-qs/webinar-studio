@@ -732,9 +732,21 @@ async def assign_bucket(
         resp["bucket_remaining"] = max(0, (bucket.remaining_contacts or 0) - blocklisted_available)
     else:
         resp["bucket_remaining"] = None
-    # Remaining counts just changed — drop the eligible-counts micro-cache.
-    from api.routers.outreach.buckets import invalidate_eligible_cache
-    invalidate_eligible_cache()
+    # Remaining counts just changed — exact-patch the eligible-counts cache for
+    # this claim's own filter combo (assigned bucket −= claimed; totals keep)
+    # and drop only the other, unknowably-stale combos. Keeps the operator's
+    # back-to-back assign loop on a warm cache instead of a 1-8s refetch.
+    from api.routers.outreach.buckets import patch_eligible_cache_after_claim
+    patch_eligible_cache_after_claim(
+        body.bucket_id, claimed,
+        reuse_cutoff=getattr(body, "reuse_cutoff", None),
+        reuse_before=body.reuse_before.isoformat() if getattr(body, "reuse_before", None) else None,
+        reuse_only=bool(getattr(body, "reuse_only", False)),
+        webinar_id=webinar_id,
+        country=body.filter_countries,
+        emp_min=getattr(body, "emp_min", None),
+        emp_max=getattr(body, "emp_max", None),
+    )
     return resp
 
 

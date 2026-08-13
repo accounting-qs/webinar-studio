@@ -116,6 +116,36 @@ def invalidate_eligible_cache() -> None:
     _ELIGIBLE_CACHE.clear()
 
 
+def patch_eligible_cache_after_claim(
+    bucket_id, claimed: int, *, reuse_cutoff, reuse_before, reuse_only,
+    webinar_id, country, emp_min, emp_max,
+) -> None:
+    """Exact-patch instead of a blanket clear after an assign: every claimed
+    contact matched the claim's own filter combo, so under THAT combo the
+    assigned bucket's remaining drops by exactly `claimed` (totals unchanged —
+    claiming doesn't remove a contact from the filter population). Cache
+    entries for OTHER combos are stale by an unknown amount — drop only those.
+    Keeps the operator's assign-assign-assign loop on a warm cache."""
+    match_key = (
+        reuse_cutoff, reuse_before, reuse_only, webinar_id,
+        tuple(sorted(country)) if country else None, emp_min, emp_max,
+    )
+    bid = str(bucket_id)
+    for key in list(_ELIGIBLE_CACHE.keys()):
+        if key != match_key:
+            _ELIGIBLE_CACHE.pop(key, None)
+            continue
+        ts, resp = _ELIGIBLE_CACHE[key]
+        buckets_map = {
+            k: (max(0, v - claimed) if str(k) == bid else v)
+            for k, v in (resp.get("buckets") or {}).items()
+        }
+        _ELIGIBLE_CACHE[key] = (
+            ts,
+            {**resp, "buckets": buckets_map, "total": sum(buckets_map.values())},
+        )
+
+
 @router.get("/buckets/eligible")
 async def bucket_eligible_counts(
     reuse_cutoff: str | None = Query(None),

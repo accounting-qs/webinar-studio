@@ -1555,9 +1555,17 @@ export function PlanningPage() {
         setBuckets((prev) => prev.map((b) =>
           b.id === assignBucket ? { ...b, remaining_contacts: assignment.bucket_remaining! } : b
         ));
-        // Refetch the reuse-aware eligible counts (a reuse claim can also consume
-        // previously-invited contacts, which the stored fresh remaining doesn't reflect).
-        setEligibleRefresh((n) => n + 1);
+        // Exact local patch instead of a full 1-8s refetch: every claimed
+        // contact matched the ACTIVE filter (the claim applies the same
+        // filter), so the assigned bucket's eligible-remaining drops by
+        // exactly the claimed volume; no other bucket moved, and the filtered
+        // TOTALS don't change (claiming doesn't remove a contact from the
+        // filter population). The server cache is patched the same way.
+        const claimedVol = assignment.volume ?? 0;
+        const patchedBucket = assignBucket;
+        setAssignEligible((prev) => prev
+          ? { ...prev, [patchedBucket]: Math.max(0, (prev[patchedBucket] ?? 0) - claimedVol) }
+          : prev);
       }
 
       // Refresh custom lists if we assigned from one
