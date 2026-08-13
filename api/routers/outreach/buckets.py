@@ -203,7 +203,22 @@ async def bucket_eligible_counts(
     # side) and subtracted per bucket.
     claimable = claimable_conditions(cutoff_ts, None, reuse_only=reuse_only)
 
-    country_conds = country_filter_conditions(country, country_exclude)
+    # Pure-exclude mode is computed as a DIFFERENCE of two fast include-form
+    # aggregates: exclude(set) = no-country-filter − include(set), per bucket
+    # (the include/exclude partition is exact — verified). Evaluating the
+    # NOT-IN predicate inline forced Postgres to run the 42-value check
+    # against every index row and pushed the request to ~120s; the two
+    # difference queries are the proven seconds-class shapes.
+    pure_exclude = bool(country_exclude) and not country
+    if pure_exclude:
+        country_conds = []  # base side: no country predicate
+        minus_country_conds = country_filter_conditions(country_exclude, None)
+        # Overlap probes a tiny used-member set — inline exclude is fine there.
+        overlap_country_conds = country_filter_conditions(None, country_exclude)
+    else:
+        country_conds = country_filter_conditions(country, country_exclude)
+        minus_country_conds = None
+        overlap_country_conds = country_conds
     emp_conds = employee_count_filter(emp_min, emp_max)
 
     conds = [
@@ -234,6 +249,13 @@ async def bucket_eligible_counts(
         .where(*conds)
         .group_by(Contact.bucket_id)
     )
+    counts_minus_stmt = None
+    if pure_exclude:
+        counts_minus_stmt = (
+            select(Contact.bucket_id, sa_func.count())
+            .where(*conds, *minus_country_conds)
+            .group_by(Contact.bucket_id)
+        )
 
     # Contacts already members of the target webinar. Driven from the SMALL
     # membership side (one PK probe per member — zero/tiny for a freshly created
@@ -258,7 +280,7 @@ async def bucket_eligible_counts(
             ~Contact.is_blocklisted,
             *claimable,
         ]
-        overlap_conds.extend(country_conds)
+        overlap_conds.extend(overlap_country_conds)
         overlap_conds.extend(emp_conds)
         overlap_stmt = (
             select(Contact.bucket_id, sa_func.count())
@@ -275,7 +297,8 @@ async def bucket_eligible_counts(
     # is the exact aggregate list_buckets deliberately avoids for performance —
     # the client uses the static bucket.total_contacts in that case.
     totals_stmt = None
-    if country_conds or emp_conds:
+    totals_minus_stmt = None
+    if country_conds or emp_conds or pure_exclude:
         total_conds = [
             Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id.isnot(None),
@@ -288,22 +311,44 @@ async def bucket_eligible_counts(
             .where(*total_conds)
             .group_by(Contact.bucket_id)
         )
+        if pure_exclude:
+            totals_minus_stmt = (
+                select(Contact.bucket_id, sa_func.count())
+                .where(*total_conds, *minus_country_conds)
+                .group_by(Contact.bucket_id)
+            )
 
     tasks = [_grouped(counts_stmt)]
+    if counts_minus_stmt is not None:
+        tasks.append(_grouped(counts_minus_stmt))
     if overlap_stmt is not None:
         tasks.append(_grouped(overlap_stmt))
     if totals_stmt is not None:
         tasks.append(_grouped(totals_stmt))
+    if totals_minus_stmt is not None:
+        tasks.append(_grouped(totals_minus_stmt))
     results = await _asyncio.gather(*tasks)
 
     counts = results[0]
     idx = 1
+    if counts_minus_stmt is not None:
+        for _bid, _cnt in results[idx].items():
+            if _bid in counts:
+                counts[_bid] = max(0, counts[_bid] - _cnt)
+        idx += 1
     if overlap_stmt is not None:
         for _bid, _cnt in results[idx].items():
             if _bid in counts:
                 counts[_bid] = max(0, counts[_bid] - _cnt)
         idx += 1
-    totals: dict = results[idx] if totals_stmt is not None else {}
+    totals: dict = {}
+    if totals_stmt is not None:
+        totals = results[idx]
+        idx += 1
+        if totals_minus_stmt is not None:
+            for _bid, _cnt in results[idx].items():
+                if _bid in totals:
+                    totals[_bid] = max(0, totals[_bid] - _cnt)
 
     resp = {"buckets": counts, "total": sum(counts.values()), "totals": totals}
     _ELIGIBLE_CACHE[cache_key] = (_time.monotonic(), resp)
