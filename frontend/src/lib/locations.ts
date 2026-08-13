@@ -38,25 +38,36 @@ export const REGION_ORDER = ["Europe", "DACH", "BENELUX", "USA", "North America"
 export const normCountry = (c: string) => c.trim().toLowerCase();
 
 /** Collapse a selected-country list into a compact human label for list names:
- * regions whose PRESENT countries are all selected shrink to the region name
- * ("Europe"), remaining countries stay as-is. Larger regions are checked first
- * so Europe absorbs DACH/BENELUX and North America absorbs USA; a region is
- * skipped when a prior region already covers all its members. */
-export function collapseCountriesForLabel(selected: string[], present: string[]): string[] {
-  const sel = new Set(selected);
-  const covered = new Set<string>();
+ * a region shrinks to its name ("Europe") when the selection covers every one
+ * of the region's members from the FIXED world catalog (COUNTRIES) — compared
+ * in normalized space, so dirty data variants ("Czech Republic", "UK") that
+ * sneak into the selection are absorbed by the region's synonym set instead of
+ * breaking the match (comparing against the live per-bucket option list did
+ * exactly that, twice). Widest region first: Europe absorbs DACH/BENELUX,
+ * North America absorbs USA; a region already fully covered is skipped.
+ * Anything not absorbed stays listed (deduped by normalized name). */
+export function collapseCountriesForLabel(selected: string[], _present?: string[]): string[] {
+  const selNorm = new Set(selected.map(normCountry));
+  const coveredNorm = new Set<string>();
   const out: string[] = [];
-  // Widest first — deliberate deviation from REGION_ORDER (which is UI order).
   for (const label of ["Europe", "North America", "DACH", "BENELUX", "USA"]) {
     const set = REGION_COUNTRIES[label];
-    const members = present.filter((c) => set.has(normCountry(c)));
-    if (!members.length) continue;
-    if (!members.every((c) => sel.has(c))) continue;
-    if (members.every((c) => covered.has(c))) continue;  // subsumed by a wider pick
+    const canon = COUNTRIES.filter((c) => set.has(normCountry(c)));
+    if (!canon.length) continue;
+    if (!canon.every((c) => selNorm.has(normCountry(c)))) continue;
+    if (canon.every((c) => coveredNorm.has(normCountry(c)))) continue; // subsumed
     out.push(label);
-    members.forEach((c) => covered.add(c));
+    // Absorb EVERY selected entry that normalizes into this region — including
+    // dirty variants the region's synonym set recognizes.
+    for (const s of selected) if (set.has(normCountry(s))) coveredNorm.add(normCountry(s));
   }
-  for (const c of selected) if (!covered.has(c)) out.push(c);
+  const listedNorm = new Set<string>();
+  for (const s of selected) {
+    const n = normCountry(s);
+    if (coveredNorm.has(n) || listedNorm.has(n)) continue;
+    listedNorm.add(n);
+    out.push(s);
+  }
   return out;
 }
 
