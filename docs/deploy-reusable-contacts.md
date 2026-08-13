@@ -100,7 +100,7 @@ Applies, in order:
   then rerun without the flag.
   *(Being run NOW on prod ahead of the merge — see §5. Only re-run at merge time
   to catch any newly-imported bad rows in the interim.)*
-- ⬜ **Booking attribution backfill** — `python -m scripts.backfill_booking_attribution --dry-run`
+- ✅ **Booking attribution backfill** *(ran 2026-08-13: 3,666 first-call bookings; 582 attributed to tracked webinars — mix: 464 source_number / 78 attended / 25 date_window / 13 invited / 2 reschedule; 3,084 pre-tracked-era rows stored unattributed. Capture-forward had already locked every row via the live sync — the backfill confirmed + refreshed outcomes.)* — `python -m scripts.backfill_booking_attribution --dry-run`
   (review the attribution-source mix on the ~559 multi-booking contacts), then
   rerun without the flag. **Must run AFTER 064 + 066** (needs both the membership
   table and `webinar_booking_attribution`). Idempotent; never re-attributes a
