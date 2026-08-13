@@ -42,6 +42,15 @@ STALE_SWEEP_INTERVAL_MINUTES = 2
 WG_AUTO_SYNC_JOB_ID = "wg_auto_sync"
 WG_AUTO_SYNC_INTERVAL_MINUTES = 15
 
+# Correctness backstop for the sync-scoped snapshot recompute. Syncs rebuild
+# only the webinars their rows attribute to (see
+# statistics_snapshot.schedule_recompute_since); this rebuilds everything once
+# a night so anything that attribution misses self-heals within 24h rather
+# than serving a stale number indefinitely. 03:00 UTC — off-peak for a
+# US-Central audience, and clear of the Wed 14:00 Chicago report window.
+SNAPSHOT_FULL_REBUILD_JOB_ID = "statistics_snapshot_full_rebuild"
+SNAPSHOT_FULL_REBUILD_HOUR_UTC = 3
+
 _scheduler: AsyncIOScheduler | None = None
 
 
@@ -71,6 +80,19 @@ async def _stale_sweeper_job() -> None:
         await sweep_stale_runs()
     except Exception as exc:
         logger.error("Stale sync sweeper failed: %s", exc)
+
+
+async def _snapshot_full_rebuild_job() -> None:
+    try:
+        # Lazy import — keeps the scheduler free of a statistics import cycle.
+        from services.statistics_snapshot import recompute
+        result = await recompute(None)
+        logger.info(
+            "Nightly snapshot rebuild finished: %s done, %s error(s)",
+            result.get("done"), result.get("errors"),
+        )
+    except Exception as exc:
+        logger.error("Nightly snapshot rebuild failed: %s", exc)
 
 
 async def _weekly_report_job() -> None:
@@ -156,7 +178,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID, SNAPSHOT_FULL_REBUILD_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -180,6 +202,18 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         id=WG_AUTO_SYNC_JOB_ID,
         max_instances=1,
         misfire_grace_time=300,
+        replace_existing=True,
+    )
+
+    # Nightly full snapshot rebuild — unconditional, and the backstop that lets
+    # the post-sync recompute stay scoped. misfire_grace_time is generous: if
+    # the process was down at 03:00 we still want the rebuild once it returns.
+    scheduler.add_job(
+        _snapshot_full_rebuild_job,
+        trigger=CronTrigger(hour=SNAPSHOT_FULL_REBUILD_HOUR_UTC, minute=0, timezone="UTC"),
+        id=SNAPSHOT_FULL_REBUILD_JOB_ID,
+        max_instances=1,
+        misfire_grace_time=3600,
         replace_existing=True,
     )
 

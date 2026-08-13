@@ -144,7 +144,9 @@ class Contact(Base):
         Index("ix_contacts_user_id", "user_id"),
         Index("ix_contacts_bucket_id", "bucket_id"),
         Index("ix_contacts_upload_id", "upload_id"),
-        Index("ix_contacts_email", "user_id", "email"),
+        # No ix_contacts_email here: it was btree(user_id, email) — identical to
+        # the uq_contacts_user_email constraint above, which already serves those
+        # lookups. Dropped in migration 068.
         Index("ix_contacts_assignment_id", "assignment_id"),
         Index("ix_contacts_bucket_unassigned", "bucket_id", "assignment_id"),
         Index("ix_contacts_outreach_status", "bucket_id", "outreach_status"),

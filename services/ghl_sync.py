@@ -874,12 +874,20 @@ async def run_sync(sync_type: SyncType, trigger: SyncTrigger = "scheduled") -> s
             await _heartbeat(state)
 
             # New data → cached statistics responses are stale. Drop the
-            # in-memory cache, then rebuild every webinar's persisted snapshot
-            # in the background so the next dashboard open is instant.
+            # in-memory cache, then rebuild the persisted snapshots in the
+            # background so the next dashboard open is instant.
+            #
+            # Scoped to the webinars this run's rows actually attribute to.
+            # An unscoped rebuild runs the heaviest statistics query (~30s
+            # mean, and the single largest source of disk reads on this
+            # instance — 3.5 TB over a 127-day window) once per passed webinar.
+            # Degrades to a full rebuild whenever the affected set can't be
+            # derived, and the nightly backstop in services.ghl_scheduler
+            # catches anything the attribution misses.
             from services.statistics import invalidate_stats_cache
-            from services.statistics_snapshot import schedule_recompute
+            from services.statistics_snapshot import schedule_recompute_since
             invalidate_stats_cache()
-            schedule_recompute()
+            schedule_recompute_since(state.started_at)
 
             return state.run_id
 
@@ -918,10 +926,13 @@ async def run_opportunities_sync(trigger: SyncTrigger = "scheduled") -> str:
             await sync_appointments_and_derive(client, state)
             await _heartbeat(state)
 
+            # Scoped for the same reason as run_sync above — an opportunities
+            # refresh moves Sales + Quality metrics only for the webinars its
+            # opportunities carry as webinar_source_number.
             from services.statistics import invalidate_stats_cache
-            from services.statistics_snapshot import schedule_recompute
+            from services.statistics_snapshot import schedule_recompute_since
             invalidate_stats_cache()
-            schedule_recompute()
+            schedule_recompute_since(state.started_at)
 
             return state.run_id
 

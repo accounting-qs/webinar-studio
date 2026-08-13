@@ -321,8 +321,9 @@ class WebinarContactMembership(Base):
         Index("ix_wcm_assignment", "assignment_id"),
         Index("ix_wcm_contact", "contact_id"),
         Index("ix_wcm_webinar_status", "webinar_id", "status"),
-        Index("ix_wcm_bucket", "bucket_id"),
-        Index("ix_wcm_user", "user_id"),
+        # No ix_wcm_bucket / ix_wcm_user: neither took a meaningful scan (0 and 4
+        # over 127 days) — this table is only ever reached by webinar, contact, or
+        # assignment. Dropped in migration 068.
     )
 
 

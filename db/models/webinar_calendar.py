@@ -90,7 +90,8 @@ class WebinarCalendarInvite(Base):
 
     __table_args__ = (
         UniqueConstraint("webinar_id", "email", name="uq_wci_webinar_email"),
-        Index("ix_wci_webinar_email", "webinar_id", "email"),
+        # No ix_wci_webinar_email here: it duplicated the unique constraint above
+        # column-for-column and never took a scan. Dropped in migration 068.
         Index("ix_wci_webinar_assignment", "webinar_id", "matched_assignment_id"),
         Index("ix_wci_webinar_account", "webinar_id", "calendar_account"),
         Index("ix_wci_webinar_response", "webinar_id", "calendar_invite_response"),

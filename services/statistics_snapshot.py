@@ -332,3 +332,176 @@ def schedule_recompute_for_broadcast(broadcast_id: str | None, source: str = "au
             await recompute(list(ids), source=source)
 
     _spawn(f"bcast:{_snap_source(source)}:{broadcast_id}", _run)
+
+
+# ---------------------------------------------------------------------------
+# Sync-scoped recompute
+# ---------------------------------------------------------------------------
+
+# Past this many touched contacts, deriving the exact affected set costs more
+# than it saves — and a sync that large is a full sync, which wants a full
+# rebuild anyway.
+_SCOPE_ROW_LIMIT = 50_000
+
+# How each source column attributes to a webinar. Kept next to the queries
+# below so a new metric reading a new column is an obvious edit here too.
+#
+#   ghl_contact.calendar_webinar_series_history      -> e{N} token  (number)
+#   ghl_contact.calendar_webinar_series_non_joiners  -> e{N} token  (number)
+#   ghl_contact.booked_call_webinar_series           -> N           (number)
+#   ghl_contact.webinar_registration_in_form_date    -> (prev, current] window
+#   ghl_contact.cold_calendar_unsubscribe_date       -> (prev, current] window
+#   ghl_opportunity.webinar_source_number            -> N           (number)
+#   ghl_appointment -> its contact's opportunity     -> N           (number)
+#
+# Contacts are scoped on synced_at: the incremental contact stream is already
+# filtered server-side by GHL, so a written row is a changed row (measured:
+# 50–7,000 rows per incremental, vs 147k on a full sync, which trips the cap
+# below and falls back to a full rebuild — the right outcome).
+_TOUCHED_CONTACTS_SQL = """
+WITH touched AS (
+    SELECT calendar_webinar_series_history      AS hist,
+           calendar_webinar_series_non_joiners  AS nj,
+           booked_call_webinar_series           AS booked,
+           webinar_registration_in_form_date    AS form_date,
+           cold_calendar_unsubscribe_date       AS unsub_date
+    FROM ghl_contact
+    WHERE synced_at >= :since
+    LIMIT :cap
+)
+SELECT
+    (SELECT count(*) FROM touched) AS n,
+    (SELECT array_agg(DISTINCT m[1]::int)
+       FROM touched t,
+            LATERAL regexp_matches(
+                lower(coalesce(t.hist, '') || ',' || coalesce(t.nj, '')),
+                'e([0-9]+)', 'g'
+            ) AS m
+    ) AS token_numbers,
+    (SELECT array_agg(DISTINCT booked) FROM touched WHERE booked IS NOT NULL) AS booked_numbers,
+    (SELECT array_agg(DISTINCT d)
+       FROM (SELECT form_date AS d FROM touched
+             UNION SELECT unsub_date FROM touched) x
+      WHERE d IS NOT NULL
+    ) AS touched_dates
+"""
+
+# Opportunities are scoped on updated_at_ghl, NOT synced_at: every sync
+# re-upserts the whole opportunity table, so synced_at marks ~3,671 of 4,005
+# rows across 138 webinar numbers (i.e. everything) while updated_at_ghl marks
+# the ~59 rows across 17 numbers that GHL actually changed.
+_TOUCHED_OPPS_SQL = """
+SELECT DISTINCT webinar_source_number
+FROM ghl_opportunity
+WHERE updated_at_ghl >= :since AND webinar_source_number IS NOT NULL
+"""
+
+# Appointment-derived call1/call2 columns are written straight onto
+# ghl_opportunity by sync_appointments_and_derive without touching
+# updated_at_ghl, so those changes are invisible to the query above. Catch them
+# from the appointment side instead: a freshly-synced appointment moves the
+# Sales metrics of whatever webinar its contact's opportunity belongs to.
+_TOUCHED_APPOINTMENT_OPPS_SQL = """
+SELECT DISTINCT o.webinar_source_number
+FROM ghl_appointment a
+JOIN ghl_opportunity o ON o.ghl_contact_id = a.ghl_contact_id
+WHERE a.synced_at >= :since AND o.webinar_source_number IS NOT NULL
+"""
+
+
+async def affected_webinar_ids_since(since) -> list[str] | None:
+    """Webinar ids whose statistics could have moved since `since`.
+
+    A webinar is affected when a contact or opportunity touched by the sync
+    attributes to it — either by number (an e{N} token in the series history,
+    a booked_call_webinar_series, an opportunity's webinar_source_number) or by
+    falling inside its (prev_date, current_date] window (self-registration and
+    unsubscribe are date-driven, not number-tagged).
+
+    Returns None when the set can't be bounded — too many touched rows, or a
+    derivation query failed. The caller must then fall back to a full recompute
+    rather than assume "nothing changed"; an empty list means genuinely nothing.
+    """
+    import bisect
+
+    from sqlalchemy import text as sa_text
+    from db.session import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            row = (await db.execute(
+                sa_text(_TOUCHED_CONTACTS_SQL),
+                {"since": since, "cap": _SCOPE_ROW_LIMIT + 1},
+            )).mappings().one()
+
+            if row["n"] > _SCOPE_ROW_LIMIT:
+                logger.info(
+                    "recompute scope: %d+ touched contacts — falling back to full rebuild",
+                    _SCOPE_ROW_LIMIT,
+                )
+                return None
+
+            opp_numbers = (await db.execute(
+                sa_text(_TOUCHED_OPPS_SQL), {"since": since},
+            )).scalars().all()
+            appt_numbers = (await db.execute(
+                sa_text(_TOUCHED_APPOINTMENT_OPPS_SQL), {"since": since},
+            )).scalars().all()
+
+        numbers: set[int] = set()
+        for group in (row["token_numbers"], row["booked_numbers"], opp_numbers, appt_numbers):
+            numbers.update(int(n) for n in (group or []) if n is not None)
+
+        from services.ghl_statistics_source import (
+            _get_cached_webinars,
+            GoHighLevelStatisticsSource,
+        )
+        webinars = await _get_cached_webinars()
+        windows = GoHighLevelStatisticsSource._date_windows(webinars)
+
+        # Sorted touched dates + bisect, so the date-window test is exact rather
+        # than a min/max range. A range would be useless here: touched form
+        # dates span years, so "does the window overlap [min, max]" matches
+        # nearly every webinar and scoping degenerates to a full rebuild.
+        touched_dates = sorted(d for d in (row["touched_dates"] or []) if d is not None)
+
+        def _window_has_touched_date(prev_date, current_date) -> bool:
+            """Any touched date in (prev_date, current_date] — the same
+            half-open window the self-reg and unsubscribe metrics use."""
+            i = bisect.bisect_right(touched_dates, prev_date)
+            return i < len(touched_dates) and touched_dates[i] <= current_date
+
+        ids: set[str] = set()
+        for w in webinars:
+            if w.number in numbers:
+                ids.add(w.id)
+                continue
+            prev_date, current_date = windows.get(w.id, (None, None))
+            if prev_date is None or current_date is None or not touched_dates:
+                continue
+            if _window_has_touched_date(prev_date, current_date):
+                ids.add(w.id)
+
+        return sorted(ids)
+    except Exception as exc:
+        logger.warning("recompute scope: derivation failed (%s) — full rebuild", exc)
+        return None
+
+
+def schedule_recompute_since(since, source: str = "auto") -> None:
+    """Recompute only the webinars a sync since `since` could have moved.
+
+    Falls back to a full recompute whenever the affected set can't be derived,
+    so a scoping bug degrades to "slow but correct", never "fast but stale".
+    """
+    async def _run():
+        ids = await affected_webinar_ids_since(since)
+        if ids is None:
+            await recompute(None, source=source)
+        elif ids:
+            logger.info("recompute scope: %d webinar(s) affected since %s", len(ids), since)
+            await recompute(ids, source=source)
+        else:
+            logger.info("recompute scope: no webinars affected since %s — skipping", since)
+
+    _spawn(f"since:{_snap_source(source)}:{since}", _run)
