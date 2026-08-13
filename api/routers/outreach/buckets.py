@@ -104,6 +104,18 @@ async def list_buckets(
     ]}
 
 
+# 60s micro-cache for /buckets/eligible: the Planning panel re-requests the
+# same filter combos constantly (toggling filters back and forth), and each
+# miss costs 1-8s of index scans. Single uvicorn worker → a module dict is the
+# whole story. Mutating endpoints call invalidate_eligible_cache().
+_ELIGIBLE_CACHE: dict[tuple, tuple[float, dict]] = {}
+_ELIGIBLE_TTL = 60.0
+
+
+def invalidate_eligible_cache() -> None:
+    _ELIGIBLE_CACHE.clear()
+
+
 @router.get("/buckets/eligible")
 async def bucket_eligible_counts(
     reuse_cutoff: str | None = Query(None),
@@ -137,6 +149,16 @@ async def bucket_eligible_counts(
             parsed_before = _date.fromisoformat(reuse_before)
         except ValueError:
             raise HTTPException(400, "reuse_before must be an ISO date (YYYY-MM-DD)")
+    import time as _time
+
+    cache_key = (
+        reuse_cutoff, reuse_before, reuse_only, webinar_id,
+        tuple(sorted(country)) if country else None, emp_min, emp_max,
+    )
+    hit = _ELIGIBLE_CACHE.get(cache_key)
+    if hit and (_time.monotonic() - hit[0]) < _ELIGIBLE_TTL:
+        return hit[1]
+
     cutoff_ts = reuse_cutoff_to_ts(reuse_cutoff, parsed_before)
     # Build the claimable predicate WITHOUT the target-webinar exclusion: any
     # predicate on contacts.id breaks the index-only scan over the covering
@@ -167,18 +189,30 @@ async def bucket_eligible_counts(
         conds.append(country_cond)
     conds.extend(emp_conds)
 
-    result = await db.execute(
+    # The 1-3 aggregates below are independent — run them CONCURRENTLY on their
+    # own pooled connections (they ran sequentially before; with filters active
+    # that stacked 2-8s of index scans back to back).
+    import asyncio as _asyncio
+
+    from db.session import AsyncSessionLocal as _Session
+
+    async def _grouped(stmt) -> dict:
+        async with _Session() as s:
+            res = await s.execute(stmt)
+            return {row[0]: int(row[1] or 0) for row in res}
+
+    counts_stmt = (
         select(Contact.bucket_id, sa_func.count())
         .where(*conds)
         .group_by(Contact.bucket_id)
     )
-    counts = {row[0]: int(row[1] or 0) for row in result}
 
-    # Subtract contacts already members of the target webinar. Driven from the
-    # SMALL membership side (one PK probe per member — zero/tiny for a freshly
-    # created webinar), which keeps the big scan above index-only. Equivalent to
-    # the old in-query NOT-member predicate: base(claimable) − overlap(claimable
-    # ∧ member) = claimable ∧ ¬member, per bucket.
+    # Contacts already members of the target webinar. Driven from the SMALL
+    # membership side (one PK probe per member — zero/tiny for a freshly created
+    # webinar), which keeps the big scan index-only. Equivalent to the old
+    # in-query NOT-member predicate: base(claimable) − overlap(claimable ∧
+    # member) = claimable ∧ ¬member, per bucket.
+    overlap_stmt = None
     if webinar_id is not None:
         overlap_conds = [
             WebinarContactMembership.webinar_id == webinar_id,
@@ -190,16 +224,13 @@ async def bucket_eligible_counts(
         if country_cond is not None:
             overlap_conds.append(country_cond)
         overlap_conds.extend(emp_conds)
-        overlap_result = await db.execute(
+        overlap_stmt = (
             select(Contact.bucket_id, sa_func.count())
             .select_from(WebinarContactMembership)
             .join(Contact, Contact.id == WebinarContactMembership.contact_id)
             .where(*overlap_conds)
             .group_by(Contact.bucket_id)
         )
-        for _bid, _cnt in overlap_result:
-            if _bid in counts:
-                counts[_bid] = max(0, counts[_bid] - int(_cnt or 0))
 
     # When a country/employee filter is active, also return a per-bucket TOTAL
     # that respects the SAME filter (all matching contacts, not just fresh) so the
@@ -207,7 +238,7 @@ async def bucket_eligible_counts(
     # when no filter is set: an unfiltered GROUP BY over the whole contacts table
     # is the exact aggregate list_buckets deliberately avoids for performance —
     # the client uses the static bucket.total_contacts in that case.
-    totals: dict = {}
+    totals_stmt = None
     if country_cond is not None or emp_conds:
         total_conds = [
             Contact.user_id == LLOYD_USER_ID,
@@ -217,14 +248,31 @@ async def bucket_eligible_counts(
         if country_cond is not None:
             total_conds.append(country_cond)
         total_conds.extend(emp_conds)
-        total_result = await db.execute(
+        totals_stmt = (
             select(Contact.bucket_id, sa_func.count())
             .where(*total_conds)
             .group_by(Contact.bucket_id)
         )
-        totals = {row[0]: int(row[1] or 0) for row in total_result}
 
-    return {"buckets": counts, "total": sum(counts.values()), "totals": totals}
+    tasks = [_grouped(counts_stmt)]
+    if overlap_stmt is not None:
+        tasks.append(_grouped(overlap_stmt))
+    if totals_stmt is not None:
+        tasks.append(_grouped(totals_stmt))
+    results = await _asyncio.gather(*tasks)
+
+    counts = results[0]
+    idx = 1
+    if overlap_stmt is not None:
+        for _bid, _cnt in results[idx].items():
+            if _bid in counts:
+                counts[_bid] = max(0, counts[_bid] - _cnt)
+        idx += 1
+    totals: dict = results[idx] if totals_stmt is not None else {}
+
+    resp = {"buckets": counts, "total": sum(counts.values()), "totals": totals}
+    _ELIGIBLE_CACHE[cache_key] = (_time.monotonic(), resp)
+    return resp
 
 
 # Country-name buckets for the Good-Available geo split. Matched case-insensitively

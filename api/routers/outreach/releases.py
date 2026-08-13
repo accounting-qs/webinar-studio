@@ -282,6 +282,9 @@ async def release_contacts(
 
     # Always return the batch_id (even on a 0-released chunk) so the client
     # can pass it through to subsequent chunks of the same upload.
+    # Remaining counts changed — drop the eligible-counts micro-cache.
+    from api.routers.outreach.buckets import invalidate_eligible_cache
+    invalidate_eligible_cache()
     return {
         "release_batch_id": release_batch_id,
         "released": released_count,
@@ -525,6 +528,9 @@ async def release_contacts_by_id(
 
     await db.flush()
 
+    # Remaining counts changed — drop the eligible-counts micro-cache.
+    from api.routers.outreach.buckets import invalidate_eligible_cache
+    invalidate_eligible_cache()
     return {
         "release_batch_id": release_batch_id,
         "released": len(contact_ids_to_release),

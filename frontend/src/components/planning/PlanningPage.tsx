@@ -962,6 +962,15 @@ export function PlanningPage() {
   // loading treatment on the assign table's Total/Remaining numbers so a
   // filter change visibly distinguishes "still fetching" from "final".
   const [assignEligibleLoading, setAssignEligibleLoading] = useState(false);
+  // Debounced mirrors of the employee inputs: each keystroke used to fire a
+  // 1-8s count fetch (typing "200" → three stacked fetches for 2, 20, 200).
+  // The eligible effect keys off these; everything else stays immediate.
+  const [debEmpMin, setDebEmpMin] = useState<number | "">("");
+  const [debEmpMax, setDebEmpMax] = useState<number | "">("");
+  useEffect(() => {
+    const t = setTimeout(() => { setDebEmpMin(assignFilterEmpMin); setDebEmpMax(assignFilterEmpMax); }, 400);
+    return () => clearTimeout(t);
+  }, [assignFilterEmpMin, assignFilterEmpMax]);
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
@@ -1015,13 +1024,13 @@ export function PlanningPage() {
       reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
       webinar_id: activeAssignWebinarId,
       country: assignFilterCountries.length ? assignFilterCountries : undefined,
-      emp_min: assignFilterEmpMin === "" ? undefined : assignFilterEmpMin,
-      emp_max: assignFilterEmpMax === "" ? undefined : assignFilterEmpMax,
+      emp_min: debEmpMin === "" ? undefined : debEmpMin,
+      emp_max: debEmpMax === "" ? undefined : debEmpMax,
     })
       .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); setAssignEligibleLoading(false); } })
       .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); } });
     return () => { cancelled = true; };
-  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, eligibleRefresh]);
+  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, debEmpMin, debEmpMax, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket. When the eligible map is loaded, a
   // bucket ABSENT from it has zero eligible contacts under the current filter —

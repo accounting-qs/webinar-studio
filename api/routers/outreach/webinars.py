@@ -559,7 +559,10 @@ async def assign_bucket(
     # asyncpg caps a statement at 32,767 bind params. The membership INSERT
     # binds 7 values per row, so 2,000 rows ≈ 14k params — safely under the cap
     # (5,000 rows × 7 = 35k blew it up on real-size assigns).
-    CLAIM_CHUNK = 2000
+    # unnest-array statements bind ONE param per statement, so the chunk size is
+    # bounded by statement duration (index write amplification), not the 32,767
+    # bind-param cap that forced 2000 previously.
+    CLAIM_CHUNK = 8000
 
     # Fresh (never-invited) contacts claimed across all pools — feeds the exact
     # bucket-remaining decrement below instead of a whole-bucket recount.
@@ -584,49 +587,64 @@ async def assign_bucket(
         got = 0
         while got < target:
             chunk_limit = min(CLAIM_CHUNK, target - got)
-            candidate_ids = (await db.execute(
-                select(Contact.id).where(*where_conds).limit(chunk_limit)
+            # Fetch outreach_status alongside the id: the merged UPDATE below no
+            # longer yields a fresh-rows rowcount, so the fresh count comes from
+            # the statuses captured here (rows are FOR UPDATE locked — stable).
+            cand_rows = (await db.execute(
+                select(Contact.id, Contact.outreach_status).where(*where_conds).limit(chunk_limit)
                 .with_for_update(skip_locked=True)
-            )).scalars().all()
-            if not candidate_ids:
+            )).all()
+            if not cand_rows:
                 break
+            candidate_ids = [r[0] for r in cand_rows]
+            status_by_id = {r[0]: r[1] for r in cand_rows}
+            # unnest-array insert: one bind param regardless of chunk size (the
+            # old per-row VALUES form hit asyncpg's 32,767-param cap at ~4k rows,
+            # which is what capped chunks at 2000).
             inserted_ids = (await db.execute(
-                pg_insert(WebinarContactMembership)
-                .values([
-                    {
-                        "user_id": LLOYD_USER_ID,
-                        "contact_id": cid,
-                        "webinar_id": webinar_id,
-                        "assignment_id": assignment.id,
-                        "bucket_id": membership_source_bucket,
-                        "status": "assigned",
-                        "assigned_date": webinar.date,
-                    }
-                    for cid in candidate_ids
-                ])
-                .on_conflict_do_nothing(index_elements=["webinar_id", "contact_id"])
-                .returning(WebinarContactMembership.contact_id)
+                sa_text("""
+                    INSERT INTO webinar_contact_memberships
+                        (user_id, contact_id, webinar_id, assignment_id, bucket_id, status, assigned_date)
+                    SELECT CAST(:uid AS uuid), u.cid, CAST(:wid AS uuid), CAST(:aid AS uuid),
+                           CAST(:bid AS uuid), 'assigned', CAST(:adate AS date)
+                    FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
+                    ON CONFLICT (webinar_id, contact_id) DO NOTHING
+                    RETURNING contact_id
+                """),
+                {
+                    "uid": str(LLOYD_USER_ID),
+                    "wid": str(webinar_id),
+                    "aid": str(assignment.id),
+                    "bid": str(membership_source_bucket) if membership_source_bucket else None,
+                    "adate": webinar.date,
+                    "ids": [str(c) for c in candidate_ids],
+                },
             )).scalars().all()
             n = len(inserted_ids)
             if n:
+                # ONE merged write per chunk (was two): cache bump for every
+                # claimed row + the legacy slot dual-write CASEd to still-fresh
+                # rows. Each contacts write rewrites ~9 indexes, so halving the
+                # statements roughly halves the claim's dominant cost.
                 await db.execute(
-                    update(Contact)
-                    .where(Contact.id.in_(inserted_ids))
-                    .values(assigned_membership_count=Contact.assigned_membership_count + 1)
+                    sa_text("""
+                        UPDATE contacts c SET
+                            assigned_membership_count = c.assigned_membership_count + 1,
+                            assignment_id  = CASE WHEN c.outreach_status = 'available' THEN CAST(:aid AS uuid) ELSE c.assignment_id END,
+                            assigned_date  = CASE WHEN c.outreach_status = 'available' THEN CAST(:adate AS date) ELSE c.assigned_date END,
+                            outreach_status = CASE WHEN c.outreach_status = 'available' THEN 'assigned' ELSE c.outreach_status END
+                        FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
+                        WHERE c.id = u.cid
+                    """),
+                    {
+                        "aid": str(assignment.id),
+                        "adate": webinar.date,
+                        "ids": [str(c) for c in inserted_ids],
+                    },
                 )
-                # Legacy slot dual-write — fresh contacts only. Its rowcount IS
-                # the number of fresh (never-invited) contacts this chunk took,
-                # which the bucket-remaining decrement below relies on.
-                legacy_res = await db.execute(
-                    update(Contact)
-                    .where(Contact.id.in_(inserted_ids), Contact.outreach_status == "available")
-                    .values(
-                        assignment_id=assignment.id,
-                        outreach_status="assigned",
-                        assigned_date=webinar.date,
-                    )
+                fresh_claimed["n"] += sum(
+                    1 for cid in inserted_ids if status_by_id.get(cid) == "available"
                 )
-                fresh_claimed["n"] += legacy_res.rowcount or 0
             got += n
             if n < chunk_limit:
                 # Fewer rows than requested → this pool is exhausted (or a concurrent
@@ -714,6 +732,9 @@ async def assign_bucket(
         resp["bucket_remaining"] = max(0, (bucket.remaining_contacts or 0) - blocklisted_available)
     else:
         resp["bucket_remaining"] = None
+    # Remaining counts just changed — drop the eligible-counts micro-cache.
+    from api.routers.outreach.buckets import invalidate_eligible_cache
+    invalidate_eligible_cache()
     return resp
 
 
