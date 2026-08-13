@@ -26,10 +26,26 @@ already serves 4,990,209 scans against the same table.
 
 Plain DROP INDEX rather than DROP INDEX CONCURRENTLY: alembic runs migrations
 inside a transaction (see migrations/env.py) and CONCURRENTLY cannot run in one.
-A non-concurrent drop is near-instantaneous once it holds the lock — the only
-real risk is queueing behind a long-running statistics query, so each drop is
-guarded by a short lock_timeout. If that fires, the migration aborts cleanly
-with nothing dropped; re-run it when the instance is quiet.
+Each drop is guarded by a short lock_timeout, so if it can't get the ACCESS
+EXCLUSIVE lock it aborts cleanly with nothing dropped rather than stalling
+readers behind it.
+
+OPERATIONAL NOTE — this is what actually happened applying it to prod. On a
+live instance the transactional path never wins the lock: the statistics
+queries hit `contacts` continuously (20s+ each, IO-bound), so six consecutive
+attempts all died on lock_timeout with alembic_version still at 067. The
+procedure that worked, and the one to use on any busy database:
+
+    export PGOPTIONS="-c statement_timeout=0 -c lock_timeout=0"
+    # one -c per statement — psql wraps multiple -c flags in a transaction,
+    # which CONCURRENTLY rejects
+    psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS ix_contacts_email"
+    ...                                          # repeat per index
+    alembic -c migrations/alembic.ini stamp 068
+
+Stamping is sound here because upgrade() is idempotent (every drop is
+IF EXISTS), so a later run against an environment that took the transactional
+path converges on the same state.
 
 Revision ID: 068
 Revises: 067
