@@ -396,7 +396,7 @@ async def _funnel_scope(wids: list[str]) -> dict[str, dict[str, dict[str, int]]]
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             JOIN webinars w2 ON w2.id = m.webinar_id
             JOIN webinargeek_subscribers wgs
-                ON wgs.email = c.email
+                ON LOWER(wgs.email) = LOWER(c.email)
                AND wgs.broadcast_id = w2.broadcast_id
             WHERE m.webinar_id = ANY(CAST(:wids AS uuid[])) AND {_COLD}
             GROUP BY GROUPING SETS ({sets})

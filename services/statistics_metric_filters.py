@@ -26,7 +26,7 @@ class MetricSpec:
         SELECT ...
         FROM contacts c
         JOIN webinar_contact_memberships m ON m.contact_id = c.id
-        JOIN ghl_contact g ON g.email = c.email
+        JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
         [+ wgs join if needs_wg]
         [+ opp join if needs_opp]
         WHERE m.webinar_id = :wid
@@ -240,9 +240,9 @@ def build_contacts_query(
     # several webinars now). UNIQUE(webinar_id, contact_id) keeps this 1 row per
     # contact, so the DISTINCT semantics below are unchanged.
     joins = ["JOIN webinar_contact_memberships m ON m.contact_id = c.id",
-             "JOIN ghl_contact g ON g.email = c.email"]
+             "JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)"]
     if spec.needs_wg:
-        joins.append("LEFT JOIN webinargeek_subscribers wgs ON wgs.email = c.email")
+        joins.append("LEFT JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)")
     if spec.needs_opp:
         joins.append("JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id")
         joins.append("LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id")
@@ -380,7 +380,7 @@ def build_webinar_wide_opp_query(
                   LIMIT 1)                  AS assignment_id
             FROM ghl_opportunity o
             LEFT JOIN ghl_contact g ON g.ghl_contact_id = o.ghl_contact_id
-            LEFT JOIN contacts c ON c.email = g.email
+            LEFT JOIN contacts c ON LOWER(c.email) = LOWER(g.email)
             LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id
             WHERE {where}
             ORDER BY o.ghl_opportunity_id, c.first_name NULLS LAST
