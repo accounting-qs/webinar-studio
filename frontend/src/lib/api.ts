@@ -768,6 +768,7 @@ export async function assignBucketToWebinar(
     countries_override?: string;
     emp_range_override?: string;
     filter_countries?: string[];
+    filter_countries_label?: string;
     emp_min?: number;
     emp_max?: number;
     reuse_cutoff?: string;

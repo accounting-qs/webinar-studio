@@ -19,7 +19,7 @@ import {
   type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
   type AssignCountry,
 } from "@/lib/api";
-import { REGION_COUNTRIES, REGION_ORDER, normCountry, COUNTRIES } from "@/lib/locations";
+import { REGION_COUNTRIES, REGION_ORDER, normCountry, COUNTRIES, collapseCountriesForLabel } from "@/lib/locations";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
@@ -1476,6 +1476,11 @@ export function PlanningPage() {
     let requestData: Parameters<typeof assignBucketToWebinar>[1];
 
     const filterCountries = assignFilterCountries.length ? assignFilterCountries : undefined;
+    // Compact label for the list NAME: fully-selected regions collapse to their
+    // region name ("Europe") instead of 42 slash-joined countries.
+    const filterCountriesLabel = filterCountries
+      ? collapseCountriesForLabel(filterCountries, assignAvailCountries.map((c) => c.country)).join("/")
+      : undefined;
     const empMin = assignFilterEmpMin === "" ? undefined : assignFilterEmpMin;
     const empMax = assignFilterEmpMax === "" ? undefined : assignFilterEmpMax;
     if (isCustomListAssign) {
@@ -1487,6 +1492,7 @@ export function PlanningPage() {
         send_per_account: sendPerAcct,
         days: assignDays,
         filter_countries: filterCountries,
+        filter_countries_label: filterCountriesLabel,
         emp_min: empMin,
         emp_max: empMax,
       };
@@ -1511,6 +1517,7 @@ export function PlanningPage() {
         countries_override: countries,
         emp_range_override: empRange,
         filter_countries: filterCountries,
+        filter_countries_label: filterCountriesLabel,
         emp_min: empMin,
         emp_max: empMax,
         reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,

@@ -475,7 +475,8 @@ async def assign_bucket(
     elif _emax is not None:
         _fbits.append(f"≤{_emax} emp")
     if body.filter_countries:
-        _fbits.append("/".join(body.filter_countries))
+        # Prefer the compact region label ("Europe") over 42 joined countries.
+        _fbits.append(getattr(body, "filter_countries_label", None) or "/".join(body.filter_countries))
     if cutoff_ts is not None:
         if getattr(body, "reuse_before", None):
             _rlabel = f"before {body.reuse_before.isoformat()}"

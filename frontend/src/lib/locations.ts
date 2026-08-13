@@ -37,6 +37,29 @@ export const REGION_ORDER = ["Europe", "DACH", "BENELUX", "USA", "North America"
 
 export const normCountry = (c: string) => c.trim().toLowerCase();
 
+/** Collapse a selected-country list into a compact human label for list names:
+ * regions whose PRESENT countries are all selected shrink to the region name
+ * ("Europe"), remaining countries stay as-is. Larger regions are checked first
+ * so Europe absorbs DACH/BENELUX and North America absorbs USA; a region is
+ * skipped when a prior region already covers all its members. */
+export function collapseCountriesForLabel(selected: string[], present: string[]): string[] {
+  const sel = new Set(selected);
+  const covered = new Set<string>();
+  const out: string[] = [];
+  // Widest first — deliberate deviation from REGION_ORDER (which is UI order).
+  for (const label of ["Europe", "North America", "DACH", "BENELUX", "USA"]) {
+    const set = REGION_COUNTRIES[label];
+    const members = present.filter((c) => set.has(normCountry(c)));
+    if (!members.length) continue;
+    if (!members.every((c) => sel.has(c))) continue;
+    if (members.every((c) => covered.has(c))) continue;  // subsumed by a wider pick
+    out.push(label);
+    members.forEach((c) => covered.add(c));
+  }
+  for (const c of selected) if (!covered.has(c)) out.push(c);
+  return out;
+}
+
 // Full list of selectable countries for the import location picker.
 export const COUNTRIES: string[] = [
   "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Argentina", "Armenia",

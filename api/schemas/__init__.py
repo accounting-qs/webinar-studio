@@ -129,6 +129,11 @@ class AssignRequest(BaseModel):
     # The frontend expands region shortcuts (Europe / USA / Canada) into concrete
     # country strings before sending, so this is always a flat list of countries.
     filter_countries: list[str] | None = None
+    # Compact human label for the country filter, used ONLY in the created list's
+    # name (e.g. "Europe" instead of 42 slash-joined countries). The frontend
+    # collapses fully-selected region shortcuts into their region name; the claim
+    # itself always uses the flat filter_countries list above.
+    filter_countries_label: str | None = None
     # Employee-count range filter for the claim (literal headcount). Only contacts
     # whose raw employee_count is within [emp_min, emp_max] are eligible. Either
     # bound may be omitted for an open range; None/None = no filter. Contacts with
