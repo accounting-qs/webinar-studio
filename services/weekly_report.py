@@ -1241,7 +1241,7 @@ def _report_scorecard_card(payload: dict[str, Any]) -> str:
     return _card(
         _eyebrow("Scorecard — vs average webinar", _GREEN)
         + _scroll(_table(
-            ["Metric", "This webinar", f"All avg ({n_all})", "Δ", f"4-week avg ({n_4w})", "Δ"],
+            ["Metric", "This webinar", f"Last-{n_all} avg", "Δ", f"4-week avg ({n_4w})", "Δ"],
             rows,
         ))
     )

@@ -435,6 +435,7 @@ function HeroTile({
   w4,
   fmt = "int",
   sub,
+  allLabel,
 }: {
   label: string;
   value: string;
@@ -443,6 +444,7 @@ function HeroTile({
   w4: number | null | undefined;
   fmt?: Fmt;
   sub?: string;
+  allLabel?: string;
 }) {
   return (
     <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 px-4 py-3">
@@ -451,7 +453,7 @@ function HeroTile({
         {value}
       </div>
       <RelDelta cur={cur} base={w4} label="4-wk avg" fmt={fmt} />
-      <RelDelta cur={cur} base={all} label="all-time avg" fmt={fmt} />
+      <RelDelta cur={cur} base={all} label={allLabel ?? "10-webinar avg"} fmt={fmt} />
       {sub && <div className="text-[11px] text-zinc-400 mt-0.5">{sub}</div>}
     </div>
   );
@@ -479,10 +481,11 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
       <SectionHeading
         id="scorecard"
         title="This webinar vs the average webinar"
-        subtitle={`Baselines: all ${all?.webinarCount ?? 0} prior webinars and the ${w4?.webinarCount ?? 0} in the 4 weeks before this one.`}
+        subtitle={`Baselines: the last ${all?.webinarCount ?? 0} webinars and the ${w4?.webinarCount ?? 0} in the 4 weeks before this one.`}
       />
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mb-4">
         <HeroTile
+          allLabel={`last-${all?.webinarCount ?? 10} avg`}
           label="Net-new registrations"
           value={fmtInt(cur.netNewRegs)}
           cur={cur.netNewRegs}
@@ -491,6 +494,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
           sub={`${fmtPct(cur.regRate)} of ${fmtInt(cur.invited)} invited`}
         />
         <HeroTile
+          allLabel={`last-${all?.webinarCount ?? 10} avg`}
           label="Total registrations"
           value={fmtInt(cur.totalRegs)}
           cur={cur.totalRegs}
@@ -499,6 +503,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
           sub={`${fmtInt(cur.nonjoinerRegs)} non-joiner · ${fmtInt(cur.noListDataRegs)} no-list`}
         />
         <HeroTile
+          allLabel={`last-${all?.webinarCount ?? 10} avg`}
           label="Live attendance"
           value={fmtInt(cur.totalAttended)}
           cur={cur.totalAttended}
@@ -507,6 +512,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
           sub={`${fmtPct(cur.attendRateOfRegs)} of regs · ${fmtR1(cur.attendPer10kInvited)} per 10k invited`}
         />
         <HeroTile
+          allLabel={`last-${all?.webinarCount ?? 10} avg`}
           label="Booked contacts"
           value={fmtInt(bk.uniqueBookedContacts ?? cur.uniqueBookers)}
           cur={cur.uniqueBookers}
@@ -531,7 +537,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
               <tr>
                 <th className={TH}>Metric</th>
                 <th className={`${TH} text-right`}>This webinar</th>
-                <th className={`${TH} text-right`}>All avg ({all?.webinarCount ?? 0})</th>
+                <th className={`${TH} text-right`}>Last-{all?.webinarCount ?? 0} avg</th>
                 <th className={`${TH} text-right`}>Δ</th>
                 <th className={`${TH} text-right`}>4-wk avg ({w4?.webinarCount ?? 0})</th>
                 <th className={`${TH} text-right`}>Δ</th>
@@ -862,7 +868,7 @@ function V1Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
       {/* 1 — scorecard */}
       <SectionHeading
         title="Scorecard — vs the average webinar"
-        subtitle="Baselines: every prior webinar (all) and the 4 weeks before this one — not just the previous webinar."
+        subtitle="Baselines: the last 10 webinars and the 4 weeks before this one — not just the previous webinar."
       />
       <Card>
         <div className="overflow-x-auto">
@@ -871,7 +877,7 @@ function V1Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
               <tr>
                 <th className={TH}>Metric</th>
                 <th className={TH}>This webinar</th>
-                <th className={TH}>All avg ({payload.scorecard.baselineAll?.webinarCount ?? 0})</th>
+                <th className={TH}>Last-{payload.scorecard.baselineAll?.webinarCount ?? 0} avg</th>
                 <th className={TH}>Δ</th>
                 <th className={TH}>4-wk avg ({payload.scorecard.baseline4w?.webinarCount ?? 0})</th>
                 <th className={TH}>Δ</th>

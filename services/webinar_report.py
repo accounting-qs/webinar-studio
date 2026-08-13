@@ -2,7 +2,7 @@
 Statistics page "Report" button and the weekly email.
 
 A report is a frozen JSONB payload per webinar variant:
-  - scorecard: this webinar vs the all-webinar average AND the last-4-week
+  - scorecard: this webinar vs the last-10-webinar average AND the last-4-week
     average (never just vs previous),
   - funnels: invited / reg rate / attendance by industry, geography, employee
     size and segment (bucket), each vs the last-10-webinar baseline,
@@ -621,6 +621,8 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
     )
 
     # -- Scorecard baselines from statistics snapshots -------------------
+    # Long baseline = the last BASELINE_WINDOW webinars (not all-time): the
+    # operation changes quickly, so a rolling window tracks "how we run now".
     snap_all = await read_all_payloads("ghl")
     counts_all: list[dict[str, float]] = []
     counts_4w: list[dict[str, float]] = []
@@ -629,7 +631,7 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
         cutoff_4w = (datetime.fromisoformat(my_date) - timedelta(days=28)).date().isoformat()
     except Exception:
         pass
-    for s in prior_primary:
+    for s in prior_primary[:BASELINE_WINDOW]:
         p = snap_all.get(s["webinarId"])
         if not p:
             continue
