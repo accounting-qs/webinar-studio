@@ -1190,6 +1190,234 @@ def render_report_html(data: dict[str, Any], narrative: str | None,
 
 
 # ---------------------------------------------------------------------------
+# Per-webinar report email (services.webinar_report artifact → email HTML)
+# ---------------------------------------------------------------------------
+
+def _pct(v: float | None) -> str:
+    return _fmt(v, "pct")
+
+
+def _int(v: float | None) -> str:
+    return _fmt(v, "int")
+
+
+def _r1(v: float | None) -> str:
+    return "—" if v is None else f"{v:,.1f}"
+
+
+def _report_scorecard_card(payload: dict[str, Any]) -> str:
+    sc = payload.get("scorecard") or {}
+    cur = sc.get("current") or {}
+    ball = sc.get("baselineAll") or {}
+    b4w = sc.get("baseline4w") or {}
+
+    rows_spec = [
+        ("Invited", "invited", "int"),
+        ("Net-new registrations", "netNewRegs", "int"),
+        ("Net-new reg rate", "regRate", "pct"),
+        ("Non-joiner registrations", "nonjoinerRegs", "int"),
+        ("No-list-data registrations", "noListDataRegs", "int"),
+        ("Total registrations", "totalRegs", "int"),
+        ("Yes marks", "yesMarked", "int"),
+        ("Maybe marks", "maybeMarked", "int"),
+        ("Live attendance", "totalAttended", "int"),
+        ("Attendance % of regs", "attendRateOfRegs", "pct"),
+        ("Attendees / 10k invited", "attendPer10kInvited", "ratio"),
+        ("Booked contacts", "uniqueBookers", "int"),
+    ]
+    rows = []
+    for label, key, fmt in rows_spec:
+        c = cur.get(key)
+        rows.append([
+            label,
+            f"<b>{_fmt(c, fmt)}</b>",
+            _fmt(ball.get(key), fmt),
+            _fmt_delta(c, ball.get(key), fmt, key),
+            _fmt(b4w.get(key), fmt),
+            _fmt_delta(c, b4w.get(key), fmt, key),
+        ])
+    n_all = ball.get("webinarCount") or 0
+    n_4w = b4w.get("webinarCount") or 0
+    return _card(
+        _eyebrow("Scorecard — vs average webinar", _GREEN)
+        + _scroll(_table(
+            ["Metric", "This webinar", f"All avg ({n_all})", "Δ", f"4-week avg ({n_4w})", "Δ"],
+            rows,
+        ))
+    )
+
+
+def _report_funnel_cards(payload: dict[str, Any]) -> str:
+    titles = {
+        "employeeSize": "Employee size",
+        "industry": "Industry",
+        "geography": "Geography",
+        "segments": "Segments (buckets)",
+    }
+    out: list[str] = []
+    for dim in ("segments", "industry", "geography", "employeeSize"):
+        block = (payload.get("funnels") or {}).get(dim)
+        if not block or not block.get("cells"):
+            continue
+        rows = []
+        for cell in block["cells"][:8]:
+            c = cell.get("current") or {}
+            b = cell.get("baseline") or {}
+            rows.append([
+                _esc(str(cell.get("key"))[:38]),
+                _int(c.get("invited")),
+                f"{_pct(c.get('regRate'))} {_fmt_delta(c.get('regRate'), b.get('regRate'), 'pct')}",
+                f"{_pct(c.get('attPctOfRegs'))} {_fmt_delta(c.get('attPctOfRegs'), b.get('attPctOfRegs'), 'pct')}",
+                f"{_r1(c.get('attendeesPer10kInv'))} {_fmt_delta(c.get('attendeesPer10kInv'), b.get('attendeesPer10kInv'), 'ratio')}",
+            ])
+        out.append(_card(
+            _eyebrow(titles[dim], _BLUE)
+            + f"<div style='font-size:11px;color:{_MUTED};margin:-6px 0 10px 0'>Δ vs the last-{block.get('baselineWebinarCount') or 0}-webinar average</div>"
+            + _scroll(_table(
+                [titles[dim], "Invited", "Reg rate", "Att % of regs", "Att / 10k inv"],
+                rows,
+            ))
+        ))
+    return "".join(out)
+
+
+def _report_bookings_card(payload: dict[str, Any]) -> str:
+    bk = payload.get("bookings") or {}
+    if not bk:
+        return ""
+    q = bk.get("quality") or {}
+    st = bk.get("callStatus") or {}
+    origin = bk.get("origin") or {}
+    inner = _eyebrow("Bookings deep-dive", _PURPLE)
+    inner += _kv("Unique booked contacts", f"<b>{_int(bk.get('uniqueBookedContacts'))}</b>",
+                 note="rebooked contact counts once")
+    inner += _kv(
+        "Call status",
+        f"{st.get('showed', 0)} showed &middot; {st.get('noShow', 0)} no-show &middot; "
+        f"{st.get('cancelled', 0)} cancelled &middot; {st.get('confirmed', 0)} upcoming",
+    )
+    inner += _kv(
+        "Lead quality (rated)",
+        f"{q.get('great', 0)} Great &middot; {q.get('ok', 0)} Ok &middot; "
+        f"{q.get('barely', 0)} Barely &middot; {q.get('bad', 0)} Bad/DQ",
+        note=f"{bk.get('rated', 0)} of {bk.get('uniqueBookedContacts', 0)} rated",
+    )
+    inner += _kv("Implied close rate", _pct(bk.get("impliedCloseRate")),
+                 note="Great 25% · Ok 13% · Barely 5%")
+    inner += _kv(
+        "Booking origin",
+        f"{origin.get('netNew', 0)} net-new &middot; {origin.get('nonjoiner', 0)} non-joiner &middot; "
+        f"{origin.get('noListData', 0)} no-list &middot; {origin.get('notRegistrant', 0)} not registered",
+    )
+    sources = bk.get("leadSources") or []
+    if sources:
+        inner += "<div style='height:10px'></div>" + _scroll(_table(
+            ["Lead source", "Booked"],
+            [[_esc(s["source"]), _int(s["count"])] for s in sources[:5]],
+        ))
+    return _card(inner)
+
+
+def _report_nonjoiners_card(payload: dict[str, Any]) -> str:
+    nj = payload.get("nonjoiners") or {}
+    if not nj:
+        return ""
+    inner = _eyebrow("Non-joiner package", _CYAN)
+    inner += _kv("Pool (last %d webinars)" % (nj.get("windowWebinars") or 6),
+                 _int(nj.get("poolSize")))
+    inner += _kv("Re-registered", f"{_int(nj.get('regs'))} ({_pct(nj.get('regRate'))} of pool)")
+    inner += _kv("Attended live", f"{_int(nj.get('attended'))} ({_pct(nj.get('attendRateOfRegs'))} of NJ regs)")
+    inner += _kv("Net-new attendance rate", _pct(nj.get("netNewAttendRateOfRegs")),
+                 note="comparison")
+    inner += _kv("Net-new reg rate of invited", _pct(nj.get("netNewRegRateOfInvited")),
+                 note="comparison")
+    return _card(inner)
+
+
+def _report_insights_card(insights: list[dict[str, Any]] | None, ai_error: str | None) -> str:
+    banner = (
+        f"<div style='margin:0 0 12px 0;padding:8px 12px;border:1px solid {_AMBER};"
+        f"border-radius:6px;font-size:11px;color:{_AMBER};line-height:1.5'>"
+        "&#9888;&#65039; AI-generated insights (beta) — not always accurate; verify the numbers "
+        "above before acting on them.</div>"
+    )
+    if not insights:
+        note = _esc(ai_error or "Insights unavailable for this report.")
+        return _card(_eyebrow("AI Insights", _AMBER) + banner
+                     + f"<div style='font-size:12px;color:{_MUTED}'>{note}</div>")
+    blocks: list[str] = []
+    for group in insights:
+        blocks.append(
+            f"<div style='font-size:12px;font-weight:700;letter-spacing:1px;color:{_TEXT};"
+            f"text-transform:uppercase;margin:{'0' if not blocks else '14px'} 0 6px 0'>"
+            f"{_esc(group.get('title', ''))}</div>"
+            + "".join(_bullet(b) for b in (group.get("bullets") or []))
+        )
+    return _card(_eyebrow("AI Insights", _AMBER) + banner + "".join(blocks))
+
+
+def render_webinar_report_email(report: dict[str, Any],
+                                schedule: dict[str, Any] | None = None) -> str:
+    """Email-safe HTML for a stored per-webinar report artifact."""
+    from config import settings as app_settings
+
+    payload = report.get("payload") or {}
+    webinar_id = report.get("webinarId") or payload.get("webinarId") or ""
+    label = f"W{payload.get('number')}"
+    if payload.get("variantLabel"):
+        label += f" · {payload['variantLabel']}"
+    if payload.get("date"):
+        label += f" ({payload['date']})"
+
+    report_url = f"{app_settings.APP_BASE_URL.rstrip('/')}/statistics/report/{webinar_id}"
+
+    body: list[str] = [_brand_header(schedule)]
+    body.append(
+        f"<div style='font-size:14px;color:{_TEXT};margin:-10px 0 16px 0'>"
+        f"Webinar report — <b>{_esc(label)}</b> &middot; "
+        f"<a href='{report_url}' style='color:{_BLUE}'>Open the interactive report</a></div>"
+    )
+
+    body.append(_report_scorecard_card(payload))
+    body.append(_section_header("Funnel breakdowns — vs last-10-webinar average", _BLUE))
+    body.append(_report_funnel_cards(payload))
+    body.append(_section_header("Sales & non-joiners", _PURPLE))
+    body.append(_report_bookings_card(payload))
+    body.append(_report_nonjoiners_card(payload))
+    body.append(_section_header("Insights", _AMBER))
+    body.append(_report_insights_card(report.get("insights"), report.get("aiError")))
+
+    caveats = payload.get("caveats") or []
+    if caveats:
+        body.append(_card(
+            _eyebrow("Data notes", _MUTED)
+            + "".join(
+                f"<div style='font-size:11px;color:{_MUTED};line-height:1.5;margin:0 0 5px 0'>"
+                f"&bull; {_esc(c)}</div>" for c in caveats
+            )
+        ))
+
+    footer = (
+        f"<div style='text-align:center;font-size:11px;color:{_MUTED};margin-top:26px;"
+        f"padding-top:14px;border-top:1px solid {_CARD_BORDER}'>"
+        "Quantum Scaling &middot; Webinar Studio &middot; Weekly Report<br>"
+        f"Auto-generated &middot; <a href='{report_url}' style='color:{_BLUE}'>"
+        "Open the full report in Webinar Studio</a></div>"
+    )
+    body.append(footer)
+
+    inner = (
+        "<div style='max-width:700px;margin:0 auto;padding:28px 22px;"
+        "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
+        f"color:{_TEXT}'>" + "".join(body) + "</div>"
+    )
+    return (
+        f"<table width='100%' cellpadding='0' cellspacing='0' bgcolor='{_BG}' "
+        f"style='background:{_BG}'><tr><td>{inner}</td></tr></table>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1228,22 +1456,40 @@ async def send_weekly_report(*, test: bool = False, webinar_id: str | None = Non
     if not api_key:
         return await _fail("Resend API key not configured (Connectors → Resend)")
 
+    # The email body is the per-webinar report artifact (services.webinar_report):
+    # normally pre-generated by the prep job 15 minutes earlier; regenerate
+    # synchronously when missing or stale (no HTTP timeout in job context).
+    from services import webinar_report
+
     try:
-        data = await build_report_data(webinar_id)
+        target_id = webinar_id or await webinar_report.resolve_latest_passed_webinar_id()
+        if not target_id:
+            return await _fail("No passed webinar found to report on")
+
+        report = await webinar_report.read_report(target_id)
+        stale = True
+        if report and report.get("generatedAt"):
+            try:
+                gen_dt = datetime.fromisoformat(report["generatedAt"])
+                stale = datetime.now(dt_timezone.utc) - gen_dt > timedelta(hours=2)
+            except Exception:
+                stale = True
+        if report is None or stale:
+            logger.info("Weekly report: report for %s missing/stale — generating now", target_id)
+            report = await webinar_report.generate_report(target_id) or report
+        if report is None or not report.get("payload"):
+            return await _fail("Failed to build the webinar report")
     except Exception as exc:
-        logger.exception("Weekly report: failed to build report data")
+        logger.exception("Weekly report: failed to build report")
         return await _fail(f"Failed to build report data: {exc}")
-    if data is None:
-        return await _fail("No passed webinar found to report on")
 
-    narrative = await generate_narrative(data)
-    html = render_report_html(data, narrative, schedule=settings)
+    html = render_webinar_report_email(report, schedule=settings)
 
-    current = data["current"]
+    current = report.get("payload") or {}
     # ASCII-only subject: non-ASCII chars (em dashes etc.) get RFC2047-encoded
     # in the header, which trips Gmail's "abnormal characters" spoof warning
     # on a young sending domain.
-    subject = f"Webinar Intelligence Report - W{current.get('number')}"
+    subject = f"Webinar Report - W{current.get('number')}"
     if current.get("date"):
         subject += f" ({current['date']})"
     if test:
@@ -1273,5 +1519,5 @@ async def send_weekly_report(*, test: bool = False, webinar_id: str | None = Non
         "message_id": message_id,
         "webinar_number": current.get("number"),
         "recipients": recipients,
-        "narrative_included": narrative is not None,
+        "narrative_included": report.get("insights") is not None,
     }

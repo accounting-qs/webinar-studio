@@ -1690,6 +1690,106 @@ export async function fetchStatisticsWebinar(
   return res.json();
 }
 
+/* ── Per-webinar report (frozen artifact + AI insights) ──────────────────── */
+
+export interface WebinarReportFunnelCellSide {
+  invited: number | null;
+  regs: number | null;
+  regRate: number | null;
+  attPctOfRegs: number | null;
+  attendeesPer10kInv: number | null;
+}
+
+export interface WebinarReportFunnelCell {
+  key: string;
+  current: WebinarReportFunnelCellSide;
+  baseline: WebinarReportFunnelCellSide;
+}
+
+export interface WebinarReportScorecardSide {
+  [key: string]: number | null;
+}
+
+export interface WebinarReportPayload {
+  webinarId: string;
+  number: number;
+  variantLabel: string | null;
+  date: string;
+  title: string;
+  generatedAt: string;
+  scorecard: {
+    current: WebinarReportScorecardSide;
+    baselineAll: (WebinarReportScorecardSide & { webinarCount?: number }) | null;
+    baseline4w: (WebinarReportScorecardSide & { webinarCount?: number }) | null;
+  };
+  funnels: Record<
+    string,
+    { cells: WebinarReportFunnelCell[]; baselineWebinarCount: number } | undefined
+  >;
+  bookings: {
+    uniqueBookedContacts?: number;
+    callStatus?: Record<string, number>;
+    quality?: Record<string, number>;
+    rated?: number;
+    impliedCloseRate?: number | null;
+    origin?: Record<string, number>;
+    leadSources?: { source: string; count: number }[];
+  };
+  nonjoiners: Record<string, number | null>;
+  caveats: string[];
+}
+
+export interface ApiWebinarReportStatus {
+  running: boolean;
+  phase: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  last_error: string | null;
+  generated_at: string | null;
+}
+
+export interface ApiWebinarReport {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  payload: WebinarReportPayload | null;
+  insights: { title: string; bullets: string[] }[] | null;
+  insightsModel: string | null;
+  aiError: string | null;
+  generatedAt: string | null;
+  generationMs: number | null;
+  status: ApiWebinarReportStatus;
+}
+
+export async function fetchWebinarReport(
+  webinarId: string,
+  generateIfMissing = true,
+): Promise<ApiWebinarReport> {
+  const res = await fetch(
+    `${API_URL}/statistics/report/${webinarId}?generate_if_missing=${generateIfMissing}`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error(`Failed to fetch report for ${webinarId}`);
+  return res.json();
+}
+
+export async function triggerWebinarReport(webinarId: string): Promise<ApiWebinarReportStatus> {
+  const res = await fetch(`${API_URL}/statistics/report/${webinarId}/generate`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Failed to trigger report for ${webinarId}`);
+  return res.json();
+}
+
+export async function fetchWebinarReportStatus(webinarId: string): Promise<ApiWebinarReportStatus> {
+  const res = await fetch(`${API_URL}/statistics/report/${webinarId}/status`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Failed to fetch report status for ${webinarId}`);
+  return res.json();
+}
+
 /* ── By-bucket funnel (Segments tab) ─────────────────────────────────────── */
 
 export interface SegmentFunnelWebinar {

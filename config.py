@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # Frontend base URL (used for links in outbound emails, e.g. the weekly
+    # report's "open in Webinar Studio" CTA). Set to the deployed frontend URL
+    # in prod.
+    APP_BASE_URL: str = "http://localhost:3000"
+
     # Twilio WhatsApp
     TWILIO_ACCOUNT_SID: str
     TWILIO_AUTH_TOKEN: str

@@ -24,6 +24,7 @@ CLAUDE_PRICING = {
     "claude-sonnet-4-6": {"input_per_mtok": 3.00, "output_per_mtok": 15.00},
     "claude-haiku-4-5-20251001": {"input_per_mtok": 0.80, "output_per_mtok": 4.00},
     "claude-opus-4-6": {"input_per_mtok": 15.00, "output_per_mtok": 75.00},
+    "claude-opus-5": {"input_per_mtok": 5.00, "output_per_mtok": 25.00},
 }
 
 

@@ -1604,6 +1604,19 @@ export function StatisticsPage() {
                       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="8"/><rect x="12" y="6" width="3" height="12"/><rect x="17" y="13" width="3" height="5"/></svg>
                       List dist.
                     </button>
+                    {w.webinarId && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          window.open(`/statistics/report/${w.webinarId}`, "_blank");
+                        }}
+                        title="Open the full per-webinar report — scorecard vs averages, funnel breakdowns, bookings, AI insights"
+                        className="ml-1.5 px-2 py-1 text-[10px] font-semibold rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25 border border-emerald-500/30 transition-colors inline-flex items-center gap-1"
+                      >
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/><path d="M9 11h6"/></svg>
+                        Report
+                      </button>
+                    )}
                   </td>
                   {METRIC_COLUMNS.map((col, idx) => (
                     <MetricCell

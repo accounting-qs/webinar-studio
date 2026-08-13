@@ -970,6 +970,62 @@ async def recompute_status(source: str = "auto"):
     return await snap.get_status(source)
 
 
+# ---------------------------------------------------------------------------
+# Per-webinar report (frozen artifact + AI insights) — see services.webinar_report
+# ---------------------------------------------------------------------------
+
+class WebinarReportStatusResponse(BaseModel):
+    running: bool
+    phase: str | None = None            # "queries" | "ai"
+    started_at: str | None = None
+    finished_at: str | None = None
+    last_error: str | None = None
+    generated_at: str | None = None     # when a stored report exists
+
+
+class WebinarReportResponse(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    payload: dict | None = None
+    insights: list | None = None
+    insightsModel: str | None = None
+    aiError: str | None = None
+    generatedAt: str | None = None
+    generationMs: int | None = None
+    status: WebinarReportStatusResponse
+
+
+@router.get("/report/{webinar_id}", response_model=WebinarReportResponse)
+async def get_webinar_report(webinar_id: str, generate_if_missing: bool = True):
+    """Stored report for a webinar. When none exists and generate_if_missing,
+    generation is scheduled in the background (2–4 min); poll
+    /report/{id}/status and re-fetch when it finishes."""
+    from services import webinar_report as rpt
+
+    report = await rpt.read_report(webinar_id)
+    if report is None and generate_if_missing:
+        rpt.schedule_generate(webinar_id)
+    status = await rpt.get_status(webinar_id)
+    if report is None:
+        return WebinarReportResponse(webinarId=webinar_id, status=status)
+    return WebinarReportResponse(**report, status=status)
+
+
+@router.post("/report/{webinar_id}/generate", response_model=WebinarReportStatusResponse)
+async def trigger_webinar_report(webinar_id: str):
+    """Manual (re)generation. Returns immediately; poll /report/{id}/status."""
+    from services import webinar_report as rpt
+    rpt.schedule_generate(webinar_id)
+    return await rpt.get_status(webinar_id)
+
+
+@router.get("/report/{webinar_id}/status", response_model=WebinarReportStatusResponse)
+async def webinar_report_status(webinar_id: str):
+    from services import webinar_report as rpt
+    return await rpt.get_status(webinar_id)
+
+
 @router.get("/webinars/{webinar_id}", response_model=ApiStatisticsWebinar)
 async def get_statistics_webinar(webinar_id: str, source: str = "auto"):
     """Fully-processed single webinar by webinar_id (the row's UUID, or

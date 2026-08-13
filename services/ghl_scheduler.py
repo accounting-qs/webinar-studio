@@ -27,6 +27,10 @@ WEEKLY_JOB_ID = "ghl_weekly_full_sync"
 DAILY_SALES_JOB_ID = "ghl_daily_sales_sync"
 STALE_SWEEPER_JOB_ID = "ghl_stale_sweeper"
 WEEKLY_REPORT_JOB_ID = "weekly_report_send"
+# Report prep runs 15 minutes before the send so the per-webinar report
+# artifact (2–4 min of heavy SQL + AI insights) is ready when the email goes out.
+WEEKLY_REPORT_PREP_JOB_ID = "weekly_report_prep"
+WEEKLY_REPORT_PREP_LEAD_MINUTES = 15
 
 # How often to scan for sync runs with stale heartbeats and reap them.
 # Cheap query (one indexed scan over status='running') so 2 minutes is fine.
@@ -78,6 +82,23 @@ async def _weekly_report_job() -> None:
             logger.warning("Scheduled weekly report skipped/failed: %s", result.get("error"))
     except Exception as exc:
         logger.error("Scheduled weekly report failed: %s", exc)
+
+
+async def _weekly_report_prep_job() -> None:
+    try:
+        # Lazy import — avoids a scheduler ↔ report-service import cycle.
+        from services import webinar_report
+        wid = await webinar_report.resolve_latest_passed_webinar_id()
+        if not wid:
+            logger.info("Weekly report prep: no passed webinar to report on")
+            return
+        result = await webinar_report.generate_report(wid)
+        if result is None:
+            logger.warning("Weekly report prep: generation failed for %s", wid)
+        else:
+            logger.info("Weekly report prep: report ready for %s", wid)
+    except Exception as exc:
+        logger.error("Weekly report prep failed: %s", exc)
 
 
 async def _wg_auto_sync_job() -> None:
@@ -135,7 +156,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -184,6 +205,36 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
             logger.info(
                 "Registered weekly report %s %02d:%02d %s",
                 rs["day_of_week"], rs["hour_local"], rs["minute_local"], rs["timezone"],
+            )
+
+            # Prep job: generate the per-webinar report artifact 15 minutes
+            # before the send (borrow across the hour/day boundary as needed).
+            prep_minute = int(rs["minute_local"]) - WEEKLY_REPORT_PREP_LEAD_MINUTES
+            prep_hour = int(rs["hour_local"])
+            prep_day = rs["day_of_week"]
+            if prep_minute < 0:
+                prep_minute += 60
+                prep_hour -= 1
+                if prep_hour < 0:
+                    prep_hour = 23
+                    _days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                    prep_day = _days[(_days.index(prep_day) - 1) % 7]
+            scheduler.add_job(
+                _weekly_report_prep_job,
+                trigger=CronTrigger(
+                    day_of_week=prep_day,
+                    hour=prep_hour,
+                    minute=prep_minute,
+                    timezone=rs["timezone"],
+                ),
+                id=WEEKLY_REPORT_PREP_JOB_ID,
+                max_instances=1,
+                misfire_grace_time=3600,
+                replace_existing=True,
+            )
+            logger.info(
+                "Registered weekly report prep %s %02d:%02d %s",
+                prep_day, prep_hour, prep_minute, rs["timezone"],
             )
     except Exception as exc:
         logger.warning("Could not load report settings (skipping weekly report): %s", exc)
