@@ -7,6 +7,7 @@ via PATCH /ghl-sync/settings.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -50,6 +51,25 @@ WG_AUTO_SYNC_INTERVAL_MINUTES = 15
 # US-Central audience, and clear of the Wed 14:00 Chicago report window.
 SNAPSHOT_FULL_REBUILD_JOB_ID = "statistics_snapshot_full_rebuild"
 SNAPSHOT_FULL_REBUILD_HOUR_UTC = 3
+
+# Fixed anchor for interval-based jobs.
+#
+# IntervalTrigger with no start_date defaults to "now + interval", and jobs are
+# re-registered by _apply_settings() on every process start. With a 24h
+# interval that means each restart pushes the next run a full day out, so a
+# service that restarts more than once a day never syncs at all — which is
+# exactly what happened: the incremental sync last completed 2026-08-11 20:16
+# and did not fire again across ~3 days of OOM restarts and deploys, while the
+# Aug 13 opportunities run died mid-flight ("orphaned / process_restart_or_crash").
+#
+# Anchoring to a fixed past instant makes fire times a pure function of the
+# wall clock (anchor + k*interval), so restarts cannot defer them.
+_INTERVAL_ANCHOR = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+# Generous grace so a run that came due while the process was down still
+# executes once it returns, instead of being silently skipped. The 60s default
+# meant any restart near a scheduled fire dropped that run entirely.
+INTERVAL_MISFIRE_GRACE_SECONDS = 3600
 
 _scheduler: AsyncIOScheduler | None = None
 
@@ -283,13 +303,13 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         hours = max(1, int(s["incremental_interval_hours"]))
         scheduler.add_job(
             _incremental_job,
-            trigger=IntervalTrigger(hours=hours),
+            trigger=IntervalTrigger(hours=hours, start_date=_INTERVAL_ANCHOR),
             id=INCREMENTAL_JOB_ID,
             max_instances=1,
-            misfire_grace_time=60,
+            misfire_grace_time=INTERVAL_MISFIRE_GRACE_SECONDS,
             replace_existing=True,
         )
-        logger.info("Registered incremental sync every %dh", hours)
+        logger.info("Registered incremental sync every %dh (anchored)", hours)
 
     if s["weekly_full_enabled"]:
         scheduler.add_job(
