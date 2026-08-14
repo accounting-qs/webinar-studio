@@ -163,10 +163,38 @@ type ReportPayload = NonNullable<ApiWebinarReport["payload"]>;
 export function WebinarReportPage({ webinarId }: { webinarId: string }) {
   const [report, setReport] = useState<ApiWebinarReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [phase, setPhase] = useState<string | null>(null);
   const [view, setView] = useState<"v1" | "v2">("v2");
+  const [webList, setWebList] = useState<ApiStatisticsWebinarSummary[] | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Webinar list once — powers the sidebar and the header label for webinars
+  // whose report doesn't exist yet.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { webinars } = await fetchStatisticsWebinarList("auto");
+        if (cancelled) return;
+        const today = new Date().toISOString().slice(0, 10);
+        setWebList(
+          webinars
+            .filter((w) => w.webinarId && w.date && w.date <= today)
+            .sort(
+              (a, b) =>
+                (b.date ?? "").localeCompare(a.date ?? "") || (b.number ?? 0) - (a.number ?? 0),
+            ),
+        );
+      } catch {
+        setWebList([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const stored = typeof window !== "undefined" ? window.localStorage.getItem("webinarReportView") : null;
@@ -191,17 +219,26 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
 
   const load = useCallback(async () => {
     try {
-      const r = await fetchWebinarReport(webinarId);
+      // Never auto-generate on view: missing reports show a "not generated"
+      // state with an explicit Generate button instead.
+      const r = await fetchWebinarReport(webinarId, false);
       setReport(r);
       setError(null);
+      setLoading(false);
       if (r.payload && !r.status.running) {
         setGenerating(false);
         stopPolling();
         return;
       }
-      setGenerating(true);
-      setPhase(r.status.phase);
+      if (r.status.running) {
+        // A generation is already in flight (prep job / another tab) — follow it.
+        setGenerating(true);
+        setPhase(r.status.phase);
+      } else {
+        setGenerating(false);
+      }
     } catch (e) {
+      setLoading(false);
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [webinarId, stopPolling]);
@@ -226,6 +263,7 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
   useEffect(() => {
     setReport(null);
     setGenerating(false);
+    setLoading(true);
     stopPolling();
     void load();
     return stopPolling;
@@ -249,13 +287,16 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
   };
 
   const payload = report?.payload ?? null;
-  const label = payload
-    ? `W${payload.number}${payload.variantLabel ? ` · ${payload.variantLabel}` : ""}`
-    : "";
+  const activeMeta = webList?.find((w) => w.webinarId === webinarId) ?? null;
+  const headerLabel = payload
+    ? `W${payload.number}${payload.variantLabel ? ` · ${payload.variantLabel}` : ""} — ${payload.date}`
+    : activeMeta
+      ? `W${activeMeta.number}${activeMeta.variantLabel ? ` · ${activeMeta.variantLabel}` : ""} — ${activeMeta.date}`
+      : "Webinar report";
 
   return (
-    <div className="flex max-w-[1400px] mx-auto">
-      <WebinarSidebar activeId={webinarId} />
+    <div className="flex w-full max-w-[1400px] mx-auto">
+      <WebinarSidebar items={webList} activeId={webinarId} />
 
       <div className="flex-1 min-w-0 px-4 py-6 max-w-5xl">
         {/* header */}
@@ -264,13 +305,15 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
             <div className="text-[11px] font-bold uppercase tracking-[0.15em] text-violet-500 mb-1">
               Webinar report
             </div>
-            <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {payload ? `${label} — ${payload.date}` : "Loading report…"}
-            </h1>
-            {report?.generatedAt && (
+            <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">{headerLabel}</h1>
+            {report?.generatedAt ? (
               <p className="text-xs text-zinc-500 mt-1">
                 Generated {new Date(report.generatedAt).toLocaleString()}
                 {report.generationMs != null && ` · ${(report.generationMs / 1000).toFixed(0)}s compute`}
+              </p>
+            ) : (
+              <p className="text-xs text-zinc-500 mt-1">
+                {loading ? "Loading…" : generating ? "Generating…" : "No report generated yet"}
               </p>
             )}
           </div>
@@ -293,7 +336,7 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
             </div>
             <button
               onClick={regenerate}
-              disabled={generating}
+              disabled={generating || loading}
               className="px-3 py-1.5 text-xs font-semibold rounded bg-zinc-500/15 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-500/25 border border-zinc-400/30 transition-colors disabled:opacity-50 inline-flex items-center gap-1.5"
             >
               {generating ? (
@@ -301,8 +344,10 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
                   <span className="w-3 h-3 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
                   {phase === "ai" ? "Writing insights…" : "Crunching numbers…"}
                 </>
-              ) : (
+              ) : payload ? (
                 "Regenerate"
+              ) : (
+                "Generate"
               )}
             </button>
           </div>
@@ -314,15 +359,43 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
           </div>
         )}
 
+        {/* Placeholder states keep the same footprint as a rendered report so
+            switching webinars in the sidebar never reflows the layout. */}
         {!payload && !error && (
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 p-10 text-center">
-            <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
-            <p className="text-sm text-zinc-600 dark:text-zinc-300">
-              Generating this webinar&apos;s report — usually 2–4 minutes.
-            </p>
-            <p className="text-xs text-zinc-500 mt-1">
-              {phase === "ai" ? "Numbers done — writing AI insights…" : "Running the funnel queries…"}
-            </p>
+          <div className="w-full min-h-[60vh] rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 flex items-center justify-center">
+            {loading ? (
+              <div className="text-center">
+                <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                <p className="text-sm text-zinc-500">Loading…</p>
+              </div>
+            ) : generating ? (
+              <div className="text-center">
+                <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                <p className="text-sm text-zinc-600 dark:text-zinc-300">
+                  Generating this webinar&apos;s report — usually 2–4 minutes.
+                </p>
+                <p className="text-xs text-zinc-500 mt-1">
+                  {phase === "ai" ? "Numbers done — writing AI insights…" : "Running the funnel queries…"}
+                </p>
+              </div>
+            ) : (
+              <div className="text-center max-w-sm px-6">
+                <div className="text-3xl mb-2">📄</div>
+                <p className="text-sm font-medium text-zinc-700 dark:text-zinc-200 mb-1">
+                  No report generated yet
+                </p>
+                <p className="text-xs text-zinc-500 mb-4">
+                  Generating crunches the funnel queries and writes AI insights — it takes about
+                  2–4 minutes and the page updates itself when done.
+                </p>
+                <button
+                  onClick={regenerate}
+                  className="px-4 py-2 text-xs font-semibold rounded bg-violet-500/15 text-violet-600 dark:text-violet-300 hover:bg-violet-500/25 border border-violet-500/30 transition-colors"
+                >
+                  Generate report
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -339,31 +412,13 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
 
 /* ── sidebar: webinar switcher ───────────────────────────────────────────── */
 
-function WebinarSidebar({ activeId }: { activeId: string }) {
-  const [items, setItems] = useState<ApiStatisticsWebinarSummary[] | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const { webinars } = await fetchStatisticsWebinarList("auto");
-        if (cancelled) return;
-        const today = new Date().toISOString().slice(0, 10);
-        const list = webinars
-          .filter((w) => w.webinarId && w.date && w.date <= today)
-          .sort((a, b) =>
-            (b.date ?? "").localeCompare(a.date ?? "") || (b.number ?? 0) - (a.number ?? 0),
-          );
-        setItems(list);
-      } catch {
-        setItems([]);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
+function WebinarSidebar({
+  items,
+  activeId,
+}: {
+  items: ApiStatisticsWebinarSummary[] | null;
+  activeId: string;
+}) {
   return (
     <aside className="hidden lg:block w-56 shrink-0 border-r border-zinc-200 dark:border-zinc-800 py-6 pr-2 pl-4">
       <div className="sticky top-16 max-h-[calc(100vh-5rem)] overflow-y-auto pr-2">
