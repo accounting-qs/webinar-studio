@@ -5,6 +5,7 @@ import {
   downloadAssignmentGroupContactsCsv,
   fetchAssignmentContacts,
   fetchAssignmentGroupContacts,
+  fetchWebinarNonjoiners,
   markContactsUsed,
   markGroupContactsUsed,
   releaseContactsById,
@@ -37,8 +38,11 @@ type NormalizedData = {
 };
 
 type ContactsPageProps =
-  | { assignmentId: string; groupAssignmentIds?: undefined; initialTab?: StatusFilter }
-  | { assignmentId?: undefined; groupAssignmentIds: string[]; initialTab?: StatusFilter };
+  | { assignmentId: string; groupAssignmentIds?: undefined; nonjoinerWebinarId?: undefined; initialTab?: StatusFilter }
+  | { assignmentId?: undefined; groupAssignmentIds: string[]; nonjoinerWebinarId?: undefined; initialTab?: StatusFilter }
+  // Derived non-joiner pool for one webinar. Read-only — no memberships behind
+  // it, so status tabs, mark-used and release don't apply.
+  | { assignmentId?: undefined; groupAssignmentIds?: undefined; nonjoinerWebinarId: string; initialTab?: StatusFilter };
 
 /* ─── Main Component ──────────────────────────────────────────────────────── */
 
@@ -51,6 +55,8 @@ export function ContactsPage(props: ContactsPageProps) {
     [props.groupAssignmentIds],
   );
   const isGroup = !!props.groupAssignmentIds;
+  const isNonjoiner = !!props.nonjoinerWebinarId;
+  const [njWindow, setNjWindow] = useState<{ size: number; webinars: number[] } | null>(null);
 
   const [data, setData] = useState<NormalizedData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -68,7 +74,23 @@ export function ContactsPage(props: ContactsPageProps) {
 
   const load = useCallback(async (status: StatusFilter) => {
     try {
-      if (isGroup) {
+      if (isNonjoiner) {
+        const r = await fetchWebinarNonjoiners(props.nonjoinerWebinarId!);
+        setNjWindow(r.window);
+        setData({
+          header: {
+            title: `W${r.assignment.webinar_number} — Nonjoiners`,
+            webinarNumber: r.assignment.webinar_number,
+            webinarDate: r.assignment.webinar_date,
+            volume: r.assignment.volume,
+            fileBase: `W${r.assignment.webinar_number}_nonjoiners`,
+          },
+          contacts: r.contacts,
+          counts: r.counts,
+          filteredTotal: r.contacts.length,
+          hasMore: false,
+        });
+      } else if (isGroup) {
         const ids = groupKey ? groupKey.split(",") : [];
         const r = await fetchAssignmentGroupContacts(ids, status, { limit: GROUP_PAGE_SIZE, offset: 0 });
         const title = r.group.bucket_name
@@ -118,7 +140,7 @@ export function ContactsPage(props: ContactsPageProps) {
     } finally {
       setLoading(false);
     }
-  }, [isGroup, groupKey, props.assignmentId]);
+  }, [isGroup, isNonjoiner, groupKey, props.assignmentId, props.nonjoinerWebinarId]);
 
   const loadMore = useCallback(async () => {
     if (!isGroup || !data || !data.hasMore || loadingMore) return;
@@ -326,7 +348,7 @@ export function ContactsPage(props: ContactsPageProps) {
   if (!data) {
     return (
       <main className="flex-1 bg-zinc-50 dark:bg-zinc-950 min-h-0 flex items-center justify-center">
-        <p className="text-zinc-500">{isGroup ? "Group not found" : "Assignment not found"}</p>
+        <p className="text-zinc-500">{isNonjoiner ? "Webinar not found" : isGroup ? "Group not found" : "Assignment not found"}</p>
       </main>
     );
   }
@@ -353,9 +375,23 @@ export function ContactsPage(props: ContactsPageProps) {
             {header.webinarDate && <span className="text-zinc-300 dark:text-zinc-600">·</span>}
             <span>{header.volume.toLocaleString()} total contacts</span>
           </div>
+          {isNonjoiner && njWindow && (
+            <p className="mt-2 text-xs text-zinc-500 max-w-[70ch]">
+              Registered within {njWindow.webinars.length > 0
+                ? `W${njWindow.webinars[njWindow.webinars.length - 1]}–W${njWindow.webinars[0]}`
+                : "the last webinars"}{" "}
+              and no-showed their most recent registration (live, replay or any viewing
+              minutes count as joining). Each new registration restarts the budget; after{" "}
+              {njWindow.size} invites without re-registering, a non-joiner drops out.
+              Removed permanently: blocklisted, unsubscribed, already-planned, and
+              converted contacts (booked a call, won or disqualified).
+            </p>
+          )}
         </div>
 
         {/* ── Status Filter ─────────────────────────────────────────── */}
+        {/* Non-joiners have no membership status — nothing to filter by. */}
+        {!isNonjoiner && (
         <div className="flex items-center gap-2 mb-4">
           {(["assigned", "used", "all"] as StatusFilter[]).map((s) => {
             const label = s === "all" ? "All" : s.charAt(0).toUpperCase() + s.slice(1);
@@ -380,6 +416,7 @@ export function ContactsPage(props: ContactsPageProps) {
             );
           })}
         </div>
+        )}
 
         {/* ── Action Bar ────────────────────────────────────────────── */}
         <div className="flex items-center gap-3 mb-4 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800/40 rounded-xl px-4 py-3 shadow-sm">
@@ -473,7 +510,8 @@ export function ContactsPage(props: ContactsPageProps) {
             </button>
           )}
 
-          {selectedIds.size > 0 && (
+          {/* Release needs membership rows; the non-joiner pool has none. */}
+          {selectedIds.size > 0 && !isNonjoiner && (
             <button
               onClick={handleRelease}
               disabled={releasing}

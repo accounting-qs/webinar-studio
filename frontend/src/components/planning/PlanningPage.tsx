@@ -3365,6 +3365,49 @@ export function PlanningPage() {
 
                     const nodes: ReactNode[] = [];
 
+                    // 0) Non-joiners — pinned at the very top. Not an assignment
+                    // row: the pool is derived from the last 6 webinars'
+                    // registrations (services/nonjoiners.py) and never claimed
+                    // into memberships, so there's nothing to select, size or
+                    // set up here — just a link to open the contact list the
+                    // same way as any other list.
+                    nodes.push(
+                      <tr key={`nonjoiners-${w.id}`} className="border-b border-zinc-200 dark:border-zinc-800/20 bg-amber-50/60 dark:bg-amber-500/[0.04]">
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-1 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5 max-w-[160px]">
+                          <span className="text-amber-700 dark:text-amber-500/90 font-semibold truncate block" title="Registrants of the last 6 webinars who no-showed their most recent registration">
+                            Nonjoiners
+                          </span>
+                        </td>
+                        <td className="px-2 py-1.5">
+                          <span className="text-zinc-500 text-[10px]">last 6 webinars</span>
+                        </td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5 text-right font-mono">
+                          <a
+                            href={`/contacts/nonjoiners?webinar=${w.id}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            title="Open the non-joiner contact list for this webinar"
+                            className="text-amber-600 dark:text-amber-500 hover:text-amber-500 dark:hover:text-amber-400 underline underline-offset-2 decoration-amber-500/30 hover:decoration-amber-400/50 transition-colors"
+                          >
+                            View
+                          </a>
+                        </td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                        <td className="px-2 py-1.5"></td>
+                      </tr>
+                    );
+
                     // 1) Multi-list bucket groups (bucket-name as header)
                     for (const g of multiListGroups) {
                       const { header, collapsed, lists } = renderBucketGroup(g);

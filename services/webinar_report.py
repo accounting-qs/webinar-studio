@@ -9,9 +9,8 @@ A report is a frozen JSONB payload per webinar variant:
   - bookings deep-dive: unique booked contacts (webinar_booking_attribution
     deduped by ghl_contact_id — a rebooked contact counts once), call status,
     lead-quality mix, implied close rate, booking origin cohorts, lead sources,
-  - non-joiner package using the operational 6-webinar pool definition
-    (registered in any of the last 6 webinars' broadcasts, never watched live
-    in that window, minus this webinar's planned emails),
+  - non-joiner package using the shared 6-webinar pool definition
+    (services/nonjoiners.py),
   - data caveats.
 
 Generation runs in the background (2–4 min of heavy SQL) mirroring
@@ -32,6 +31,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from services.nonjoiners import NONJOINER_WINDOW, nonjoiner_pool_emails
+
 logger = logging.getLogger(__name__)
 
 REPORT_MODEL = "claude-opus-5"
@@ -42,8 +43,8 @@ INSIGHTS_EFFORT = "medium"
 INSIGHTS_TIMEOUT_SECONDS = 240.0
 # Funnel baselines pool the last N passed webinars before the current one.
 BASELINE_WINDOW = 10
-# Non-joiner pool = registrants of the last N webinars who never watched live.
-NONJOINER_WINDOW = 6
+# Non-joiner pool definition (NONJOINER_WINDOW) is shared with the Statistics
+# page — see services/nonjoiners.py.
 # Lloyd's close rates by lead quality (implied close rate weighting).
 CLOSE_RATES = {"great": 0.25, "ok": 0.13, "barely": 0.05}
 
@@ -507,38 +508,19 @@ async def _fetch_regs(webinar_id: str, broadcast_id: str) -> list[dict[str, Any]
     ]
 
 
-async def _fetch_nonjoiner_pool(webinar_id: str, number: int) -> set[str]:
-    """Emails registered in any of the last NONJOINER_WINDOW webinars'
-    broadcasts, never watched live in that window, minus this webinar's
-    planned emails."""
+async def _fetch_nonjoiner_pool(webinar_id: str) -> set[str]:
+    """This webinar's non-joiner pool — see services/nonjoiners.py.
+
+    Shares its definition with the Statistics page, so the report's non-joiner
+    split and the Nonjoiners row now agree by construction.
+    """
     from sqlalchemy import text as sa_text
     from db.session import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
         await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
         await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
-        rows = (await db.execute(sa_text("""
-            WITH win AS (
-                SELECT DISTINCT broadcast_id FROM webinars
-                WHERE number < :n AND number >= :n - :w AND broadcast_id IS NOT NULL
-            ),
-            pool AS (
-                SELECT LOWER(email) AS email
-                FROM webinargeek_subscribers
-                WHERE broadcast_id IN (SELECT broadcast_id FROM win)
-                  AND email IS NOT NULL
-                GROUP BY 1
-                HAVING bool_and(watched_live IS NOT TRUE)
-            )
-            SELECT p.email FROM pool p
-            WHERE NOT EXISTS (
-                SELECT 1 FROM contacts c
-                JOIN webinar_contact_memberships m ON m.contact_id = c.id
-                WHERE m.webinar_id = CAST(:wid AS uuid)
-                  AND LOWER(c.email) = p.email
-            )
-        """).bindparams(n=number, w=NONJOINER_WINDOW, wid=webinar_id))).all()
-    return {r[0] for r in rows}
+        return set(await nonjoiner_pool_emails(db, webinar_id))
 
 
 async def _fetch_bookers(webinar_id: str) -> list[dict[str, Any]]:
@@ -672,7 +654,7 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
             caveats.append(f"Registrant classification unavailable: {str(exc)[:120]}")
             logger.warning("webinar_report: regs fetch failed: %s", exc)
         try:
-            pool = await _fetch_nonjoiner_pool(webinar_id, number)
+            pool = await _fetch_nonjoiner_pool(webinar_id)
         except Exception as exc:
             caveats.append(f"Non-joiner pool unavailable: {str(exc)[:120]}")
             logger.warning("webinar_report: NJ pool failed: %s", exc)
@@ -825,9 +807,9 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
     # -- Standing caveats --------------------------------------------------
     caveats.extend([
         "Bookings = unique booked contacts from the booking-attribution layer (a rebooked contact counts once); the stats page's Sales columns use GHL opportunity counting and can differ.",
-        f"Non-joiners here use the operational {NONJOINER_WINDOW}-webinar pool definition; the stats page derives them from the previous webinar only, so its split differs.",
+        f"Non-joiners = registrants of the last {NONJOINER_WINDOW} aired webinars whose most recent registration in that window was a no-show (live, replay or any viewing minutes count as joining). Re-registering restarts the {NONJOINER_WINDOW}-invite budget; blocklisted, unsubscribed, already-planned and converted contacts (booked / won / disqualified) are removed permanently.",
         "Registration/attendance counted as distinct emails per broadcast; WebinarGeek parent totals can differ by ~1–3%.",
-        "Scorecard baseline cohort splits (net-new vs non-joiner) come from statistics snapshots, which still use the previous-webinar non-joiner definition.",
+        "Scorecard baseline cohort splits (net-new vs non-joiner) come from statistics snapshots; snapshots taken before the 6-webinar non-joiner definition landed still carry the old previous-webinar-only split until recomputed.",
     ])
     computed_ms = int((time.monotonic() - t0) * 1000)
 

@@ -26,6 +26,9 @@ from db.models import (
     Contact, WebinarContactMembership, WebinarListExportJob,
 )
 from db.session import AsyncSessionLocal, get_db
+from services.nonjoiners import (
+    NONJOINER_WINDOW, nonjoiner_pool_emails, window_webinar_numbers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,10 @@ router = APIRouter()
 
 # Keep references so detached background tasks aren't garbage-collected
 _active_export_tasks: dict[str, asyncio.Task] = {}
+
+# List name the derived non-joiner pool ships under, in the viewer and the
+# export CSV. Not stored on the assignment row — that row is only a flag.
+NONJOINER_LIST_NAME = "Nonjoiners"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1067,6 +1074,94 @@ async def get_assignment_contacts(
     }
 
 
+@router.get("/webinars/{webinar_id}/nonjoiners")
+async def get_webinar_nonjoiners(
+    webinar_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """This webinar's non-joiner pool, shaped like the assignment contacts
+    viewer so the Planning contact-list modal can render it unchanged.
+
+    Read-only: the pool is derived from WebinarGeek registrations
+    (services/nonjoiners.py) and never materialised into memberships, so there
+    is nothing to claim, release or mark used here. Names come from our own
+    contacts row when we have one and fall back to what WebinarGeek captured.
+    """
+    webinar = (await db.execute(
+        select(Webinar).where(Webinar.id == webinar_id, Webinar.user_id == LLOYD_USER_ID)
+    )).scalar_one_or_none()
+    if not webinar:
+        raise HTTPException(404, "Webinar not found")
+
+    # The heavy scan is over webinargeek_subscribers probing contacts by email —
+    # nested loops win, and this can outrun the default request-path timeout on
+    # a full six-webinar window.
+    await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
+    await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+
+    numbers = await window_webinar_numbers(db, webinar_id)
+    emails = await nonjoiner_pool_emails(db, webinar_id)
+
+    contacts: list[dict] = []
+    if emails:
+        rows = (await db.execute(sa_text("""
+            WITH pool AS (
+                SELECT email FROM UNNEST(CAST(:emails AS text[])) AS t(email)
+            ),
+            wg AS (
+                SELECT DISTINCT ON (LOWER(s.email))
+                       LOWER(s.email) AS email, s.first_name, s.last_name, s.company
+                FROM webinargeek_subscribers s
+                JOIN pool p ON p.email = LOWER(s.email)
+                ORDER BY LOWER(s.email), s.subscribed_at DESC NULLS LAST
+            )
+            SELECT p.email,
+                   c.id AS contact_id,
+                   COALESCE(c.first_name, wg.first_name) AS first_name,
+                   COALESCE(c.last_name, wg.last_name)   AS last_name,
+                   wg.company                            AS company
+            FROM pool p
+            LEFT JOIN contacts c
+                   ON LOWER(c.email) = p.email AND c.user_id = CAST(:uid AS uuid)
+            LEFT JOIN wg ON wg.email = p.email
+            ORDER BY p.email
+        """).bindparams(emails=emails, uid=LLOYD_USER_ID))).mappings().all()
+        contacts = [
+            {
+                # Email is the identity here: the pool is derived from
+                # WebinarGeek, so a member may have no contacts row at all and
+                # the viewer keys selection off `id`.
+                "id": r["email"],
+                "contact_id": str(r["contact_id"]) if r["contact_id"] else None,
+                "email": r["email"],
+                "first_name": r["first_name"],
+                "last_name": r["last_name"],
+                "company": r["company"],
+                "outreach_status": "nonjoiner",
+                "used_at": None,
+            }
+            for r in rows
+        ]
+
+    total = len(contacts)
+    return {
+        "assignment": {
+            "id": None,
+            "bucket_name": None,
+            "list_name": NONJOINER_LIST_NAME,
+            "webinar_number": webinar.number,
+            "webinar_date": webinar.date.isoformat() if webinar.date else None,
+            "volume": total,
+            "volume_raw": total,
+            "blocklisted_total": 0,
+        },
+        "contacts": contacts,
+        "counts": {"assigned": total, "used": 0, "total": total},
+        "window": {"size": NONJOINER_WINDOW, "webinars": numbers},
+    }
+
+
 class MarkUsedRequest(BaseModel):
     contact_ids: list[str]
 
@@ -1507,6 +1602,23 @@ async def _run_webinar_list_export_job(job_id: str) -> None:
                         continue
                     writer.writerow([email, list_name_by_aid.get(aid, "")])
                     total += 1
+
+            # Non-joiners ride along as their own named block. They're derived
+            # from the last 6 webinars' registrations rather than claimed into
+            # memberships, so the assignment stream above can't produce them —
+            # but they are a real send list, and the Planning page shows them on
+            # every webinar, so the export carries them for every webinar too.
+            # A failed pool must not sink the whole export.
+            try:
+                await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
+                await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+                for nj_email in await nonjoiner_pool_emails(db, job.webinar_id):
+                    writer.writerow([nj_email, NONJOINER_LIST_NAME])
+                    total += 1
+            except Exception:
+                logger.exception(
+                    "Webinar list export job %s: non-joiner pool failed", job_id
+                )
 
             job.csv_content = buf.getvalue()
             job.contact_count = total

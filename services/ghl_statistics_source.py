@@ -28,6 +28,7 @@ from db.models import (
     WebinarContactMembership, WebinarGeekSubscriber, WebinarListAssignment,
 )
 from db.session import AsyncSessionLocal
+from services.nonjoiners import nonjoiner_pool_emails
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +54,13 @@ LEAD_QUALITY_BAD_DQ = "Bad / DQ"
 # Qualified = any lead_quality except DQ (per user: qualified = shows with a non-DQ quality)
 QUALIFIED_SET = {LEAD_QUALITY_GREAT, LEAD_QUALITY_OK, LEAD_QUALITY_BARELY}
 
-# Reusable CTE turning the :nj_emails bind (a text[] of nonjoiner emails) into a
-# small joinable relation, so semi/anti-joins against it compile to hash joins
-# instead of per-row array scans.
-NJ_EMAILS_CTE = "nj_emails_cte AS (SELECT DISTINCT e AS email FROM UNNEST(CAST(:nj_emails AS text[])) AS e)"
+# Reusable CTE exposing the nonjoiner email set as a small joinable relation, so
+# semi/anti-joins against it compile to hash joins instead of per-row array
+# scans. Backed by the tmp_nj_emails session temp table filled in
+# _synthetic_special_rows: since the pool became the 6-webinar window it runs
+# ~9k emails rather than ~2k, and re-sending that as a text[] bind into all five
+# statements below cost more than the 120s prod cap could absorb.
+NJ_EMAILS_CTE = "nj_emails_cte AS (SELECT email FROM tmp_nj_emails)"
 
 
 # ---------------------------------------------------------------------------
@@ -875,9 +879,14 @@ class GoHighLevelStatisticsSource:
     ) -> list[dict[str, Any]]:
         """Build synthetic Nonjoiners + No List Data rows for this webinar.
 
-        - Nonjoiners: GHL contacts whose calendar_webinar_series_non_joiners
-          (or the narrower `_prefix_non_joiners`) contains eN, counted at
-          webinar level. Always shown (value may be 0).
+        - Nonjoiners: the shared pool from services/nonjoiners.py — registrants
+          of the last 6 aired webinars whose most recent registration was a
+          no-show, minus permanent exits (blocklist, converted contacts) and
+          this webinar's planned contacts. Always shown (value may be 0).
+          Falls back to the GHL `calendar_webinar_series_non_joiners` field only
+          when the window resolves to nothing. Deliberately the SAME set the
+          Planning viewer and export CSV hand to the assistants, so what we
+          report on is exactly who we invited.
         - No List Data: contacts with any webinar-N signal (invite_response,
           non-joiners, booked_call=N, registration_number=N, self-reg in
           window) whose email is NOT in any Planning assignment for this
@@ -941,56 +950,48 @@ class GoHighLevelStatisticsSource:
             ), {"pwid": _pwid})
 
         # ── Nonjoiners ────────────────────────────────────────────────
-        # If this webinar links to a previous one (nonjoiner_source_webinar_id),
-        # Nonjoiners = that webinar's WebinarGeek broadcast registrants who did
-        # NOT watch live (registered no-shows). Otherwise fall back to the GHL
-        # nonjoiner custom fields. Either way we materialise the actual *email
-        # set* (not just a count) so we can match the cohort against this
-        # webinar's broadcast + opportunities and show attendance/sales for it,
-        # and carve it out of NO LIST DATA below so each contact is counted
-        # once. Precedence: planned > nonjoiner (planned emails are excluded).
-        if w.nonjoiner_source_webinar_id:
-            src_bid = (await db.execute(sa_text(
-                "SELECT broadcast_id FROM webinars WHERE id = CAST(:sid AS uuid)"
-            ).bindparams(sid=w.nonjoiner_source_webinar_id))).scalar()
-            if src_bid:
-                nj_source_sql = """
-                    SELECT DISTINCT LOWER(email) AS email
-                    FROM webinargeek_subscribers
-                    WHERE broadcast_id = :nj_src_bid AND watched_live IS NOT TRUE
-                      AND email IS NOT NULL
-                """
-                nj_source_params: dict[str, Any] = {"nj_src_bid": src_bid}
-            else:
-                nj_source_sql = "SELECT NULL::text AS email WHERE FALSE"
-                nj_source_params = {}
-        else:
-            nj_source_sql = """
-                SELECT DISTINCT LOWER(email) AS email
-                FROM ghl_contact
-                WHERE (calendar_webinar_series_non_joiners ~* :nj_src_re
-                       OR calendar_invite_response_prefix_non_joiners ~* :nj_src_re)
-                  AND email IS NOT NULL
-            """
-            nj_source_params = {"nj_src_re": series_nj_re}
-
-        # Materialise the nonjoiner email set, minus any email already on a
-        # planned list for this webinar (or its sibling variants).
-        nj_emails_rows = await db.execute(sa_text(f"""
-            WITH nj_src AS (
-                {nj_source_sql}
-            ),
-            nj_planned AS (
-                -- pre-materialized session temp table (chunked fill above)
-                SELECT email FROM tmp_nld_planned
-            )
-            SELECT s.email
-            FROM nj_src s
-            LEFT JOIN nj_planned p ON p.email = s.email
-            WHERE p.email IS NULL
-        """).bindparams(**nj_source_params))
-        nonjoiner_emails: list[str] = [r[0] for r in nj_emails_rows.all() if r[0]]
+        # Nonjoiners = registrants of the LAST SIX webinars who never joined any
+        # of them — see services/nonjoiners.py for the full rule. We materialise
+        # the actual *email set* (not just a count) so we can match the cohort
+        # against this webinar's broadcast + opportunities and show
+        # attendance/sales for it, and carve it out of NO LIST DATA below so each
+        # contact is counted once. Precedence: planned > nonjoiner, enforced by
+        # passing the already-filled tmp_nld_planned as the planned exclusion
+        # (it spans this webinar AND its sibling variants).
+        nonjoiner_emails = await nonjoiner_pool_emails(
+            db, wid,
+            planned_sql="SELECT 1 FROM tmp_nld_planned t WHERE t.email = p.email",
+        )
+        if not nonjoiner_emails:
+            # No usable window (e.g. the earliest webinar, or no broadcasts
+            # linked yet) — fall back to the GHL nonjoiner custom fields so a
+            # webinar with GHL-tagged nonjoiners still reports them.
+            nj_emails_rows = await db.execute(sa_text("""
+                SELECT DISTINCT LOWER(g.email) AS email
+                FROM ghl_contact g
+                LEFT JOIN tmp_nld_planned t ON t.email = LOWER(g.email)
+                WHERE (g.calendar_webinar_series_non_joiners ~* :nj_src_re
+                       OR g.calendar_invite_response_prefix_non_joiners ~* :nj_src_re)
+                  AND g.email IS NOT NULL AND t.email IS NULL
+            """).bindparams(nj_src_re=series_nj_re))
+            nonjoiner_emails = [r[0] for r in nj_emails_rows.all() if r[0]]
         nj_count = len(nonjoiner_emails)
+
+        # Publish the cohort to the session temp table backing NJ_EMAILS_CTE.
+        # IF NOT EXISTS + TRUNCATE (never DROP) keeps the OID stable for this
+        # pooled connection so asyncpg's prepared statements survive a full
+        # multi-webinar recompute — same contract as tmp_nld_planned above.
+        await db.execute(sa_text(
+            "CREATE TEMP TABLE IF NOT EXISTS tmp_nj_emails "
+            "(email text PRIMARY KEY) ON COMMIT PRESERVE ROWS"))
+        await db.execute(sa_text("TRUNCATE tmp_nj_emails"))
+        for _i in range(0, len(nonjoiner_emails), 5000):
+            await db.execute(sa_text(
+                "INSERT INTO tmp_nj_emails "
+                "SELECT DISTINCT e FROM UNNEST(CAST(:emails AS text[])) AS e "
+                "ON CONFLICT (email) DO NOTHING"
+            ).bindparams(emails=nonjoiner_emails[_i:_i + 5000]))
+        await db.execute(sa_text("ANALYZE tmp_nj_emails"))
 
         # Nonjoiners row metrics. invited = the full nonjoiner pool (rates fall
         # back to it since actuallyUsed is None); self-reg has no data for them.
@@ -1020,7 +1021,7 @@ class GoHighLevelStatisticsSource:
         if nonjoiner_emails and broadcast_id:
             ATT = "(wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)"
             wg_att_params: dict[str, Any] = {
-                "bid": broadcast_id, "nj_emails": nonjoiner_emails, "wid": wid,
+                "bid": broadcast_id, "wid": wid,
             }
             if has_window:
                 wg_att_params["sr_start"] = prev_date
@@ -1089,7 +1090,7 @@ class GoHighLevelStatisticsSource:
                 LEFT JOIN njcsv c ON c.email = njx.email
                 WHERE (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
             """).bindparams(
-                nj_emails=nonjoiner_emails, N=N, wid=wid,
+                N=N, wid=wid,
                 now_ts=datetime.now(timezone.utc),
                 won_stage=DEAL_WON_STAGE_ID,
                 dq_stage=DISQUALIFIED_STAGE_ID,
@@ -1121,7 +1122,7 @@ class GoHighLevelStatisticsSource:
         # Self-Reg marked (GHL form-date in window) for the cohort. These don't
         # need a broadcast, so they run whenever the cohort exists.
         if nonjoiner_emails:
-            marked_params: dict[str, Any] = {"nj_emails": nonjoiner_emails, "wid": wid}
+            marked_params: dict[str, Any] = {"wid": wid}
             if has_window:
                 marked_params["sr_start"] = prev_date
                 marked_params["sr_end"] = current_date
@@ -1244,7 +1245,6 @@ class GoHighLevelStatisticsSource:
         # attributed to the Nonjoiners row aren't double-counted here (each
         # contact lands in exactly one of planned / nonjoiners / NLD).
         if nonjoiner_emails:
-            nld_params["nj_emails"] = nonjoiner_emails
             nj_cte_sql = NJ_EMAILS_CTE + ","
             nj_join_sql = "LEFT JOIN nj_emails_cte njx ON njx.email = r.lem"
             nj_filter_sql = "AND njx.email IS NULL"
@@ -1352,7 +1352,6 @@ class GoHighLevelStatisticsSource:
             # Exclude nonjoiner attendees here too — their attendance is shown
             # on the Nonjoiners row, so it must not also count in NLD.
             if nonjoiner_emails:
-                wg_nld_params["nj_emails"] = nonjoiner_emails
                 wg_nj_cte_sql = NJ_EMAILS_CTE + ","
                 wg_nj_join_sql = "LEFT JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)"
                 wg_nj_filter_sql = "AND njx.email IS NULL"

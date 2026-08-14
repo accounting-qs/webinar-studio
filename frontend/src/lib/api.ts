@@ -1329,13 +1329,18 @@ export interface ApiContact {
   id: string;
   email: string;
   first_name: string | null;
-  outreach_status: "assigned" | "used";
+  // "nonjoiner" only in the derived non-joiner pool, which has no membership
+  // rows behind it and so can't be marked used or released.
+  outreach_status: "assigned" | "used" | "nonjoiner";
   used_at: string | null;
+  last_name?: string | null;
+  company?: string | null;
+  contact_id?: string | null;
 }
 
 export interface AssignmentContactsResponse {
   assignment: {
-    id: string;
+    id: string | null;
     bucket_name: string | null;
     list_name: string | null;
     webinar_number: number | null;
@@ -1354,6 +1359,26 @@ export async function fetchAssignmentContacts(
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to fetch contacts");
+  return res.json();
+}
+
+/**
+ * A webinar's derived non-joiner pool — registrants of the last 6 webinars who
+ * never joined any of them. Read-only: these are not claimed memberships, so
+ * `id` is the email (a member may have no contacts row) and there is nothing to
+ * mark used or release.
+ */
+export interface WebinarNonjoinersResponse extends AssignmentContactsResponse {
+  window: { size: number; webinars: number[] };
+}
+
+export async function fetchWebinarNonjoiners(
+  webinarId: string
+): Promise<WebinarNonjoinersResponse> {
+  const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}/nonjoiners`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch non-joiners");
   return res.json();
 }
 

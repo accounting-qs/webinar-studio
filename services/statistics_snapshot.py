@@ -316,7 +316,14 @@ def schedule_recompute_for_number(webinar_number: int, source: str = "auto") -> 
 
 
 def schedule_recompute_for_broadcast(broadcast_id: str | None, source: str = "auto") -> None:
-    """Recompute every webinar linked to a WebinarGeek broadcast id."""
+    """Recompute every webinar linked to a WebinarGeek broadcast id — plus the
+    webinars that read this one as a non-joiner source.
+
+    A broadcast's registrations/attendance feed the non-joiner pool of the next
+    NONJOINER_WINDOW webinars (services/nonjoiners.py), so re-syncing W150 also
+    changes W151-W156's Nonjoiners rows. Without the successor sweep those
+    snapshots keep stale pool sizes until something else happens to touch them.
+    """
     if not broadcast_id:
         return
 
@@ -324,12 +331,25 @@ def schedule_recompute_for_broadcast(broadcast_id: str | None, source: str = "au
         from sqlalchemy import select
         from db.models import Webinar
         from db.session import AsyncSessionLocal
+        from services.nonjoiners import NONJOINER_WINDOW
         async with AsyncSessionLocal() as db:
-            ids = (await db.execute(
-                select(Webinar.id).where(Webinar.broadcast_id == broadcast_id)
-            )).scalars().all()
+            rows = (await db.execute(
+                select(Webinar.id, Webinar.user_id, Webinar.number)
+                .where(Webinar.broadcast_id == broadcast_id)
+            )).all()
+            ids = [r[0] for r in rows]
+            for _id, uid, num in rows:
+                if num is None:
+                    continue
+                ids.extend((await db.execute(
+                    select(Webinar.id).where(
+                        Webinar.user_id == uid,
+                        Webinar.number > num,
+                        Webinar.number <= num + NONJOINER_WINDOW,
+                    )
+                )).scalars().all())
         if ids:
-            await recompute(list(ids), source=source)
+            await recompute(list(dict.fromkeys(ids)), source=source)
 
     _spawn(f"bcast:{_snap_source(source)}:{broadcast_id}", _run)
 
