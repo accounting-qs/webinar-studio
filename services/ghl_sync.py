@@ -28,7 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 
 from db.models import (
-    BlocklistEntry, GHLAppointment, GHLCalendar, GHLContact, GHLOpportunity,
+    BlocklistEntry, GHLAppointment, GHLCalendar, GHLContact,
+    GHLContactCustomFields, GHLOpportunity, GHLOpportunityCustomFields,
     GHLSyncRun, GHLSyncSettings, GHLWebinarStats,
 )
 from db.session import AsyncSessionLocal
@@ -251,16 +252,55 @@ async def _fetch_users_map(client: GHLClient, state: "_SyncState") -> dict[str, 
         return {}
 
 
+def _split_custom_fields(rows: list[dict], key: str) -> list[dict]:
+    """Pop raw_custom_fields off each parent row, returning side-table rows.
+
+    Mutates `rows` in place so the parent upsert never carries the blob. Keeping
+    it out of ghl_contact/ghl_opportunity is the whole point of migration 070 —
+    it averaged ~1 KB/row and mostly sat in-line, so it widened every page the
+    statistics scans had to read.
+    """
+    side: list[dict] = []
+    for r in rows:
+        blob = r.pop("raw_custom_fields", None)
+        if blob and r.get(key):
+            side.append({key: r[key], "raw_custom_fields": blob})
+    return side
+
+
+async def _upsert_custom_fields(
+    db: AsyncSession, model, key: str, rows: list[dict]
+) -> None:
+    """Upsert the split-off custom-field blobs. Best-effort: this payload has no
+    readers, so a failure here must never abort a sync that is otherwise fine."""
+    if not rows:
+        return
+    try:
+        stmt = pg_insert(model).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[key],
+            set_={
+                "raw_custom_fields": stmt.excluded.raw_custom_fields,
+                "updated_at": func.now(),
+            },
+        )
+        await db.execute(stmt)
+    except Exception as exc:
+        logger.warning("Failed to upsert %s batch: %s", model.__tablename__, exc)
+
+
 async def _upsert_contacts_batch(db: AsyncSession, rows: list[dict]) -> None:
     """Batch upsert many contacts in a single round-trip."""
     if not rows:
         return
+    cf_rows = _split_custom_fields(rows, "ghl_contact_id")
     stmt = pg_insert(GHLContact).values(rows)
     update_cols = {k: getattr(stmt.excluded, k) for k in rows[0].keys() if k != "ghl_contact_id"}
     stmt = stmt.on_conflict_do_update(
         index_elements=["ghl_contact_id"], set_=update_cols,
     )
     await db.execute(stmt)
+    await _upsert_custom_fields(db, GHLContactCustomFields, "ghl_contact_id", cf_rows)
     await _upsert_blocklist_from_ghl_batch(db, rows)
 
 
@@ -295,12 +335,14 @@ async def _upsert_blocklist_from_ghl_batch(db: AsyncSession, rows: list[dict]) -
 async def _upsert_opps_batch(db: AsyncSession, rows: list[dict]) -> None:
     if not rows:
         return
+    cf_rows = _split_custom_fields(rows, "ghl_opportunity_id")
     stmt = pg_insert(GHLOpportunity).values(rows)
     update_cols = {k: getattr(stmt.excluded, k) for k in rows[0].keys() if k != "ghl_opportunity_id"}
     stmt = stmt.on_conflict_do_update(
         index_elements=["ghl_opportunity_id"], set_=update_cols,
     )
     await db.execute(stmt)
+    await _upsert_custom_fields(db, GHLOpportunityCustomFields, "ghl_opportunity_id", cf_rows)
 
 
 # ---------------------------------------------------------------------------

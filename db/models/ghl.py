@@ -47,7 +47,7 @@ class GHLContact(Base):
     registration_campaign_name: Mapped[Optional[str]] = mapped_column(Text)
 
     tags: Mapped[Optional[list]] = mapped_column(JSONB)
-    raw_custom_fields: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # raw_custom_fields lives in GHLContactCustomFields — see migration 070.
 
     created_at_ghl: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     updated_at_ghl: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -91,7 +91,7 @@ class GHLOpportunity(Base):
     projected_deal_size_option: Mapped[Optional[str]] = mapped_column(Text)
     projected_deal_size_value: Mapped[Optional[int]] = mapped_column(Integer)
 
-    raw_custom_fields: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # raw_custom_fields lives in GHLOpportunityCustomFields — see migration 070.
     created_at_ghl: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     updated_at_ghl: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -102,6 +102,31 @@ class GHLOpportunity(Base):
         Index("ix_ghl_opp_stage", "pipeline_stage_id"),
         Index("ix_ghl_opp_lead_quality", "lead_quality"),
     )
+
+
+class GHLContactCustomFields(Base):
+    """GHL's raw custom-field blob for a contact, split out of ghl_contact.
+
+    Nothing reads this today — it is captured so the raw GHL payload is never
+    lost — but it averaged ~1 KB per row and mostly sat in-line, which made
+    every statistics scan of ghl_contact read far more pages than it needed.
+    Keeping it 1:1 in its own table preserves the data while taking it off the
+    hot path. See migration 070.
+    """
+    __tablename__ = "ghl_contact_custom_fields"
+
+    ghl_contact_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    raw_custom_fields: Mapped[Optional[dict]] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GHLOpportunityCustomFields(Base):
+    """Opportunity counterpart of GHLContactCustomFields — see migration 070."""
+    __tablename__ = "ghl_opportunity_custom_fields"
+
+    ghl_opportunity_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    raw_custom_fields: Mapped[Optional[dict]] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class GHLCalendar(Base):
