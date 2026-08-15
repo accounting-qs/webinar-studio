@@ -1766,11 +1766,17 @@ export interface WebinarReportPayload {
 
 export interface ApiWebinarReportStatus {
   running: boolean;
+  /** Durable request marker — a restart-killed generation is retried by the
+   * backend sweep within ~2 minutes while this stays true. */
+  queued: boolean;
   phase: string | null;
   started_at: string | null;
   finished_at: string | null;
   last_error: string | null;
+  attempts: number;
   generated_at: string | null;
+  /** Average generation time across stored reports (ms) — used for the ETA. */
+  typical_ms: number | null;
 }
 
 export interface ApiWebinarReport {

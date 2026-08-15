@@ -43,6 +43,8 @@ INSIGHTS_EFFORT = "medium"
 INSIGHTS_TIMEOUT_SECONDS = 240.0
 # Funnel baselines pool the last N passed webinars before the current one.
 BASELINE_WINDOW = 10
+# Give up retrying a durably-requested generation after this many failures.
+MAX_GENERATION_ATTEMPTS = 5
 # Non-joiner pool definition (NONJOINER_WINDOW) is shared with the Statistics
 # page — see services/nonjoiners.py.
 # Lloyd's close rates by lead quality (implied close rate weighting).
@@ -74,11 +76,15 @@ _status: dict[str, Any] = {
 
 
 async def get_status(webinar_id: str) -> dict[str, Any]:
-    from sqlalchemy import select
-    from db.models import WebinarReport
+    from sqlalchemy import func as sa_func, select
+    from db.models import WebinarReport, WebinarReportRequest
     from db.session import AsyncSessionLocal
 
     generated_at = None
+    typical_ms = None
+    queued = False
+    queue_error = None
+    queue_attempts = 0
     try:
         async with AsyncSessionLocal() as db:
             r = await db.execute(
@@ -86,6 +92,18 @@ async def get_status(webinar_id: str) -> dict[str, Any]:
             )
             row = r.scalar_one_or_none()
             generated_at = row.isoformat() if row else None
+            # Typical duration across recent reports → frontend ETA.
+            typical_ms = (await db.execute(
+                select(sa_func.avg(WebinarReport.generation_ms))
+                .where(WebinarReport.generation_ms.isnot(None))
+            )).scalar_one_or_none()
+            req = (await db.execute(
+                select(WebinarReportRequest).where(WebinarReportRequest.webinar_id == webinar_id)
+            )).scalar_one_or_none()
+            if req is not None:
+                queued = req.attempts < MAX_GENERATION_ATTEMPTS
+                queue_error = req.last_error
+                queue_attempts = req.attempts
     except Exception as exc:  # table missing before migration, etc.
         logger.warning("webinar_report.get_status: read failed: %s", exc)
 
@@ -93,11 +111,19 @@ async def get_status(webinar_id: str) -> dict[str, Any]:
     pending_here = f"report:{webinar_id}" in _pending
     return {
         "running": running_here or pending_here,
+        # Durable request marker: survives restarts; the scheduler sweep picks
+        # it up, so "queued but not running" means "will start shortly".
+        "queued": queued,
         "phase": _status["phase"] if running_here else None,
         "started_at": _status["started_at"] if running_here else None,
         "finished_at": _status["finished_at"] if _status["webinar_id"] == webinar_id else None,
-        "last_error": _status["last_error"] if _status["webinar_id"] == webinar_id else None,
+        "last_error": (
+            (_status["last_error"] if _status["webinar_id"] == webinar_id else None)
+            or (queue_error if queue_attempts else None)
+        ),
+        "attempts": queue_attempts,
         "generated_at": generated_at,
+        "typical_ms": int(typical_ms) if typical_ms else None,
     }
 
 
@@ -937,6 +963,43 @@ async def generate_insights(payload: dict[str, Any]) -> tuple[list[dict[str, Any
 # Orchestration
 # ---------------------------------------------------------------------------
 
+async def _upsert_request(webinar_id: str) -> None:
+    """Durable 'please generate' marker — survives deploys/restarts so the
+    scheduler sweep can retry a generation the process death swallowed."""
+    from sqlalchemy import text as sa_text
+    from db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(sa_text("""
+            INSERT INTO webinar_report_request (webinar_id)
+            VALUES (:wid)
+            ON CONFLICT (webinar_id) DO UPDATE SET requested_at = now()
+        """).bindparams(wid=webinar_id))
+        await db.commit()
+
+
+async def _resolve_request(webinar_id: str, error: str | None) -> None:
+    """Delete the marker on success; count the failure otherwise."""
+    from sqlalchemy import text as sa_text
+    from db.session import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            if error is None:
+                await db.execute(sa_text(
+                    "DELETE FROM webinar_report_request WHERE webinar_id = :wid"
+                ).bindparams(wid=webinar_id))
+            else:
+                await db.execute(sa_text("""
+                    UPDATE webinar_report_request
+                    SET attempts = attempts + 1, last_error = :err
+                    WHERE webinar_id = :wid
+                """).bindparams(wid=webinar_id, err=error[:300]))
+            await db.commit()
+    except Exception as exc:
+        logger.warning("webinar_report: request bookkeeping failed: %s", exc)
+
+
 async def generate_report(webinar_id: str) -> dict[str, Any] | None:
     """Build the numbers, persist, then attach AI insights. Serialized."""
     async with _gen_lock:
@@ -956,9 +1019,11 @@ async def generate_report(webinar_id: str) -> dict[str, Any] | None:
             _status["phase"] = "ai"
             insights, ai_error = await generate_insights(payload)
             await _update_insights(webinar_id, insights, ai_error)
+            await _resolve_request(webinar_id, None)
         except Exception as exc:
             _status["last_error"] = str(exc)[:300]
             logger.exception("webinar_report: generation failed for %s", webinar_id)
+            await _resolve_request(webinar_id, str(exc))
             return None
         finally:
             _status.update({
@@ -967,6 +1032,42 @@ async def generate_report(webinar_id: str) -> dict[str, Any] | None:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
     return await read_report(webinar_id)
+
+
+async def request_generate(webinar_id: str) -> None:
+    """Durably request generation (marker row) and start it in-process. If
+    this process dies mid-run, the scheduler sweep retries from the marker."""
+    try:
+        await _upsert_request(webinar_id)
+    except Exception as exc:  # table missing before migration — still generate
+        logger.warning("webinar_report: could not persist request: %s", exc)
+    schedule_generate(webinar_id)
+
+
+async def run_pending_requests() -> int:
+    """Scheduler sweep: generate any durably-requested report that isn't
+    already running here. Returns how many generations were run."""
+    from sqlalchemy import select
+    from db.models import WebinarReportRequest
+    from db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(WebinarReportRequest.webinar_id)
+            .where(WebinarReportRequest.attempts < MAX_GENERATION_ATTEMPTS)
+            .order_by(WebinarReportRequest.requested_at)
+        )).scalars().all()
+
+    ran = 0
+    for wid in rows:
+        if _status["running"] and _status["webinar_id"] == wid:
+            continue
+        if f"report:{wid}" in _pending:
+            continue
+        logger.info("webinar_report sweep: generating pending report for %s", wid)
+        await generate_report(wid)
+        ran += 1
+    return ran
 
 
 def schedule_generate(webinar_id: str) -> None:

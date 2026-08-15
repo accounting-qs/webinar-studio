@@ -32,6 +32,10 @@ WEEKLY_REPORT_JOB_ID = "weekly_report_send"
 # artifact (2–4 min of heavy SQL + AI insights) is ready when the email goes out.
 WEEKLY_REPORT_PREP_JOB_ID = "weekly_report_prep"
 WEEKLY_REPORT_PREP_LEAD_MINUTES = 15
+# Durable report-request sweep: retries per-webinar report generations whose
+# in-process task was killed by a deploy/restart (see webinar_report_request).
+REPORT_SWEEP_JOB_ID = "webinar_report_sweep"
+REPORT_SWEEP_INTERVAL_MINUTES = 2
 
 # How often to scan for sync runs with stale heartbeats and reap them.
 # Cheap query (one indexed scan over status='running') so 2 minutes is fine.
@@ -153,6 +157,17 @@ async def _wg_auto_sync_job() -> None:
         logger.error("WG broadcast auto-sync failed: %s", exc)
 
 
+async def _report_sweep_job() -> None:
+    try:
+        # Lazy import — avoids a scheduler ↔ report-service import cycle.
+        from services import webinar_report
+        n = await webinar_report.run_pending_requests()
+        if n:
+            logger.info("Report sweep: generated %d pending report(s)", n)
+    except Exception as exc:
+        logger.error("Report sweep failed: %s", exc)
+
+
 async def start() -> AsyncIOScheduler:
     """Start the scheduler and register jobs from current DB settings.
 
@@ -198,7 +213,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID, SNAPSHOT_FULL_REBUILD_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID, SNAPSHOT_FULL_REBUILD_JOB_ID, REPORT_SWEEP_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -222,6 +237,18 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         id=WG_AUTO_SYNC_JOB_ID,
         max_instances=1,
         misfire_grace_time=300,
+        replace_existing=True,
+    )
+
+    # Report-request sweep is unconditional — cheap query on an almost-always-
+    # empty table; picks up per-webinar report generations that a deploy or
+    # restart killed mid-run.
+    scheduler.add_job(
+        _report_sweep_job,
+        trigger=IntervalTrigger(minutes=REPORT_SWEEP_INTERVAL_MINUTES),
+        id=REPORT_SWEEP_JOB_ID,
+        max_instances=1,
+        misfire_grace_time=60,
         replace_existing=True,
     )
 

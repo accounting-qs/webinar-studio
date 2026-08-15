@@ -976,11 +976,14 @@ async def recompute_status(source: str = "auto"):
 
 class WebinarReportStatusResponse(BaseModel):
     running: bool
+    queued: bool = False                # durable request marker (sweep retries)
     phase: str | None = None            # "queries" | "ai"
     started_at: str | None = None
     finished_at: str | None = None
     last_error: str | None = None
+    attempts: int = 0
     generated_at: str | None = None     # when a stored report exists
+    typical_ms: int | None = None       # avg generation time → frontend ETA
 
 
 class WebinarReportResponse(BaseModel):
@@ -1005,7 +1008,7 @@ async def get_webinar_report(webinar_id: str, generate_if_missing: bool = True):
 
     report = await rpt.read_report(webinar_id)
     if report is None and generate_if_missing:
-        rpt.schedule_generate(webinar_id)
+        await rpt.request_generate(webinar_id)
     status = await rpt.get_status(webinar_id)
     if report is None:
         return WebinarReportResponse(webinarId=webinar_id, status=status)
@@ -1014,9 +1017,10 @@ async def get_webinar_report(webinar_id: str, generate_if_missing: bool = True):
 
 @router.post("/report/{webinar_id}/generate", response_model=WebinarReportStatusResponse)
 async def trigger_webinar_report(webinar_id: str):
-    """Manual (re)generation. Returns immediately; poll /report/{id}/status."""
+    """Manual (re)generation. Durably queued (survives restarts) + started
+    immediately. Returns at once; poll /report/{id}/status."""
     from services import webinar_report as rpt
-    rpt.schedule_generate(webinar_id)
+    await rpt.request_generate(webinar_id)
     return await rpt.get_status(webinar_id)
 
 

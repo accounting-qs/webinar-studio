@@ -166,9 +166,22 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [phase, setPhase] = useState<string | null>(null);
+  const [genStartedAt, setGenStartedAt] = useState<string | null>(null);
+  const [genQueuedOnly, setGenQueuedOnly] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [typicalMs, setTypicalMs] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [view, setView] = useState<"v1" | "v2">("v2");
   const [webList, setWebList] = useState<ApiStatisticsWebinarSummary[] | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const genLocalStartRef = useRef<number | null>(null);
+
+  // 1s ticker while generating — drives the elapsed/ETA display.
+  useEffect(() => {
+    if (!generating) return;
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [generating]);
 
   // Webinar list once — powers the sidebar and the header label for webinars
   // whose report doesn't exist yet.
@@ -217,6 +230,14 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
     }
   }, []);
 
+  const applyStatus = useCallback((s: ApiWebinarReport["status"]) => {
+    setPhase(s.phase);
+    setGenStartedAt(s.started_at);
+    setGenQueuedOnly(!s.running && s.queued);
+    setTypicalMs(s.typical_ms);
+    setGenError(s.attempts > 0 ? s.last_error : null);
+  }, []);
+
   const load = useCallback(async () => {
     try {
       // Never auto-generate on view: missing reports show a "not generated"
@@ -225,40 +246,38 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
       setReport(r);
       setError(null);
       setLoading(false);
+      applyStatus(r.status);
       if (r.payload && !r.status.running) {
         setGenerating(false);
         stopPolling();
         return;
       }
-      if (r.status.running) {
-        // A generation is already in flight (prep job / another tab) — follow it.
-        setGenerating(true);
-        setPhase(r.status.phase);
-      } else {
-        setGenerating(false);
-      }
+      // A generation in flight (prep job / other tab / sweep-queued after a
+      // restart) — follow it.
+      setGenerating(r.status.running || r.status.queued);
     } catch (e) {
       setLoading(false);
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [webinarId, stopPolling]);
+  }, [webinarId, stopPolling, applyStatus]);
 
   const startPolling = useCallback(() => {
     stopPolling();
     pollRef.current = setInterval(async () => {
       try {
         const s = await fetchWebinarReportStatus(webinarId);
-        setPhase(s.phase);
-        if (!s.running) {
+        applyStatus(s);
+        if (!s.running && !s.queued) {
           stopPolling();
           setGenerating(false);
+          genLocalStartRef.current = null;
           await load();
         }
       } catch {
         /* transient poll errors are fine */
       }
     }, 5000);
-  }, [webinarId, load, stopPolling]);
+  }, [webinarId, load, stopPolling, applyStatus]);
 
   useEffect(() => {
     setReport(null);
@@ -278,13 +297,35 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
     try {
       setGenerating(true);
       setPhase("queries");
-      await triggerWebinarReport(webinarId);
+      setGenError(null);
+      genLocalStartRef.current = Date.now();
+      const s = await triggerWebinarReport(webinarId);
+      applyStatus(s);
       startPolling();
     } catch (e) {
       setGenerating(false);
       setError(e instanceof Error ? e.message : String(e));
     }
   };
+
+  // Elapsed/ETA for the progress display. started_at comes from the backend
+  // when the run is live in-process; fall back to the local click time.
+  const startedMs = genStartedAt
+    ? Date.parse(genStartedAt)
+    : genLocalStartRef.current;
+  const elapsedMs = startedMs ? Math.max(0, nowTick - startedMs) : 0;
+  const estMs = typicalMs ?? 240_000;
+  const progressPct = startedMs ? Math.min(96, (elapsedMs / estMs) * 100) : 4;
+  const remainingMs = estMs - elapsedMs;
+  const fmtClock = (ms: number) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  };
+  const etaText = !startedMs
+    ? `usually takes about ${fmtClock(estMs)} min`
+    : remainingMs > 5_000
+      ? `≈ ${fmtClock(remainingMs)} min remaining`
+      : "finishing up…";
 
   const payload = report?.payload ?? null;
   const activeMeta = webList?.find((w) => w.webinarId === webinarId) ?? null;
@@ -369,13 +410,28 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
                 <p className="text-sm text-zinc-500">Loading…</p>
               </div>
             ) : generating ? (
-              <div className="text-center">
+              <div className="text-center w-full max-w-md px-6">
                 <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
-                <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                  Generating this webinar&apos;s report — usually 2–4 minutes.
+                <p className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+                  {genQueuedOnly
+                    ? "Queued — a worker picks it up within ~2 minutes"
+                    : phase === "ai"
+                      ? "Numbers done — writing AI insights…"
+                      : "Crunching the funnel queries…"}
                 </p>
-                <p className="text-xs text-zinc-500 mt-1">
-                  {phase === "ai" ? "Numbers done — writing AI insights…" : "Running the funnel queries…"}
+                <div className="h-1.5 mt-4 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-1.5 bg-violet-500 rounded-full transition-all duration-1000"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
+                <div className="flex justify-between mt-1.5 text-[11px] text-zinc-500 tabular-nums">
+                  <span>{startedMs ? `${fmtClock(elapsedMs)} elapsed` : "starting…"}</span>
+                  <span>{etaText}</span>
+                </div>
+                <p className="text-[11px] text-zinc-400 mt-3">
+                  The page updates itself when the report is ready — safe to switch webinars
+                  meanwhile, generation continues on the server.
                 </p>
               </div>
             ) : (
@@ -384,15 +440,20 @@ export function WebinarReportPage({ webinarId }: { webinarId: string }) {
                 <p className="text-sm font-medium text-zinc-700 dark:text-zinc-200 mb-1">
                   No report generated yet
                 </p>
+                {genError && (
+                  <p className="text-xs text-red-500 mb-2">
+                    Last attempt failed: {genError}
+                  </p>
+                )}
                 <p className="text-xs text-zinc-500 mb-4">
-                  Generating crunches the funnel queries and writes AI insights — it takes about
-                  2–4 minutes and the page updates itself when done.
+                  Generating crunches the funnel queries and writes AI insights — about{" "}
+                  {fmtClock(estMs)} min. The page updates itself when done.
                 </p>
                 <button
                   onClick={regenerate}
                   className="px-4 py-2 text-xs font-semibold rounded bg-violet-500/15 text-violet-600 dark:text-violet-300 hover:bg-violet-500/25 border border-violet-500/30 transition-colors"
                 >
-                  Generate report
+                  {genError ? "Retry generation" : "Generate report"}
                 </button>
               </div>
             )}
