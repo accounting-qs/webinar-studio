@@ -1349,10 +1349,11 @@ async def _process_csv_import(
         # (binary protocol, no params) lets us go much wider. 5000 trades batch
         # blast radius for fewer round-trips and amortises temp-table overhead.
         BATCH_SIZE = 5000
-        inserted = 0
-        skipped = 0
-        overwritten = 0
-        processed = 0
+        # NB: inserted/skipped/overwritten/processed are seeded from the
+        # initial_*/start_from_row params at the top of this function. Do not
+        # re-zero them here — on a resume that discards every prior run's
+        # tallies, so the row under-reports processed_rows and the next resume
+        # rewinds too far and re-reads rows it already imported.
         batch_rows: list[list[str]] = []
         new_bucket_names: set[str] = set()
 
