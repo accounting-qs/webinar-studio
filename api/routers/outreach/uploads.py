@@ -412,7 +412,7 @@ async def get_custom_list_copies(
     return {"upload_id": upload_id, "titles": titles, "descriptions": descriptions}
 
 
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -434,7 +434,7 @@ async def presign_upload(
     if not filename.endswith(".csv"):
         raise HTTPException(400, "Only CSV files are accepted")
     if file_size > MAX_UPLOAD_SIZE:
-        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_SIZE // (1024*1024)} MB limit")
+        raise HTTPException(413, "File exceeds 1 GB limit")
 
     storage_path = f"{LLOYD_USER_ID}/{int(datetime.now().timestamp())}_{filename}"
 

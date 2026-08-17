@@ -179,8 +179,8 @@ export function UploadPage() {
 
   const handleFile = useCallback(async (file: File) => {
     if (!file.name.endsWith(".csv")) return;
-    if (file.size > 500 * 1024 * 1024) {
-      setUploadError("File exceeds 500 MB limit");
+    if (file.size > 1024 * 1024 * 1024) {
+      setUploadError("File exceeds 1 GB limit");
       return;
     }
 
@@ -470,7 +470,7 @@ export function UploadPage() {
             Drop your CSV here or click to browse
           </p>
           <p style={{ color: "var(--muted-foreground)", fontSize: 13, marginTop: 4 }}>
-            Supports files up to 500 MB • CSV format only
+            Supports files up to 1 GB • CSV format only
           </p>
           <input ref={fileRef} type="file" accept=".csv" hidden onChange={onFileSelect} />
         </div>

@@ -62,7 +62,7 @@ _import_pause_events: dict[str, asyncio.Event] = {}   # set = running, clear = p
 _import_cancel_flags: dict[str, bool] = {}
 
 
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
 BATCH_SIZE = 2000  # ~10 cols per row → ~20k params, well under asyncpg's 32767 limit
 
 
@@ -652,7 +652,7 @@ async def presign_calendar_upload(
     if not filename.endswith(".csv"):
         raise HTTPException(400, "Only CSV files are accepted")
     if file_size > MAX_UPLOAD_SIZE:
-        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_SIZE // (1024*1024)} MB limit")
+        raise HTTPException(413, "File exceeds 1 GB limit")
     if not webinar_id:
         raise HTTPException(400, "webinar_id is required")
 
