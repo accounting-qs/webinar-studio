@@ -979,20 +979,26 @@ def resume_orphan_import(upload: "UploadHistory") -> bool:
     as failed in the False case. Single-instance safe; if multiple instances
     ever run, this needs a row-level lock so only one picks up each orphan.
     """
-    if upload.id in _active_import_tasks:
+    # Read every attribute up front: the caller's Session closes as soon as the
+    # startup sweep finishes, and the done-callback below fires long after that.
+    # Touching `upload.<attr>` from the closure raises DetachedInstanceError,
+    # which silently strands the entry in _active_import_tasks.
+    uid = upload.id
+
+    if uid in _active_import_tasks:
         return True  # Already running in this process
     if not upload.storage_path or not upload.field_mappings:
         return False
 
     pause_event = asyncio.Event()
     pause_event.set()
-    _import_pause_events[upload.id] = pause_event
-    _import_cancel_flags[upload.id] = False
+    _import_pause_events[uid] = pause_event
+    _import_cancel_flags[uid] = False
 
     def _cleanup(_t):
-        _active_import_tasks.pop(upload.id, None)
-        _import_pause_events.pop(upload.id, None)
-        _import_cancel_flags.pop(upload.id, None)
+        _active_import_tasks.pop(uid, None)
+        _import_pause_events.pop(uid, None)
+        _import_cancel_flags.pop(uid, None)
 
     task = asyncio.create_task(
         _process_csv_import(
@@ -1008,7 +1014,7 @@ def resume_orphan_import(upload: "UploadHistory") -> bool:
             initial_overwritten=upload.overwritten_count or 0,
         )
     )
-    _active_import_tasks[upload.id] = task
+    _active_import_tasks[uid] = task
     task.add_done_callback(_cleanup)
     return True
 
@@ -1561,10 +1567,13 @@ async def _process_csv_import(
         print(f"[IMPORT] Done: {upload_id} — {inserted} inserted, {skipped} skipped, {overwritten} overwritten")
 
     except Exception as e:
-        print(f"[IMPORT] FAILED: {upload_id} at row {processed} — {e}")
+        # Bare TimeoutError/CancelledError stringify to "", which renders as a
+        # blank "Error:" in the UI — fall back to the exception class name.
+        err_text = str(e).strip() or type(e).__name__
+        print(f"[IMPORT] FAILED: {upload_id} at row {processed} — {err_text}")
         traceback.print_exc()
         # Write partial success info so user can see what was imported before the crash
-        error_detail = f"Import stopped at row {processed:,}. {inserted:,} contacts were successfully imported. Error: {str(e)[:300]}"
+        error_detail = f"Import stopped at row {processed:,}. {inserted:,} contacts were successfully imported. Error: {err_text[:300]}"
         try:
             async with engine.begin() as conn:
                 await conn.execute(

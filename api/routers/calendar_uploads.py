@@ -1006,20 +1006,24 @@ def resume_orphan_calendar_import(upload: "WebinarCalendarUpload") -> bool:
     storage_path). Caller is responsible for marking the row as failed in that
     case. Single-instance safe; see note in outreach resume_orphan_import.
     """
-    if upload.id in _active_import_tasks:
+    # Read attributes up front — the caller's Session is closed by the time the
+    # done-callback fires, so `upload.<attr>` there raises DetachedInstanceError.
+    uid = upload.id
+
+    if uid in _active_import_tasks:
         return True
     if not upload.storage_path:
         return False
 
     pause_event = asyncio.Event()
     pause_event.set()
-    _import_pause_events[upload.id] = pause_event
-    _import_cancel_flags[upload.id] = False
+    _import_pause_events[uid] = pause_event
+    _import_cancel_flags[uid] = False
 
     def _cleanup(_t):
-        _active_import_tasks.pop(upload.id, None)
-        _import_pause_events.pop(upload.id, None)
-        _import_cancel_flags.pop(upload.id, None)
+        _active_import_tasks.pop(uid, None)
+        _import_pause_events.pop(uid, None)
+        _import_cancel_flags.pop(uid, None)
 
     task = asyncio.create_task(
         _process_calendar_csv(
@@ -1034,7 +1038,7 @@ def resume_orphan_calendar_import(upload: "WebinarCalendarUpload") -> bool:
             initial_unmatched=upload.unmatched_count or 0,
         )
     )
-    _active_import_tasks[upload.id] = task
+    _active_import_tasks[uid] = task
     task.add_done_callback(_cleanup)
     return True
 
@@ -1476,9 +1480,12 @@ async def _process_calendar_csv(
             print(f"[CAL_IMPORT] recompute schedule failed: {exc}")
 
     except Exception as e:
-        print(f"[CAL_IMPORT] FAILED: {upload_id} at row {processed} — {e}")
+        # Bare TimeoutError/CancelledError stringify to "", which renders as a
+        # blank "Error:" in the UI — fall back to the exception class name.
+        err_text = str(e).strip() or type(e).__name__
+        print(f"[CAL_IMPORT] FAILED: {upload_id} at row {processed} — {err_text}")
         traceback.print_exc()
-        err = f"Import stopped at row {processed:,}. {matched:,} matched. Error: {str(e)[:300]}"
+        err = f"Import stopped at row {processed:,}. {matched:,} matched. Error: {err_text[:300]}"
         try:
             async with engine.begin() as conn:
                 await conn.execute(
