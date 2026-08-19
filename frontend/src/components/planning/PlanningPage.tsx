@@ -696,7 +696,13 @@ export function PlanningPage() {
   const [editingSenders, setEditingSenders] = useState(false);
   const [webinars, setWebinars] = useState<Webinar[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [loadingData, setLoadingData] = useState(true);
+  /* Each header source loads on its own clock — the campaign table renders as
+   * soon as the webinar metadata lands, and a slow /buckets or /good-available
+   * only spins its own pills instead of holding the whole page hostage. */
+  const [loadingWebinars, setLoadingWebinars] = useState(true);
+  const [loadingBuckets, setLoadingBuckets] = useState(true);
+  const [loadingSenders, setLoadingSenders] = useState(true);
+  const [loadingGoodAvail, setLoadingGoodAvail] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
 
   /* ── Lazy loading of per-webinar lists ─────────────────────────────────
@@ -765,19 +771,34 @@ export function PlanningPage() {
     }
   }, []);
 
-  /* ── Load metadata on mount, then hydrate newest campaigns first ──── */
+  /* ── Load metadata on mount, then hydrate newest campaigns first ──────
+   * The four sources are fetched independently, not as one Promise.all: the
+   * campaign table used to wait on /buckets/good-available, which scans the
+   * whole contacts table and can take minutes (or 500 on the DB's statement
+   * cap), leaving Planning unusable. Now whatever arrives first renders, and
+   * each still-pending source shows its own spinner. */
   useEffect(() => {
     let cancelled = false;
-    async function loadData() {
-      try {
-        const [bucketsRes, sendersRes, webinarsRes, goodAvailRes] = await Promise.all([
-          fetchBuckets(), fetchSenders(), fetchWebinars(), fetchGoodAvailable(),
-        ]);
-        if (cancelled) return;
 
-        setBuckets(bucketsRes.buckets);
-        setGoodAvail(goodAvailRes);
-        setSenders(sendersRes.senders.map(apiSenderToLocal));
+    fetchBuckets()
+      .then(({ buckets: fresh }) => { if (!cancelled) setBuckets(fresh); })
+      .catch((err) => console.error("Failed to load buckets:", err))
+      .finally(() => { if (!cancelled) setLoadingBuckets(false); });
+
+    fetchSenders()
+      .then(({ senders: fresh }) => { if (!cancelled) setSenders(fresh.map(apiSenderToLocal)); })
+      .catch((err) => console.error("Failed to load senders:", err))
+      .finally(() => { if (!cancelled) setLoadingSenders(false); });
+
+    fetchGoodAvailable()
+      .then((fresh) => { if (!cancelled) setGoodAvail(fresh); })
+      .catch((err) => console.error("Failed to load good-available:", err))
+      .finally(() => { if (!cancelled) setLoadingGoodAvail(false); });
+
+    async function loadCampaigns() {
+      try {
+        const webinarsRes = await fetchWebinars();
+        if (cancelled) return;
 
         // Build campaign rows from metadata only — lists are hydrated lazily.
         const webinarList: Webinar[] = webinarsRes.webinars.map((w) => {
@@ -813,11 +834,13 @@ export function PlanningPage() {
           .map((w) => w.id);
         recencyOrderRef.current = recency;
 
-        // Load the two most recent campaigns, then reveal the page.
+        // Rows are renderable from metadata alone — show the table now and let
+        // each campaign spin its own "Loading lists…" while it hydrates.
+        setLoadingWebinars(false);
+
         await hydrateWebinars(recency.slice(0, INITIAL_LOAD));
         if (cancelled) return;
         setLoadedCount(Math.min(recency.length, INITIAL_LOAD));
-        setLoadingData(false);
 
         // "Go to the past": pull a few more recent campaigns in the
         // background so history is ready without a click. The long tail
@@ -827,11 +850,11 @@ export function PlanningPage() {
           if (!cancelled) setLoadedCount((c) => Math.max(c, Math.min(recency.length, INITIAL_LOAD + AUTO_MORE)));
         }
       } catch (err) {
-        console.error("Failed to load data:", err);
-        if (!cancelled) setLoadingData(false);
+        console.error("Failed to load campaigns:", err);
+        if (!cancelled) setLoadingWebinars(false);
       }
     }
-    loadData();
+    loadCampaigns();
     return () => { cancelled = true; };
   }, [hydrateWebinars]);
 
@@ -2198,17 +2221,24 @@ export function PlanningPage() {
             <h1 className="text-lg font-bold text-zinc-900 dark:text-zinc-100 tracking-tight">Campaign Planning</h1>
             <div className="flex gap-2">
               {[
-                { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200" },
-                { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400" },
-                { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400" },
-                { label: "Good Avail", value: (goodAvail?.total ?? 0).toLocaleString(), color: "text-teal-400" },
-                { label: "Good US+CA", value: (goodAvail?.us_ca ?? 0).toLocaleString(), color: "text-teal-400" },
-                { label: "Good EU", value: (goodAvail?.europe ?? 0).toLocaleString(), color: "text-teal-400" },
-                { label: "Good No-loc", value: (goodAvail?.no_location ?? 0).toLocaleString(), color: "text-teal-400" },
-                { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400" },
+                { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200", loading: loadingWebinars },
+                { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400", loading: loadingWebinars },
+                { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400", loading: loadingBuckets },
+                { label: "Good Avail", value: goodAvail ? goodAvail.total.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
+                { label: "Good US+CA", value: goodAvail ? goodAvail.us_ca.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
+                { label: "Good EU", value: goodAvail ? goodAvail.europe.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
+                { label: "Good No-loc", value: goodAvail ? goodAvail.no_location.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
+                { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400", loading: loadingWebinars },
               ].map((s) => (
                 <div key={s.label} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40">
-                  <span className={`text-sm font-bold font-mono ${s.color}`}>{s.value}</span>
+                  {s.loading ? (
+                    <span
+                      title={`Loading ${s.label}…`}
+                      className="w-3 h-3 my-0.5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin inline-block"
+                    />
+                  ) : (
+                    <span className={`text-sm font-bold font-mono ${s.color}`}>{s.value}</span>
+                  )}
                   <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{s.label}</span>
                 </div>
               ))}
@@ -2244,6 +2274,12 @@ export function PlanningPage() {
           </button>
         </div>
         <div className="flex items-center gap-5 mt-1.5 overflow-x-auto">
+          {loadingSenders && (
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="w-3.5 h-3.5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin inline-block" />
+              <span className="text-xs text-zinc-500">Loading senders…</span>
+            </div>
+          )}
           {senders.map((s) => (
             <div key={s.id} className="flex items-center gap-2 shrink-0">
               <SenderBadge name={s.name} color={s.color} />
@@ -2265,7 +2301,7 @@ export function PlanningPage() {
       )}
 
       {/* ── Loading state ─────────────────────────────────────────── */}
-      {loadingData && (
+      {loadingWebinars && (
         <div className="flex flex-col items-center justify-center py-24 gap-3">
           <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
           <span className="text-sm text-zinc-500">Loading campaigns...</span>
@@ -2273,7 +2309,7 @@ export function PlanningPage() {
       )}
 
       {/* ── Webinar table ──────────────────────────────────────────── */}
-      {!loadingData && <div className="overflow-x-auto">
+      {!loadingWebinars && <div className="overflow-x-auto">
         <table className="w-full text-xs min-w-[1180px]">
           <thead>
             <tr className="bg-zinc-50 dark:bg-zinc-900/90 border-b border-zinc-200 dark:border-zinc-800/40">
@@ -3554,7 +3590,7 @@ export function PlanningPage() {
       </div>}
 
       {/* ── Load more campaigns ─────────────────────────────────────── */}
-      {!loadingData && (() => {
+      {!loadingWebinars && (() => {
         const remaining = webinars.filter((w) => !w.listsLoaded).length;
         if (remaining === 0) return null;
         return (

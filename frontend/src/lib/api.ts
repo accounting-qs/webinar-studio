@@ -849,7 +849,9 @@ export interface GoodAvailable { total: number; us_ca: number; europe: number; n
  *  of the total. */
 export async function fetchGoodAvailable(): Promise<GoodAvailable> {
   const res = await fetch(`${API_URL}/outreach/buckets/good-available`, { headers: authHeaders() });
-  if (!res.ok) return { total: 0, us_ca: 0, europe: 0, no_location: 0 };
+  // Throw rather than return zeros: a failed count and a genuine zero look the
+  // same in the header, and the caller renders "—" for the unknown case.
+  if (!res.ok) throw new Error("Failed to fetch good-available inventory");
   return res.json();
 }
 
