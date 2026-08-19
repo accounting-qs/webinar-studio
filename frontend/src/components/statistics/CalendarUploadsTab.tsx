@@ -205,8 +205,18 @@ function UploadsTable({
                 <td className="px-3 py-2 max-w-[260px] truncate text-zinc-700 dark:text-zinc-300" title={u.file_name}>{u.file_name}</td>
                 <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{dateLabel}</td>
                 <td className="px-3 py-2 text-right font-mono">{u.total_rows.toLocaleString()}</td>
-                <td className="px-3 py-2 text-right font-mono text-emerald-500">{u.matched_count.toLocaleString()}</td>
-                <td className="px-3 py-2 text-right font-mono text-amber-500">{u.unmatched_count.toLocaleString()}</td>
+                <td
+                  className="px-3 py-2 text-right font-mono text-emerald-500"
+                  title={u.kind === "nonjoiner"
+                    ? "Uploaded Yes/Maybe emails that are in this webinar's Non-joiners group."
+                    : undefined}
+                >{u.matched_count.toLocaleString()}</td>
+                <td
+                  className="px-3 py-2 text-right font-mono text-amber-500"
+                  title={u.kind === "nonjoiner"
+                    ? "Uploaded emails no longer in the Non-joiners group — booked, blocklisted, or aged out of the 6-webinar window."
+                    : undefined}
+                >{u.unmatched_count.toLocaleString()}</td>
                 <td className="px-3 py-2 text-center">
                   {u.has_responses ? <span className="text-emerald-500">✓</span> : <span className="text-zinc-500">—</span>}
                 </td>

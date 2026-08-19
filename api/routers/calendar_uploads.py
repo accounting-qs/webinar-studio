@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy import select, func as sa_func, update, delete
+from sqlalchemy import select, func as sa_func, update, delete, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy import pool
@@ -64,6 +64,10 @@ _import_cancel_flags: dict[str, bool] = {}
 
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
 BATCH_SIZE = 2000  # ~10 cols per row → ~20k params, well under asyncpg's 32767 limit
+# Statement budget for the non-joiner pool query on a Non-joiners import. The
+# request path runs under a 120s cap; this one walks six webinars of
+# WebinarGeek registrations off the request path, so it gets more room.
+NJ_POOL_TIMEOUT_S = 600
 
 
 def _supabase_base_url() -> str:
@@ -111,6 +115,10 @@ _HEADER_MAP = {
     "calendar_invite_response": "calendar_invite_response",
     "calendar_response": "calendar_invite_response",
     "response": "calendar_invite_response",
+    # Headers the Non-joiners export actually emits. Without these every
+    # Non-joiners upload needs the column-mapping dropdowns filled in by hand.
+    "calendar_invite_response_non_joiners": "calendar_invite_response",
+    "calendar_webinar_series_non_joiners": "calendar_webinar_series",
 }
 
 
@@ -125,6 +133,42 @@ def _build_col_map(headers: list[str]) -> dict[int, str]:
         if target:
             col_map[idx] = target
     return col_map
+
+
+async def _nonjoiner_match_counts(upload_id: str, webinar_id: str) -> tuple[int, int]:
+    """(matched, unmatched) for a Non-joiners upload. Raises if the group query does.
+
+    Non-joiners are a derived cohort — services/nonjoiners.py computes them from
+    WebinarGeek registrations and never writes membership rows — so the per-list
+    matcher in `_flush_batch` can only ever report 0 for them. The number this
+    upload actually wants is how many of the uploaded Yes/Maybe emails are in the
+    webinar's non-joiner group, which is a set intersection against that same
+    shared definition. Unmatched = uploaded but no longer in the group: booked,
+    blocklisted, or aged out of the six-webinar window since the CSV was pulled.
+
+    Deliberately run once *after* the rows are in, not per batch: the pool query
+    walks six webinars of registrations and can take minutes, which would stall
+    the import's progress bar at 0 and re-run on every resume.
+    """
+    from db.session import AsyncSessionLocal
+    from services.nonjoiners import nonjoiner_pool_emails
+
+    async with AsyncSessionLocal() as db:
+        # The request path runs under a 120s statement cap; this is a background
+        # worker, so give the pool query room instead of failing the count.
+        await db.execute(sa_text(f"SET statement_timeout = '{NJ_POOL_TIMEOUT_S}s'"))
+        pool = set(await nonjoiner_pool_emails(db, webinar_id))
+        # Every row this upload owns, including ones written by an earlier run
+        # of the same upload that was resumed.
+        emails = (await db.execute(sa_text(
+            "SELECT LOWER(email) FROM webinar_nonjoiner_invites "
+            "WHERE upload_id = CAST(:uid AS uuid)"
+        ), {"uid": upload_id})).scalars().all()
+
+    matched = sum(1 for e in emails if e in pool)
+    print(f"[CAL_IMPORT] Non-joiner group for webinar {webinar_id}: {len(pool)} emails "
+          f"— {matched}/{len(emails)} uploaded rows in it")
+    return matched, len(emails) - matched
 
 
 def _parse_invited_date(value: str) -> datetime | None:
@@ -1248,7 +1292,9 @@ async def _process_calendar_csv(
                             await asyncio.sleep(1)
                         else:
                             raise
-                # matched/unmatched aren't meaningful for nonjoiner uploads
+                # No per-batch matching: non-joiners aren't a per-list cohort, so
+                # the counts are the intersection with the whole derived group and
+                # are resolved once after the import (see _nonjoiner_match_counts).
                 return 0, 0, rows_affected
 
             # Match: contacts assigned to this webinar via WebinarListAssignment
@@ -1413,6 +1459,16 @@ async def _process_calendar_csv(
             processed += len(batch)
 
         csv_file.close()
+
+        # Non-joiner uploads carry no per-list matching, so their counts are the
+        # intersection with the derived non-joiner group, resolved now that every
+        # row is in. A failure here leaves the counts at 0 rather than failing an
+        # otherwise-successful import.
+        if kind == "nonjoiner":
+            try:
+                matched, unmatched = await _nonjoiner_match_counts(upload_id, webinar_id)
+            except Exception as exc:
+                print(f"[CAL_IMPORT] Non-joiner group lookup failed ({exc}) — counts left at 0")
 
         async with engine.begin() as conn:
             await conn.execute(
