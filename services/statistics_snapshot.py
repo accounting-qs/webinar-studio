@@ -176,31 +176,50 @@ async def get_status(source: str = "auto") -> dict[str, Any]:
 # Recompute worker
 # ---------------------------------------------------------------------------
 
+# Held around ONE webinar's compute+upsert, not around a whole run. A full
+# sweep re-queues on it between webinars, so a targeted recompute — the kind a
+# CSV import or a sync schedules — waits for the webinar in flight and then goes
+# next instead of behind the entire sweep. On prod a single webinar takes
+# 25-40 min (the non-joiner pool query dominates), so a full sweep runs for
+# hours; holding this for the whole run left a freshly-uploaded webinar's
+# snapshot stale for that long.
 _recompute_lock = asyncio.Lock()
 _bg_tasks: set[asyncio.Task] = set()
 # Scope tokens already queued/running, so duplicate schedules coalesce. The
 # sentinel "*" means a full ("all") recompute.
 _pending_scopes: set[str] = set()
 _ALL = "*"
+# Identity of the run currently reporting into `_status`. A full sweep always
+# takes it over; a partial that has been superseded stops writing, so it can't
+# clear "running" out from under a sweep that started after it.
+_status_owner: object | None = None
 
 
 async def recompute(webinar_ids: list[str] | None = None, source: str = "auto") -> dict[str, Any]:
     """Compute fresh statistics payloads and upsert them. webinar_ids=None
     rebuilds every passed webinar (and prunes snapshots for webinars that no
-    longer pass). Serialized: only one recompute runs at a time."""
+    longer pass). Serialized per webinar, not per run: a full sweep yields
+    between webinars so a targeted recompute doesn't queue behind all of it."""
     from services import statistics as stats
 
-    async with _recompute_lock:
-        is_full = webinar_ids is None
-        if is_full:
-            summaries = await stats.get_statistics_webinar_list(source=source)
-            targets = [
-                s["webinarId"] for s in summaries
-                if s.get("webinarId") and stats._is_passed_webinar(s.get("date"), s.get("status"))
-            ]
-        else:
-            targets = list(dict.fromkeys(webinar_ids))  # de-dupe, preserve order
+    global _status_owner
 
+    is_full = webinar_ids is None
+    if is_full:
+        summaries = await stats.get_statistics_webinar_list(source=source)
+        targets = [
+            s["webinarId"] for s in summaries
+            if s.get("webinarId") and stats._is_passed_webinar(s.get("date"), s.get("status"))
+        ]
+    else:
+        targets = list(dict.fromkeys(webinar_ids))  # de-dupe, preserve order
+
+    # A partial run interleaves with a full sweep, so it must not stomp the
+    # sweep's progress in the status the UI polls. The sweep owns it; a partial
+    # only reports when no sweep is in flight.
+    token = object()
+    if is_full or not (_status["running"] and _status["scope"] == "all"):
+        _status_owner = token
         _status.update({
             "running": True,
             "scope": "all" if is_full else "partial",
@@ -212,29 +231,37 @@ async def recompute(webinar_ids: list[str] | None = None, source: str = "auto") 
             "last_error": None,
         })
 
-        try:
-            for wid in targets:
-                try:
+    logger.info("recompute: %s run over %d webinar(s)", "full" if is_full else "partial", len(targets))
+    try:
+        for wid in targets:
+            try:
+                # Re-acquired per webinar so anything waiting gets the next slot.
+                async with _recompute_lock:
                     payload = await stats.get_statistics_webinar_one(
                         source=source, webinar_id=wid, force=True,
                     )
                     if payload is not None:
                         await _upsert_snapshot(source, payload)
-                except Exception as exc:
+            except Exception as exc:
+                if _status_owner is token:
                     _status["errors"] += 1
                     _status["last_error"] = str(exc)[:300]
-                    logger.warning("recompute: webinar %s failed: %s", wid, exc)
-                finally:
+                logger.warning("recompute: webinar %s failed: %s", wid, exc)
+            finally:
+                if _status_owner is token:
                     _status["done"] += 1
 
-            if is_full:
-                try:
-                    await _prune_snapshots(source, set(targets))
-                except Exception as exc:
-                    logger.warning("recompute: prune failed: %s", exc)
-        finally:
+        if is_full:
+            try:
+                await _prune_snapshots(source, set(targets))
+            except Exception as exc:
+                logger.warning("recompute: prune failed: %s", exc)
+    finally:
+        if _status_owner is token:
             _status["running"] = False
             _status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            _status_owner = None
+        logger.info("recompute: %s run finished", "full" if is_full else "partial")
 
     return await get_status(source)
 
