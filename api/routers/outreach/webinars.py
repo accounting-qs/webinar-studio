@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, func as sa_func, delete, update, or_, and_, text as sa_text
+from sqlalchemy import select, func as sa_func, delete, update, or_, and_, text as sa_text, literal as sa_literal
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, undefer
 
@@ -40,6 +41,23 @@ _active_export_tasks: dict[str, asyncio.Task] = {}
 # List name the derived non-joiner pool ships under, in the viewer and the
 # export CSV. Not stored on the assignment row — that row is only a flag.
 NONJOINER_LIST_NAME = "Nonjoiners"
+
+
+def _is_statement_timeout(exc: BaseException) -> bool:
+    """True when a DB error is Postgres cancelling a statement that ran past
+    `statement_timeout` (SQLSTATE 57014 — prod caps statements at 120s).
+
+    Worth distinguishing from every other DBAPIError: a timeout is a "this
+    statement was too big" signal that the caller can retry smaller, whereas any
+    other failure means the statement was wrong and retrying it is pointless.
+    asyncpg's QueryCanceledError reaches us wrapped by SQLAlchemy, and the
+    wrapper does not consistently carry `sqlstate`, so fall back to the text.
+    """
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "sqlstate", None) == "57014":
+        return True
+    blob = f"{orig or ''} {exc}"
+    return "QueryCanceledError" in blob or "canceling statement due to statement timeout" in blob
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -357,6 +375,30 @@ async def assign_bucket(
         )
         return int(res.scalar() or 0)
 
+    async def _available_count(*source_conds) -> int:
+        """Available contacts for this claim, capped at just past what is needed.
+
+        The count only ever decides `available >= volume`, so it is bounded by a
+        subquery LIMIT instead of counting the whole pool: the index-only scan
+        stops as soon as enough matches are seen. On prod that matters — a
+        600k-contact bucket with a 42-country filter counted the full pool in
+        33-67s (the scan pays a heap fetch for every page the visibility map has
+        gone stale on), and that ran before a claim that then had its own 120s
+        budget to fit into.
+
+        Accuracy is preserved for the error path: the cap is `volume + overlap`
+        + 1, so any result at or below `volume + overlap` means the scan ran to
+        exhaustion and the number reported to the operator is the true one.
+        """
+        overlap = await _member_overlap_count(*source_conds)
+        cap = body.volume + overlap + 1
+        res = await db.execute(
+            select(sa_func.count()).select_from(
+                select(sa_literal(1)).where(*source_conds).limit(cap).subquery()
+            )
+        )
+        return max(0, int(res.scalar() or 0) - overlap)
+
     # Optional location filter, applied identically to the availability counts and
     # the claim query so volume validation matches what gets claimed. A contact
     # matches if its per-contact `country` is in the selected set, OR — as a
@@ -391,6 +433,7 @@ async def assign_bucket(
         # Count available (non-blocklisted) contacts from this upload —
         # no-target claimable minus the already-member overlap (see above).
         _src_conds = (
+            Contact.user_id == LLOYD_USER_ID,
             Contact.upload_id == body.upload_id,
             Contact.bucket_id.is_(None),
             not_blocklisted,
@@ -398,10 +441,7 @@ async def assign_bucket(
             *country_filter,
             *emp_filter,
         )
-        available_count_result = await db.execute(
-            select(sa_func.count()).where(*_src_conds)
-        )
-        available_count = (available_count_result.scalar() or 0) - await _member_overlap_count(*_src_conds)
+        available_count = await _available_count(*_src_conds)
         desc_str = upload.custom_list_name or upload.file_name
 
         # Copies for this custom list (by upload_id). Prefer primary; fall
@@ -437,17 +477,22 @@ async def assign_bucket(
 
         # Count available (non-blocklisted) contacts in this bucket —
         # no-target claimable minus the already-member overlap (see above).
+        # user_id is not redundant with bucket_id: every contact index that
+        # covers the claim filters (ix_contacts_good_avail, ix_contacts_bucket_filters)
+        # leads with user_id, and without it Postgres can only apply bucket_id as
+        # a non-boundary qual — it reads the ENTIRE 177 MB index instead of the
+        # bucket's slice of it. Measured on prod's 600k-contact bucket: 67s → 33s
+        # on the count alone. Every other contacts read path already scopes by
+        # user_id (buckets.py:1377, webinars.py:1017); assign was the outlier.
         _src_conds = (
+            Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id == body.bucket_id,
             not_blocklisted,
             *claimable_count_conds,
             *country_filter,
             *emp_filter,
         )
-        available_count_result = await db.execute(
-            select(sa_func.count()).where(*_src_conds)
-        )
-        available_count = (available_count_result.scalar() or 0) - await _member_overlap_count(*_src_conds)
+        available_count = await _available_count(*_src_conds)
 
         # Prefer the primary copy; fall back to any non-deleted copy
         # (lowest variant_index) so every assignment has a default selection
@@ -551,6 +596,7 @@ async def assign_bucket(
     # is swapped in per-pool below so a mixed reuse can be balanced 50/50.
     if is_custom_list:
         base_claim_where = (
+            Contact.user_id == LLOYD_USER_ID,
             Contact.upload_id == body.upload_id,
             Contact.bucket_id.is_(None),
             not_blocklisted,
@@ -559,6 +605,7 @@ async def assign_bucket(
         )
     else:
         base_claim_where = (
+            Contact.user_id == LLOYD_USER_ID,
             Contact.bucket_id == body.bucket_id,
             not_blocklisted,
             *country_filter,
@@ -572,7 +619,23 @@ async def assign_bucket(
     # unnest-array statements bind ONE param per statement, so the chunk size is
     # bounded by statement duration (index write amplification), not the 32,767
     # bind-param cap that forced 2000 previously.
-    CLAIM_CHUNK = 8000
+    #
+    # 8,000 was still too big. Prod's disk sustains only ~250-350 RANDOM heap
+    # reads/s, so a chunk's real budget is heap pages, not rows — and before the
+    # phase-1/phase-2 split below the cost scaled with rows EXAMINED rather than
+    # rows claimed. Measured on the 2026-08-19 failure: a 42-country filter
+    # rejected ~3 of every 4 rows examined, so a 4,773-row chunk touched ~16.7k
+    # heap pages and ran 62-102s idle — past the 120s cap once it also competed
+    # with live traffic, which is how that assign 500'd.
+    #
+    # With the split, heap reads are ~1 per row CLAIMED, so 1,500 lands around
+    # 5-10s for the lock and ~5s for the UPDATE (each non-HOT contacts write
+    # rewrites ~9 indexes at ~3ms/row). Do not raise this past ~30,000 without
+    # revisiting phase 2: it binds one param per candidate id, against asyncpg's
+    # 32,767-param cap. _CLAIM_CHUNK_FLOOR lets a loaded database back off
+    # further instead of failing the request outright.
+    CLAIM_CHUNK = 1500
+    _CLAIM_CHUNK_FLOOR = 200
 
     # Fresh (never-invited) contacts claimed across all pools — feeds the exact
     # bucket-remaining decrement below instead of a whole-bucket recount.
@@ -595,19 +658,76 @@ async def assign_bucket(
         dual-written only for still-fresh contacts (WHERE outreach_status='available')
         so reused contacts keep their prior 'used' slot for un-migrated read paths."""
         got = 0
+        chunk = CLAIM_CHUNK
         while got < target:
-            chunk_limit = min(CLAIM_CHUNK, target - got)
-            # Fetch outreach_status alongside the id: the merged UPDATE below no
-            # longer yields a fresh-rows rowcount, so the fresh count comes from
-            # the statuses captured here (rows are FOR UPDATE locked — stable).
-            cand_rows = (await db.execute(
-                select(Contact.id, Contact.outreach_status).where(*where_conds).limit(chunk_limit)
-                .with_for_update(skip_locked=True)
-            )).all()
+            chunk_limit = min(chunk, target - got)
+            # Both phases run under ONE savepoint so a statement timeout costs the
+            # chunk, not the whole assign. How many heap pages a chunk touches
+            # depends on how selective the operator's filters are, which no fixed
+            # chunk size can predict, so on a timeout we halve and retry. Rows this
+            # attempt locked are released by the savepoint rollback; rows claimed by
+            # EARLIER chunks are not (their savepoint was already released), so the
+            # loop resumes without re-claiming or double-counting.
+            while True:
+                sp = await db.begin_nested()
+                try:
+                    # Phase 1 — choose candidates WITHOUT locking and WITHOUT
+                    # reading the heap. Selecting only `id` lets this run as an
+                    # Index Only Scan over ix_contacts_claim_cover (migration 072),
+                    # which carries id + country + list_location + employee_count in
+                    # its payload, so the filters are evaluated against index tuples
+                    # and a rejected row costs no heap read. That is the whole point
+                    # of the split: a selective country filter rejects most rows it
+                    # examines, and paying a random heap read for each of those is
+                    # what pushed this scan past the statement timeout when it was
+                    # one combined SELECT ... FOR UPDATE.
+                    cand_ids = (await db.execute(
+                        select(Contact.id).where(*where_conds).limit(chunk_limit)
+                    )).scalars().all()
+                    # Fewer rows than asked for is the only trustworthy "pool is
+                    # empty" signal — phase 2's count is not, since SKIP LOCKED also
+                    # drops rows a concurrent assign merely holds.
+                    exhausted = len(cand_ids) < chunk_limit
+                    # Phase 2 — lock just those candidates, by id. Now the heap reads
+                    # are proportional to rows CLAIMED rather than rows EXAMINED.
+                    # `where_conds` is re-applied deliberately: a concurrent assign
+                    # may have claimed one of these between the two statements, and
+                    # under READ COMMITTED Postgres re-checks the qual after taking
+                    # each lock, so a row that stopped qualifying drops out here.
+                    # Fetch outreach_status alongside the id: the merged UPDATE below
+                    # no longer yields a fresh-rows rowcount, so the fresh count comes
+                    # from the statuses captured here (rows are locked — stable).
+                    cand_rows = (await db.execute(
+                        select(Contact.id, Contact.outreach_status)
+                        .where(Contact.id.in_(cand_ids), *where_conds)
+                        .with_for_update(skip_locked=True)
+                    )).all() if cand_ids else []
+                    await sp.commit()
+                    break
+                except DBAPIError as exc:
+                    await sp.rollback()
+                    if not _is_statement_timeout(exc) or chunk_limit <= _CLAIM_CHUNK_FLOOR:
+                        raise
+                    chunk = max(_CLAIM_CHUNK_FLOOR, chunk_limit // 2)
+                    chunk_limit = min(chunk, target - got)
+                    logger.warning(
+                        "assign: candidate scan hit the statement timeout, "
+                        "retrying with chunk=%d (claimed %d/%d so far)",
+                        chunk_limit, got, target,
+                    )
             if not cand_rows:
                 break
             candidate_ids = [r[0] for r in cand_rows]
-            status_by_id = {r[0]: r[1] for r in cand_rows}
+            # Keys normalized with str(): contacts.id is mapped UUID(as_uuid=False),
+            # so the ORM select above yields `str`, while the raw-SQL INSERT below
+            # returns `uuid.UUID` (sa_text carries no type info, so asyncpg's native
+            # uuid decoding stands). Looking a UUID up in a str-keyed dict silently
+            # missed EVERY row, which pinned fresh_claimed at 0 and meant
+            # bucket.remaining_contacts was never decremented by an assign — the
+            # bucket's AVAILABLE stat only self-corrected when a release recomputed
+            # it (releases.py). Normalize both sides rather than one, so this cannot
+            # regress if either side's typing changes.
+            status_by_id = {str(r[0]): r[1] for r in cand_rows}
             # unnest-array insert: one bind param regardless of chunk size (the
             # old per-row VALUES form hit asyncpg's 32,767-param cap at ~4k rows,
             # which is what capped chunks at 2000).
@@ -653,12 +773,17 @@ async def assign_bucket(
                     },
                 )
                 fresh_claimed["n"] += sum(
-                    1 for cid in inserted_ids if status_by_id.get(cid) == "available"
+                    1 for cid in inserted_ids if status_by_id.get(str(cid)) == "available"
                 )
             got += n
-            if n < chunk_limit:
-                # Fewer rows than requested → this pool is exhausted (or a concurrent
-                # assign claimed the remainder). Stop looping on an empty set.
+            if exhausted or n == 0:
+                # exhausted → phase 1 scraped the bottom of the pool. n == 0 →
+                # everything phase 1 offered is held or was taken by a concurrent
+                # assign; phase 1 would hand back the same ids next pass, so stop
+                # rather than spin. A partial chunk (0 < n < chunk_limit) is NOT a
+                # stop signal: the rows just claimed now have assigned_membership_count
+                # > 0 and drop out of the next pass's candidate set, so the loop
+                # advances onto fresh rows.
                 break
         return got
 
