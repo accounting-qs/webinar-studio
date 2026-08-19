@@ -53,6 +53,7 @@ const Z_ROW = "z-20";
 // Row-type backgrounds (must be opaque so scroll doesn't bleed through)
 const BG_HEADER = "bg-zinc-50 dark:bg-zinc-900";
 const BG_PARENT = "bg-zinc-100 dark:bg-zinc-800";
+const BG_SUB = "bg-zinc-200 dark:bg-zinc-900";
 const BG_GROUP = "bg-zinc-100 dark:bg-zinc-800";
 const BG_LIST = "bg-white dark:bg-zinc-950";
 const BG_SPECIAL = "bg-zinc-50 dark:bg-zinc-900";
@@ -81,6 +82,11 @@ const sSendH = `${L_SEND} ${Z_HEADER} ${BG_HEADER}`;
 const sNumP = `${L_NUM} ${Z_ROW} ${BG_PARENT}`;
 const sDescP = `${L_DESC} ${Z_ROW} ${BG_PARENT}`;
 // (parent-row's colSpan={4} cell spans Desc+Copy+URL+Send, one sticky cell)
+
+// Webinar "Overall" sub-row — a shade off the parent row so the pair reads as
+// two halves of one webinar block.
+const sNumSub = `${L_NUM} ${Z_ROW} ${BG_SUB}`;
+const sDescSub = `${L_DESC} ${Z_ROW} ${BG_SUB}`;
 
 const sNumG = `${L_NUM} ${Z_ROW} ${BG_GROUP}`;
 const sDescG = `${L_DESC} ${Z_ROW} ${BG_GROUP}`;
@@ -352,7 +358,7 @@ function MetricCell({
   );
 
   return (
-    <td className={`px-2 ${dense ? "py-1 text-[11px]" : "py-1.5"} text-right font-mono whitespace-nowrap ${
+    <td className={`px-2 ${dense ? "py-0.5 text-[11px]" : "py-1.5"} text-right font-mono whitespace-nowrap ${
       bold ? "font-bold" : ""
     } ${
       isNull
@@ -1548,7 +1554,7 @@ export function StatisticsPage() {
                   className="bg-zinc-100 dark:bg-zinc-800/40 hover:bg-zinc-200 dark:hover:bg-zinc-800/60 cursor-pointer border-t-2 border-zinc-300 dark:border-zinc-700/40 transition-colors"
                   onClick={() => toggleExpand(w.id)}
                 >
-                  <td className="px-2 py-2.5 text-center">
+                  <td className="px-2 py-1.5 text-center">
                     <svg
                       width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                       strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
@@ -1557,7 +1563,7 @@ export function StatisticsPage() {
                       <path d="M9 18l6-6-6-6" />
                     </svg>
                   </td>
-                  <td className={`px-2 py-2.5 ${W_NUM} ${sNumP}`}>
+                  <td className={`px-2 py-1.5 ${W_NUM} ${sNumP}`}>
                     <div className="flex items-center gap-2">
                       <span className="text-zinc-900 dark:text-zinc-100 font-bold text-sm">{w.number}</span>
                       <span className="text-zinc-500">{w.date ?? "\u2014"}</span>
@@ -1582,10 +1588,10 @@ export function StatisticsPage() {
                       <div className="text-[10px] text-zinc-500 mt-0.5 truncate max-w-[200px]">{w.title}</div>
                     )}
                   </td>
-                  <td className="px-2 py-2.5">
+                  <td className="px-2 py-1.5">
                     <StatusBadge status={statusForBadge} />
                   </td>
-                  <td className="px-2 py-2.5 text-zinc-500 text-[10px]">
+                  <td className="px-2 py-1.5 text-zinc-500 text-[10px]">
                     <span>{listCount} lists</span>
                     {assignedTotals && (
                       <span
@@ -1604,7 +1610,7 @@ export function StatisticsPage() {
                       </span>
                     )}
                   </td>
-                  <td className={`px-2 py-2.5 ${sDescP}`} colSpan={4}>
+                  <td className={`px-2 py-1.5 ${sDescP}`} colSpan={4}>
                     <button
                       onClick={(e) => handleWebinarSync(w.number, e)}
                       disabled={syncingWebinar !== null}
@@ -1665,7 +1671,7 @@ export function StatisticsPage() {
                         return (
                           <td
                             key={col.key}
-                            className={`px-2 py-2.5 text-right font-mono font-bold whitespace-nowrap ${
+                            className={`px-2 py-1.5 text-right font-mono font-bold whitespace-nowrap ${
                               show ? "text-zinc-800 dark:text-zinc-100" : "text-zinc-500"
                             } ${isGroupBoundary(idx) ? GROUP_BOUNDARY_CLASSES : ""}`}
                           >
@@ -1692,11 +1698,11 @@ export function StatisticsPage() {
                 {/* ── Overall sub-row (assigned lists + specials) ───── */}
                 {assignedTotals && (
                   <tr
-                    className="bg-zinc-100 dark:bg-zinc-800/40 hover:bg-zinc-200 dark:hover:bg-zinc-800/60 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
+                    className="bg-zinc-200 dark:bg-zinc-900 hover:bg-zinc-300/70 dark:hover:bg-zinc-800/70 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
                     onClick={() => toggleExpand(w.id)}
                   >
-                    <td className="px-2 py-1"></td>
-                    <td className={`px-2 py-1 ${W_NUM} ${sNumP}`}>
+                    <td className="px-2 py-0.5"></td>
+                    <td className={`px-2 py-0.5 ${W_NUM} ${sNumSub}`}>
                       <span
                         title="Everything attributed to this webinar — assigned lists plus Nonjoiners and NO LIST DATA."
                         className="pl-4 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
@@ -1704,9 +1710,9 @@ export function StatisticsPage() {
                         Overall
                       </span>
                     </td>
-                    <td className="px-2 py-1"></td>
-                    <td className="px-2 py-1"></td>
-                    <td className={`px-2 py-1 ${sDescP}`} colSpan={4}></td>
+                    <td className="px-2 py-0.5"></td>
+                    <td className="px-2 py-0.5"></td>
+                    <td className={`px-2 py-0.5 ${sDescSub}`} colSpan={4}></td>
                     {METRIC_COLUMNS.map((col, idx) => (
                       <MetricCell
                         key={col.key}
