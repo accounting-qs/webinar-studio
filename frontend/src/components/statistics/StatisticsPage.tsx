@@ -272,11 +272,14 @@ const DRILLDOWN_KEYS = new Set([
 ]);
 
 function MetricCell({
-  value, col, bold, boundary, webinarNumber, webinarId, assignmentId, listLabel, rowMetrics, onDrill,
+  value, col, bold, dense, boundary, webinarNumber, webinarId, assignmentId, listLabel, rowMetrics, onDrill,
 }: {
   value: number | null | undefined;
   col: MetricColumn;
   bold?: boolean;
+  /** Compact, muted rendering — used by the webinar "Overall" sub-row that
+   * sits under the headline assigned-lists total. */
+  dense?: boolean;
   boundary?: boolean;
   webinarNumber?: number;
   /** Webinar UUID — preferred for drilldown so A/B variants stay separate.
@@ -349,9 +352,17 @@ function MetricCell({
   );
 
   return (
-    <td className={`px-2 py-1.5 text-right font-mono whitespace-nowrap ${
+    <td className={`px-2 ${dense ? "py-1 text-[11px]" : "py-1.5"} text-right font-mono whitespace-nowrap ${
       bold ? "font-bold" : ""
-    } ${isNull ? "text-zinc-400" : bold ? "text-zinc-800 dark:text-zinc-200" : "text-zinc-700 dark:text-zinc-300"} ${
+    } ${
+      isNull
+        ? "text-zinc-400"
+        : dense
+        ? "text-zinc-500 dark:text-zinc-400"
+        : bold
+        ? "text-zinc-800 dark:text-zinc-200"
+        : "text-zinc-700 dark:text-zinc-300"
+    } ${
       boundary ? GROUP_BOUNDARY_CLASSES : ""
     }`}>
       {hasWarning && (
@@ -1251,6 +1262,22 @@ export function StatisticsPage() {
     return new Set(filteredWebinars.map((w) => w.id));
   }, [senderFilter, expandedIds, filteredWebinars]);
 
+  /* ── Assigned-lists totals per webinar ──────────────────────────────
+   * Sum of the assigned list rows only — the same set the expanded
+   * "Assigned Lists Total" row covers (excludes NO LIST DATA / Nonjoiners).
+   * Rendered as the webinar's headline row, with the overall numbers kept
+   * on a second, smaller row right underneath. Empty while the webinar's
+   * metrics are still loading, in which case the headline row falls back to
+   * the overall summary and no sub-row is drawn. */
+  const assignedTotalsById = useMemo(() => {
+    const map = new Map<string, Record<string, number | null>>();
+    for (const w of filteredWebinars) {
+      const lists = w.rows.filter((r) => r.kind === "list");
+      if (lists.length > 0) map.set(w.id, aggregateMetrics(lists));
+    }
+    return map;
+  }, [filteredWebinars]);
+
   /* ── Global summary stats ───────────────────────────────────────── */
   const globalStats = useMemo(() => {
     const totalInvited = webinars.reduce((s, w) => s + (w.summary.invited ?? 0), 0);
@@ -1508,6 +1535,11 @@ export function StatisticsPage() {
               ? w.rows.filter((r) => r.kind === "list").length
               : summary?.listCount ?? 0;
             const statusForBadge = w.rows[0]?.status ?? summary?.status ?? null;
+            // Headline metrics = assigned lists only; the overall numbers move
+            // to the smaller sub-row below. Falls back to overall (and skips
+            // the sub-row) while this webinar's rows are still loading.
+            const assignedTotals = assignedTotalsById.get(w.id) ?? null;
+            const webinarLabel = `Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`;
 
             return (
               <tbody key={w.id}>
@@ -1555,6 +1587,14 @@ export function StatisticsPage() {
                   </td>
                   <td className="px-2 py-2.5 text-zinc-500 text-[10px]">
                     <span>{listCount} lists</span>
+                    {assignedTotals && (
+                      <span
+                        title="These numbers are the sum of the assigned lists only — same as the 'Assigned Lists Total' row inside the dropdown. The row below shows the overall webinar numbers (assigned lists + Nonjoiners + NO LIST DATA)."
+                        className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30 align-middle"
+                      >
+                        assigned lists
+                      </span>
+                    )}
                     {w.usedFallback && (
                       <span
                         title="Rate metrics use the planned 'Invited' number because no contacts have been marked sent yet for this webinar (or all sent contacts have been released). Mark contacts as used on the planning page for more accurate rates."
@@ -1618,21 +1658,71 @@ export function StatisticsPage() {
                       </button>
                     )}
                   </td>
-                  {METRIC_COLUMNS.map((col, idx) => (
-                    <MetricCell
-                      key={col.key}
-                      value={w.summary[col.key]}
-                      col={col}
-                      bold
-                      boundary={isGroupBoundary(idx)}
-                      webinarNumber={w.number}
-                      webinarId={w.webinarId}
-                      listLabel={`Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`}
-                      rowMetrics={w.summary}
-                      onDrill={setDrill}
-                    />
-                  ))}
+                  {assignedTotals
+                    ? METRIC_COLUMNS.map((col, idx) => {
+                        const v = assignedTotals[col.key];
+                        const show = showAggValue(col, v);
+                        return (
+                          <td
+                            key={col.key}
+                            className={`px-2 py-2.5 text-right font-mono font-bold whitespace-nowrap ${
+                              show ? "text-zinc-800 dark:text-zinc-100" : "text-zinc-500"
+                            } ${isGroupBoundary(idx) ? GROUP_BOUNDARY_CLASSES : ""}`}
+                          >
+                            {show ? formatMetricValue(v ?? null, col) : ""}
+                          </td>
+                        );
+                      })
+                    : METRIC_COLUMNS.map((col, idx) => (
+                        <MetricCell
+                          key={col.key}
+                          value={w.summary[col.key]}
+                          col={col}
+                          bold
+                          boundary={isGroupBoundary(idx)}
+                          webinarNumber={w.number}
+                          webinarId={w.webinarId}
+                          listLabel={webinarLabel}
+                          rowMetrics={w.summary}
+                          onDrill={setDrill}
+                        />
+                      ))}
                 </tr>
+
+                {/* ── Overall sub-row (assigned lists + specials) ───── */}
+                {assignedTotals && (
+                  <tr
+                    className="bg-zinc-100 dark:bg-zinc-800/40 hover:bg-zinc-200 dark:hover:bg-zinc-800/60 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
+                    onClick={() => toggleExpand(w.id)}
+                  >
+                    <td className="px-2 py-1"></td>
+                    <td className={`px-2 py-1 ${W_NUM} ${sNumP}`}>
+                      <span
+                        title="Everything attributed to this webinar — assigned lists plus Nonjoiners and NO LIST DATA."
+                        className="pl-4 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
+                      >
+                        Overall
+                      </span>
+                    </td>
+                    <td className="px-2 py-1"></td>
+                    <td className="px-2 py-1"></td>
+                    <td className={`px-2 py-1 ${sDescP}`} colSpan={4}></td>
+                    {METRIC_COLUMNS.map((col, idx) => (
+                      <MetricCell
+                        key={col.key}
+                        value={w.summary[col.key]}
+                        col={col}
+                        dense
+                        boundary={isGroupBoundary(idx)}
+                        webinarNumber={w.number}
+                        webinarId={w.webinarId}
+                        listLabel={webinarLabel}
+                        rowMetrics={w.summary}
+                        onDrill={setDrill}
+                      />
+                    ))}
+                  </tr>
+                )}
 
                 {/* ── Child rows (bucket-grouped) ─────────────────── */}
                 {isExpanded && w.rows.length > 0 &&
