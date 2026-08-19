@@ -41,3 +41,10 @@ migrations/versions/__pycache__/
 #Local Assets
 local_assets/
 lloyd-database-transfer/
+
+# Scratch run output (backfill/server logs written during ad-hoc work).
+# Matched at any depth so frontend/scratch_*.log is covered too. Deliberately
+# not committed: they go stale immediately, and the .prod.log ones carry
+# production backfill output that would live in git history permanently.
+scratch_*.log
+**/scratch_*.log
