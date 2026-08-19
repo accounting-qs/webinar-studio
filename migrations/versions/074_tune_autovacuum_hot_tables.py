@@ -58,6 +58,13 @@ TUNED = {
     "contacts": {
         "autovacuum_vacuum_scale_factor": "0.02",
         "autovacuum_analyze_scale_factor": "0.01",
+        # Prod already carried this one, set by hand and never captured in a
+        # migration — folded in here so a fresh environment reproduces it.
+        # It earns its place independently: contacts takes large CSV imports,
+        # so it is append-heavy in bursts, and inserted pages the VM has never
+        # marked all-visible defeat index-only scans just as thoroughly as dead
+        # tuples do.
+        "autovacuum_vacuum_insert_scale_factor": "0.02",
     },
     "webinar_contact_memberships": {
         "autovacuum_vacuum_scale_factor": "0.02",
@@ -68,10 +75,27 @@ TUNED = {
 
 
 def upgrade() -> None:
-    op.execute("SET LOCAL lock_timeout = '5s'")
+    # Lock-tolerant for the same reason as migration 073: this runs from the
+    # Render start command, so it must never be why the service fails to boot.
+    # ALTER TABLE ... SET takes SHARE UPDATE EXCLUSIVE, which does NOT conflict
+    # with ordinary reads or writes — but it does conflict with an in-progress
+    # autovacuum on the same table, which on a table this size can run for
+    # minutes. Skipping is safe: the tables keep their previous (default)
+    # thresholds until the next attempt, which is exactly the status quo.
     for table, params in TUNED.items():
         settings = ", ".join(f"{k} = {v}" for k, v in params.items())
-        op.execute(f"ALTER TABLE {table} SET ({settings})")
+        op.execute(
+            f"""
+            DO $$
+            BEGIN
+                SET LOCAL lock_timeout = '5s';
+                EXECUTE 'ALTER TABLE {table} SET ({settings})';
+            EXCEPTION
+                WHEN lock_not_available THEN
+                    RAISE NOTICE 'skipped autovacuum tuning for {table}: lock busy';
+            END $$;
+            """
+        )
 
 
 def downgrade() -> None:

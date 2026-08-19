@@ -116,11 +116,38 @@ RECREATE = {
 
 
 def upgrade() -> None:
-    op.execute("SET LOCAL lock_timeout = '5s'")
+    # Each drop is attempted under a SHORT lock_timeout and its failure is
+    # SWALLOWED. Both halves of that matter, because this runs from the Render
+    # start command (`alembic upgrade head && uvicorn ...`):
+    #
+    #   - Without lock_timeout, a plain DROP INDEX waits for ACCESS EXCLUSIVE on
+    #     contacts, and every query arriving behind it queues too — one long
+    #     import transaction would stall the whole table for its duration.
+    #   - WITH lock_timeout but without the handler, failing to get the lock
+    #     raises, which fails the migration, which crash-loops the service.
+    #
+    # Dropping a redundant index is pure housekeeping, so "not now" is a
+    # perfectly good answer: the index survives to the next attempt and nothing
+    # is incorrect in the meantime. Prod takes these via DROP INDEX CONCURRENTLY
+    # out of band anyway; this path exists for fresh environments and as a
+    # backstop, and must never be the reason a deploy fails to boot.
     for name in DROPPED:
-        op.execute(f"DROP INDEX IF EXISTS {name}")
+        op.execute(
+            f"""
+            DO $$
+            BEGIN
+                SET LOCAL lock_timeout = '3s';
+                EXECUTE 'DROP INDEX IF EXISTS {name}';
+            EXCEPTION
+                WHEN lock_not_available THEN
+                    RAISE NOTICE 'skipped {name}: lock busy, drop it out of band';
+            END $$;
+            """
+        )
 
 
 def downgrade() -> None:
+    # Recreating is safe to let block: a downgrade is a deliberate, supervised
+    # act, not something the start command runs unattended.
     for name in DROPPED:
         op.execute(RECREATE[name])
