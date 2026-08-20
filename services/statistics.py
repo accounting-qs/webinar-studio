@@ -699,10 +699,16 @@ async def get_statistics_segment_employee(
     from db.models import OutreachBucket
     from services.ghl_statistics_source import SOURCE_FUNNEL_RAW_KEYS
 
+    # Columns, not the ORM entity: OutreachBucket eager-loads its `copies`
+    # (lazy="selectin"), so entity-loading one bucket fires a second query for
+    # copy text this endpoint never looks at.
     async with AsyncSessionLocal() as db:
         bucket = (await db.execute(
-            select(OutreachBucket).where(OutreachBucket.id == bucket_id)
-        )).scalar_one_or_none()
+            select(
+                OutreachBucket.id, OutreachBucket.name,
+                OutreachBucket.stat_emp_min, OutreachBucket.stat_emp_max,
+            ).where(OutreachBucket.id == bucket_id)
+        )).first()
         if bucket is None:
             return None
 
