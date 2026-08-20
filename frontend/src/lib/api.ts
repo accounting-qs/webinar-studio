@@ -1863,6 +1863,10 @@ export interface SegmentFunnelRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   /** Sales + quality counts rolled up per bucket. Show% / Close% / Qual% are
    * derived from these sums in the table (never averaged per-webinar). */
   confirmed: number;
@@ -1918,6 +1922,10 @@ export interface SegmentEmployeeBand {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   confirmed: number;
   shows: number;
   noShows: number;
@@ -1970,6 +1978,10 @@ export interface SourceVintageRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   confirmed: number;
   shows: number;
   noShows: number;
@@ -1990,6 +2002,10 @@ export interface SourceFunnelRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   /** Sales + quality counts (mirrors SegmentFunnelRow). Show% / Close% / Qual%
    * are derived from these sums in the table (never averaged per-webinar). */
   confirmed: number;
@@ -2022,6 +2038,10 @@ export interface SourceFunnelTotals {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   confirmed: number;
   shows: number;
   noShows: number;
@@ -2073,6 +2093,10 @@ export interface EmployeeFunnelRow {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   /** Sales + quality counts (mirrors SourceFunnelRow). Rates are derived from
    * these sums in the table (never averaged per-webinar). */
   confirmed: number;
@@ -2103,6 +2127,10 @@ export interface EmployeeFunnelTotals {
   regs: number;
   attendees10m: number;
   bookings: number;
+  /** Booked calls whose appointment date has already passed — the Show%
+   * denominator, so upcoming calls never depress the rate. 0 on snapshots
+   * written before this field existed (recompute to populate). */
+  callsPassed: number;
   confirmed: number;
   shows: number;
   noShows: number;

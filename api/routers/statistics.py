@@ -725,6 +725,10 @@ class SegmentFunnelRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     # Sales + quality counts rolled up per bucket. Show% / Close% / Qual% are
     # derived on the frontend from these sums (never averaged). Default 0 so any
     # row that predates these fields still validates.
@@ -776,6 +780,10 @@ class SegmentEmployeeBand(BaseModel):
     regs: int = 0
     attendees10m: int = 0
     bookings: int = 0
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     confirmed: int = 0
     shows: int = 0
     noShows: int = 0
@@ -833,6 +841,10 @@ class SourceVintageRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     confirmed: int = 0
     shows: int = 0
     noShows: int = 0
@@ -854,6 +866,10 @@ class SourceFunnelRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     # Sales + quality counts (mirrors SegmentFunnelRow). Rates are derived on the
     # frontend from these sums. Default 0 so pre-feature snapshots still validate.
     confirmed: int = 0
@@ -885,6 +901,10 @@ class SourceFunnelTotals(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     confirmed: int = 0
     shows: int = 0
     noShows: int = 0
@@ -934,6 +954,10 @@ class EmployeeFunnelRow(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     confirmed: int = 0
     shows: int = 0
     noShows: int = 0
@@ -962,6 +986,10 @@ class EmployeeFunnelTotals(BaseModel):
     regs: int
     attendees10m: int
     bookings: int
+    # Booked calls whose appointment date has already passed — the Show%
+    # denominator, so upcoming calls never depress the rate. 0 on snapshots
+    # written before this field existed (recompute to populate).
+    callsPassed: int = 0
     confirmed: int = 0
     shows: int = 0
     noShows: int = 0

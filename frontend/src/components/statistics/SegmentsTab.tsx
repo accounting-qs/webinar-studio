@@ -75,7 +75,7 @@ type FunnelCells = {
 /** Raw count fields deriveCells needs — satisfied by BOTH a segment row and an
  * employee-size band, so the drill-down reuses the exact same cells + heatmap. */
 type RawFunnelCounts = {
-  invites: number; regs: number; attendees10m: number; bookings: number;
+  invites: number; regs: number; attendees10m: number; bookings: number; callsPassed: number;
   confirmed: number; shows: number; noShows: number; canceled: number; won: number;
   disqualified: number; qualified: number;
   leadQualityGreat: number; leadQualityOk: number;
@@ -95,7 +95,9 @@ function deriveCells(r: RawFunnelCounts): FunnelCells {
     bookPer1kInv: safePer1k(r.bookings, r.invites),
     confirmed: r.confirmed,
     shows: r.shows,
-    showPct: safeDiv(r.shows, r.bookings),
+    // Shows ÷ the calls whose date has passed (not ÷ bookings): a call
+    // still in the future is not a call that failed to show.
+    showPct: safeDiv(r.shows, r.callsPassed),
     noShows: r.noShows,
     canceled: r.canceled,
     won: r.won,
@@ -434,7 +436,7 @@ const NUMERIC_COLUMNS: {
   { key: "bookPer1kInv", label: "Book/1k inv", group: "Sales", title: "Bookings per 1,000 invites", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
   { key: "confirmed", label: "Confirmed", group: "Sales", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
   { key: "shows", label: "Shows", group: "Sales", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
-  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
+  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ calls whose date has passed", fmt: (c) => fmtPct(c.showPct) },
   { key: "noShows", label: "No Shows", group: "Sales", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
   { key: "canceled", label: "Canceled", group: "Sales", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
   { key: "won", label: "Won", group: "Sales", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },

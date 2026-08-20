@@ -477,7 +477,7 @@ async def get_statistics_webinar_one(
 # counts per bucket.
 _FUNNEL_RAW_KEYS = (
     "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
-    "confirmed", "shows", "noShows", "canceled", "won",
+    "totalCallsDatePassed", "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
 )
@@ -791,6 +791,9 @@ async def get_statistics_segments(
             "attendees10m": int(slot["total10MinPlus"] or 0),
             "bookings": int(slot["totalBookings"] or 0),
             "uniqueBookers": int(slot.get("uniqueBookers") or 0),
+            # Calls whose appointment date has already passed — the Show%
+            # denominator, so upcoming calls never depress the rate.
+            "callsPassed": int(slot.get("totalCallsDatePassed") or 0),
             "confirmed": int(slot["confirmed"] or 0),
             "shows": int(slot["shows"] or 0),
             "noShows": int(slot["noShows"] or 0),
@@ -817,7 +820,7 @@ async def get_statistics_segments(
         segments.append(_shape(other))
 
     _total_count_keys = (
-        "invites", "regs", "attendees10m", "bookings",
+        "invites", "regs", "attendees10m", "bookings", "callsPassed",
         "confirmed", "shows", "noShows", "canceled", "won",
         "disqualified", "qualified",
         "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -932,6 +935,7 @@ async def get_statistics_segment_employee(
             "attendees10m": int(raw.get("total10MinPlus") or 0),
             "bookings": int(raw.get("totalBookings") or 0),
             "uniqueBookers": int(raw.get("uniqueBookers") or 0),
+            "callsPassed": int(raw.get("totalCallsDatePassed") or 0),
             "confirmed": int(raw.get("confirmed") or 0),
             "shows": int(raw.get("shows") or 0),
             "noShows": int(raw.get("noShows") or 0),
@@ -971,7 +975,7 @@ async def get_statistics_segment_employee(
 # these sums downstream (never averaged), same convention as the Segments tab.
 _SOURCE_RAW_KEYS = (
     "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
-    "confirmed", "shows", "noShows", "canceled", "won",
+    "totalCallsDatePassed", "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
 )
@@ -986,6 +990,7 @@ def _shape_source_funnel(raw: dict[str, Any]) -> dict[str, int]:
         "attendees10m": int(raw.get("total10MinPlus") or 0),
         "bookings": int(raw.get("totalBookings") or 0),
         "uniqueBookers": int(raw.get("uniqueBookers") or 0),
+        "callsPassed": int(raw.get("totalCallsDatePassed") or 0),
         "confirmed": int(raw.get("confirmed") or 0),
         "shows": int(raw.get("shows") or 0),
         "noShows": int(raw.get("noShows") or 0),
@@ -1113,7 +1118,7 @@ async def get_statistics_by_source(
 
     by_source = _shape_source_agg(overall)
     _total_count_keys = (
-        "invites", "regs", "attendees10m", "bookings",
+        "invites", "regs", "attendees10m", "bookings", "callsPassed",
         "confirmed", "shows", "noShows", "canceled", "won",
         "disqualified", "qualified",
         "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -1234,7 +1239,7 @@ async def get_statistics_by_employee(
 
     by_employee = _shape_employee_agg(overall)
     _total_count_keys = (
-        "invites", "regs", "attendees10m", "bookings",
+        "invites", "regs", "attendees10m", "bookings", "callsPassed",
         "confirmed", "shows", "noShows", "canceled", "won",
         "disqualified", "qualified",
         "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",

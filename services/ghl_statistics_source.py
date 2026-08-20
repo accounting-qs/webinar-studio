@@ -221,7 +221,7 @@ def _webinar_series_regex(webinar_number: int) -> str:
 # funnel-derivation logic (percentages derived from these sums, never averaged).
 SOURCE_FUNNEL_RAW_KEYS = (
     "invited", "totalRegs", "totalAttended", "total10MinPlus", "totalBookings", "uniqueBookers",
-    "confirmed", "shows", "noShows", "canceled", "won",
+    "totalCallsDatePassed", "confirmed", "shows", "noShows", "canceled", "won",
     "disqualified", "qualified",
     "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
 )
@@ -2001,6 +2001,7 @@ class GoHighLevelStatisticsSource:
             SELECT {lln_expr} AS lln,
                 COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
                 COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
+                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.call1_appointment_date IS NOT NULL AND o.call1_appointment_date <= NOW()) AS calls_passed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
                 COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
@@ -2031,6 +2032,7 @@ class GoHighLevelStatisticsSource:
             slot = raw.setdefault(row["lln"], {})
             slot["totalBookings"] = int(row["total_bookings"] or 0)
             slot["uniqueBookers"] = int(row["unique_bookers"] or 0)
+            slot["totalCallsDatePassed"] = int(row["calls_passed"] or 0)
             slot["confirmed"] = int(row["confirmed"] or 0)
             slot["shows"] = int(row["shows"] or 0)
             slot["noShows"] = int(row["no_shows"] or 0)
@@ -2220,6 +2222,7 @@ class GoHighLevelStatisticsSource:
             SELECT t.bucket, {seg_select}
                 COUNT(DISTINCT t.opp_id) AS total_bookings,
                 COUNT(DISTINCT t.ghl_contact_id) AS unique_bookers,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.call_at IS NOT NULL AND t.call_at <= NOW()) AS calls_passed,
                 COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'confirmed') AS confirmed,
                 COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'showed') AS shows,
                 COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status IN ('noshow','no show','no-show')) AS no_shows,
@@ -2237,6 +2240,7 @@ class GoHighLevelStatisticsSource:
                     o.ghl_opportunity_id AS opp_id,
                     g.ghl_contact_id AS ghl_contact_id,
                     LOWER(COALESCE(o.call1_appointment_status, '')) AS appt_status,
+                    o.call1_appointment_date AS call_at,
                     o.pipeline_stage_id AS stage_id,
                     o.lead_quality AS lead_quality
                 FROM contacts c
@@ -2259,6 +2263,7 @@ class GoHighLevelStatisticsSource:
             slot = _slot(row)
             slot["totalBookings"] = int(row["total_bookings"] or 0)
             slot["uniqueBookers"] = int(row["unique_bookers"] or 0)
+            slot["totalCallsDatePassed"] = int(row["calls_passed"] or 0)
             slot["confirmed"] = int(row["confirmed"] or 0)
             slot["shows"] = int(row["shows"] or 0)
             slot["noShows"] = int(row["no_shows"] or 0)

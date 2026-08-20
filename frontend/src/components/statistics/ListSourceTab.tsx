@@ -51,7 +51,7 @@ type GroupMode = "source" | "vintage";
 /** Raw count fields carried on every source/vintage cell (mirror the backend
  * SOURCE_FUNNEL_RAW_KEYS / Segments tab). Rates are derived from the sums. */
 const FUNNEL_KEYS = [
-  "invites", "regs", "attendees10m", "bookings",
+  "invites", "regs", "attendees10m", "bookings", "callsPassed",
   "confirmed", "shows", "noShows", "canceled", "won",
   "disqualified", "qualified",
   "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
@@ -146,7 +146,9 @@ function deriveCells(r: Funnel): FunnelCells {
     bookPer1kInv: safePer1k(r.bookings, r.invites),
     confirmed: r.confirmed,
     shows: r.shows,
-    showPct: safeDiv(r.shows, r.bookings),
+    // Shows ÷ the calls whose date has passed (not ÷ bookings): a call
+    // still in the future is not a call that failed to show.
+    showPct: safeDiv(r.shows, r.callsPassed),
     noShows: r.noShows,
     canceled: r.canceled,
     won: r.won,
@@ -373,7 +375,7 @@ const NUMERIC_COLUMNS: {
   { key: "bookPer1kInv", label: "Book/1k leads", group: "Sales", title: "Bookings per 1,000 leads", fmt: (c) => fmtPer1k(c.bookPer1kInv) },
   { key: "confirmed", label: "Confirmed", group: "Sales", title: "Opportunities with Call 1 status = Confirmed", fmt: (c) => fmtInt(c.confirmed) },
   { key: "shows", label: "Shows", group: "Sales", title: "Opportunities whose first call showed up", fmt: (c) => fmtInt(c.shows) },
-  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ bookings", fmt: (c) => fmtPct(c.showPct) },
+  { key: "showPct", label: "Show%", group: "Sales", title: "Shows ÷ calls whose date has passed", fmt: (c) => fmtPct(c.showPct) },
   { key: "noShows", label: "No Shows", group: "Sales", title: "Opportunities that no-showed on Call 1", fmt: (c) => fmtInt(c.noShows), lowerIsBetter: true },
   { key: "canceled", label: "Canceled", group: "Sales", title: "Opportunities whose Call 1 was cancelled", fmt: (c) => fmtInt(c.canceled), lowerIsBetter: true },
   { key: "won", label: "Won", group: "Sales", title: "Opportunities that reached the Deal Won stage", fmt: (c) => fmtInt(c.won) },

@@ -632,17 +632,16 @@ function VsTile({
   );
 }
 
-/** Calls whose date has passed, for the rollups that don't carry the field:
- * showed + no-showed + cancelled (Confirmed means the call is still ahead). */
-function callsPassed(r: { shows: number; noShows: number; canceled: number }): number {
-  return r.shows + r.noShows + r.canceled;
-}
-
 /** Show rate, or an honest "no calls yet" — a bare em dash beside the word
- * "show" reads as a rendering fault rather than an empty denominator. */
-function showLabel(r: { shows: number; noShows: number; canceled: number }): string {
-  const passed = callsPassed(r);
-  return passed ? `${fmtValue(safeDiv(r.shows, passed), "pct")} show` : "no calls yet";
+ * "show" reads as a rendering fault rather than an empty denominator.
+ *
+ * `callsPassed` is the real appointment-date count, the same denominator the
+ * Statistics table's Show % uses. It reads 0 on snapshots written before the
+ * field was plumbed through these rollups, which is indistinguishable from
+ * "nothing has happened yet" — so both states say "no calls yet" until a
+ * recompute rather than inventing a rate. */
+function showLabel(r: { shows: number; callsPassed: number }): string {
+  return r.callsPassed ? `${fmtValue(safeDiv(r.shows, r.callsPassed), "pct")} show` : "no calls yet";
 }
 
 function SegmentBars({ segments }: { segments: SegmentFunnelRow[] }) {
@@ -657,7 +656,7 @@ function SegmentBars({ segments }: { segments: SegmentFunnelRow[] }) {
           tipRows: [
             { label: "Invited", value: fmtValue(s.invites, "int") },
             { label: "Booked", value: fmtValue(s.bookings, "int") },
-            { label: "Show rate", value: fmtValue(safeDiv(s.shows, callsPassed(s)), "pct") },
+            { label: "Show rate", value: fmtValue(safeDiv(s.shows, s.callsPassed), "pct") },
             { label: "Qualified", value: fmtValue(safeDiv(s.qualified, s.shows), "pct") },
           ],
         }))
@@ -690,7 +689,7 @@ function EmployeeBars({ rows }: { rows: EmployeeFunnelRow[] }) {
           tipRows: [
             { label: "Invited", value: fmtValue(r.invites, "int") },
             { label: "Booked", value: fmtValue(r.bookings, "int") },
-            { label: "Show rate", value: fmtValue(safeDiv(r.shows, callsPassed(r)), "pct") },
+            { label: "Show rate", value: fmtValue(safeDiv(r.shows, r.callsPassed), "pct") },
             { label: "Qualified", value: fmtValue(safeDiv(r.qualified, r.shows), "pct") },
           ],
         }))
