@@ -31,6 +31,11 @@ def _snap_source(source: str) -> str:
     return "workbook" if source == "workbook" else "ghl"
 
 
+# Payload key holding the {bucketId: [{bucket, metrics}]} segment × company-size
+# cross (written by the recompute, read by the Segments-tab drill-down).
+_SEGMENT_EMPLOYEE_KEY = "segmentEmployeeRows"
+
+
 # ---------------------------------------------------------------------------
 # Read helpers
 # ---------------------------------------------------------------------------
@@ -52,18 +57,55 @@ async def read_snapshot_payload(source: str, webinar_id: str) -> dict[str, Any] 
 
 async def read_all_payloads(source: str) -> dict[str, dict[str, Any]]:
     """Every snapshot payload for a source, keyed by webinar_id. One query —
-    powers the Segments rollup without N per-webinar reads."""
-    from sqlalchemy import select
+    powers the Segments rollup without N per-webinar reads.
+
+    `segmentEmployeeRows` is stripped server-side: it is the drill-down's
+    per-segment × company-size cross (one row per segment per size band), which
+    no bulk consumer reads and which would otherwise multiply the bytes this
+    pulls over the wire on every tab load. read_segment_employee_cells() selects
+    the one segment's slice straight out of JSONB instead."""
+    from sqlalchemy import cast, literal, select, Text
+    from sqlalchemy.dialects.postgresql import JSONB
     from db.models import StatisticsSnapshot
     from db.session import AsyncSessionLocal
 
+    payload_lite = StatisticsSnapshot.payload.op("-", return_type=JSONB)(
+        cast(literal(_SEGMENT_EMPLOYEE_KEY), Text)
+    ).label("payload")
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
-            select(StatisticsSnapshot.webinar_id, StatisticsSnapshot.payload).where(
+            select(StatisticsSnapshot.webinar_id, payload_lite).where(
                 StatisticsSnapshot.source == _snap_source(source)
             )
         )).all()
     return {wid: payload for wid, payload in rows}
+
+
+
+async def read_segment_employee_cells(
+    source: str, bucket_id: str,
+) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+    """One segment's company-size cells per webinar, straight out of JSONB.
+
+    Returns ({webinar_id: cells}, {webinar_ids whose snapshot carries the key}).
+    A webinar in the second set but not the first simply has no contacts in this
+    segment (legitimately zero); a webinar in neither predates the key and needs
+    a recompute before its numbers can be included."""
+    from sqlalchemy import select
+    from db.models import StatisticsSnapshot
+    from db.session import AsyncSessionLocal
+
+    seg_col = StatisticsSnapshot.payload[_SEGMENT_EMPLOYEE_KEY][bucket_id].label("cells")
+    has_key = StatisticsSnapshot.payload.has_key(_SEGMENT_EMPLOYEE_KEY).label("has_key")
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(StatisticsSnapshot.webinar_id, seg_col, has_key).where(
+                StatisticsSnapshot.source == _snap_source(source)
+            )
+        )).all()
+    cells = {wid: c for wid, c, _hk in rows if c}
+    computed = {wid for wid, _c, hk in rows if hk}
+    return cells, computed
 
 
 async def _upsert_snapshot(source: str, payload: dict[str, Any]) -> None:

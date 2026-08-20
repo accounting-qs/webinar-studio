@@ -1054,20 +1054,16 @@ function SegmentRow({
         })}
       </tr>
       {expanded && canExpand && (
-        <tr className="bg-zinc-50 dark:bg-zinc-900/40">
-          <td colSpan={LEADING_COL_COUNT + NUMERIC_COLUMNS.length} className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800">
-            <SegmentDrilldown
-              data={drill}
-              loading={drillLoading}
-              error={drillError}
-              currentMin={row.statEmpMin ?? null}
-              currentMax={row.statEmpMax ?? null}
-              onApplyRange={(mn, mx) =>
-                onSetEmpRange && row.bucketId && onSetEmpRange(row.bucketId, mn, mx)
-              }
-            />
-          </td>
-        </tr>
+        <SegmentDrilldownRows
+          data={drill}
+          loading={drillLoading}
+          error={drillError}
+          currentMin={row.statEmpMin ?? null}
+          currentMax={row.statEmpMax ?? null}
+          onApplyRange={(mn, mx) =>
+            onSetEmpRange && row.bucketId && onSetEmpRange(row.bucketId, mn, mx)
+          }
+        />
       )}
     </>
   );
@@ -1226,10 +1222,12 @@ function computeEmpRangeRecommendation(bands: SegmentEmployeeBand[]): EmpRangeRe
   return { minEmp: lo.minEmp!, maxEmp: hi.maxEmp, bandCount: good.length };
 }
 
-/** Expanded drill-down under a segment row: the funnel per canonical company-size
- * band + a one-click "suggested range" (conversion-led). Rows within the
- * segment's current stat_emp range are highlighted. */
-function SegmentDrilldown({
+/** Expanded drill-down under a segment row — rendered as REAL rows of the main
+ * table (not a nested table) so every size band's numbers sit directly under the
+ * segment column they explain, at the same width and formatting. One control row
+ * (suggested range + apply/clear) then one row per canonical company-size band;
+ * bands inside the segment's current stat_emp range are highlighted. */
+function SegmentDrilldownRows({
   data,
   loading,
   error,
@@ -1244,11 +1242,34 @@ function SegmentDrilldown({
   currentMax: number | null;
   onApplyRange: (mn: number | null, mx: number | null) => void;
 }) {
-  if (loading) return <div className="text-[11px] text-zinc-500">Loading company-size breakdown…</div>;
-  if (error) return <div className="text-[11px] text-red-500">{error}</div>;
-  if (!data) return null;
+  // Sticky first cell needs its own opaque background (it slides over the other
+  // cells on horizontal scroll); keep it in step with the row tint.
+  const drillRow = "bg-zinc-50 dark:bg-zinc-900";
+  // pl-8 indents the band under its segment name; kept in the shared class so
+  // no caller has to fight the horizontal padding.
+  const drillSticky =
+    "sticky left-0 z-20 bg-zinc-50 dark:bg-zinc-900 pl-8 pr-3 py-1.5 text-left whitespace-nowrap";
+  const spanRest = LEADING_COL_COUNT - 1 + NUMERIC_COLUMNS.length;
+
+  if (loading || error || !data) {
+    return (
+      <tr className={drillRow}>
+        <td className={`${drillSticky} text-[11px] text-zinc-500`}>
+          Company-size breakdown
+        </td>
+        <td colSpan={spanRest} className="px-3 py-1.5 text-[11px]">
+          {loading ? (
+            <span className="text-zinc-500">Loading…</span>
+          ) : error ? (
+            <span className="text-red-500">{error}</span>
+          ) : null}
+        </td>
+      </tr>
+    );
+  }
 
   const reco = computeEmpRangeRecommendation(data.bands);
+  const pendingCount = data.pendingWebinarIds?.length ?? 0;
   const inRange = (b: SegmentEmployeeBand): boolean =>
     b.minEmp !== null &&
     (currentMin == null || (b.maxEmp ?? Infinity) >= currentMin) &&
@@ -1275,95 +1296,89 @@ function SegmentDrilldown({
     vals.sort((a, b) => a - b);
     colStats[col.key] = vals;
   }
-  const DRILL_COL = "px-2 py-1 text-right tabular-nums whitespace-nowrap";
 
   return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300">
+    <>
+      <tr className={drillRow}>
+        <td className={`${drillSticky} text-[11px] font-semibold text-zinc-600 dark:text-zinc-300`}>
           Company-size breakdown
-        </span>
-        {reco ? (
-          <span className="inline-flex items-center gap-1" title="Suggested from booked calls + lead quality + won, per size band vs the segment average">
-            <span className="rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400">
-              Suggested: {fmtRange(reco.minEmp, reco.maxEmp)}
-            </span>
-            <button
-              onClick={() => onApplyRange(reco.minEmp, reco.maxEmp)}
-              className="rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
-            >
-              Apply
-            </button>
-          </span>
-        ) : (
-          <span className="text-[10px] text-zinc-400">Not enough conversion data for a suggestion</span>
-        )}
-        {(currentMin != null || currentMax != null) && (
-          <button
-            onClick={() => onApplyRange(null, null)}
-            className="text-[10px] text-zinc-500 hover:underline"
-          >
-            Clear range
-          </button>
-        )}
-      </div>
-      <div className="overflow-x-auto">
-        <table className="text-[11px] border-collapse">
-          <thead>
-            {/* Group band — mirrors the main table's section headers */}
-            <tr className="text-[9px] font-bold text-zinc-400 uppercase">
-              <th className="px-2 py-1" />
-              {COLUMN_GROUPS.map((g) => (
-                <th key={g.group} colSpan={g.span} className="px-2 py-1 text-center border-l border-zinc-200 dark:border-zinc-800/60 whitespace-nowrap">
-                  {g.group}
-                </th>
-              ))}
-            </tr>
-            <tr className="text-zinc-500">
-              <th className="text-left px-2 py-1 font-medium">Size</th>
-              {NUMERIC_COLUMNS.map((col, idx) => (
-                <th
-                  key={col.key}
-                  title={col.title}
-                  className={`text-right px-2 py-1 font-medium whitespace-nowrap ${isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""}`}
+        </td>
+        <td colSpan={spanRest} className="px-3 py-1.5">
+          <div className="flex items-center gap-2 flex-wrap text-[11px]">
+            {reco ? (
+              <span className="inline-flex items-center gap-1" title="Suggested from booked calls + lead quality + won, per size band vs the segment average">
+                <span className="rounded border border-violet-500/40 px-1.5 py-0.5 font-semibold text-violet-600 dark:text-violet-400">
+                  Suggested: {fmtRange(reco.minEmp, reco.maxEmp)}
+                </span>
+                <button
+                  onClick={() => onApplyRange(reco.minEmp, reco.maxEmp)}
+                  className="rounded border border-violet-500/40 px-1.5 py-0.5 font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
                 >
-                  {col.label}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {data.bands.map((b, i) => {
-              const c = bandCells[i];
-              const isNoSize = b.sizeLabel === "(no size)";
-              const highlighted = inRange(b);
+                  Apply
+                </button>
+              </span>
+            ) : (
+              <span className="text-zinc-400">Not enough conversion data for a suggestion</span>
+            )}
+            {(currentMin != null || currentMax != null) && (
+              <button
+                onClick={() => onApplyRange(null, null)}
+                className="text-zinc-500 hover:underline"
+              >
+                Clear range
+              </button>
+            )}
+            {pendingCount > 0 && (
+              <span className="text-amber-600 dark:text-amber-400">
+                {pendingCount} selected webinar{pendingCount === 1 ? "" : "s"} not computed yet —
+                run Recompute to include {pendingCount === 1 ? "it" : "them"}.
+              </span>
+            )}
+          </div>
+        </td>
+      </tr>
+      {data.bands.map((b, i) => {
+        const c = bandCells[i];
+        const isNoSize = b.sizeLabel === "(no size)";
+        const highlighted = inRange(b);
+        const isLast = i === data.bands.length - 1;
+        return (
+          <tr
+            key={b.sizeLabel}
+            className={`${drillRow} ${isNoSize ? "text-zinc-400" : "text-zinc-700 dark:text-zinc-300"} ${
+              isLast ? "border-b border-zinc-200 dark:border-zinc-800" : ""
+            }`}
+          >
+            <td className={`${drillSticky} text-[11px] font-medium`}>
+              <span className={`inline-block rounded px-1 ${highlighted ? "bg-violet-500/15 text-violet-700 dark:text-violet-300" : ""}`}>
+                {b.sizeLabel}
+              </span>
+            </td>
+            {/* Quality + Employee-range columns stay empty on band rows — both
+                are segment-level settings, not per-size ones. */}
+            <td className="border-l border-zinc-200 dark:border-zinc-800/60" />
+            <td className="border-l border-zinc-200 dark:border-zinc-800/60" />
+            {NUMERIC_COLUMNS.map((col, idx) => {
+              const v = c[col.key];
+              const sorted = colStats[col.key];
+              const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
+              const bg = isNoSize ? undefined : heatBg(v, sorted, col.lowerIsBetter);
               return (
-                <tr key={b.sizeLabel} className={isNoSize ? "text-zinc-400" : ""}>
-                  <td className={`text-left px-2 py-1 whitespace-nowrap font-medium ${highlighted ? "bg-violet-500/10" : ""}`}>
-                    {b.sizeLabel}
-                  </td>
-                  {NUMERIC_COLUMNS.map((col, idx) => {
-                    const v = c[col.key];
-                    const sorted = colStats[col.key];
-                    const best = col.lowerIsBetter ? sorted[0] : sorted[sorted.length - 1];
-                    const bg = isNoSize ? undefined : heatBg(v, sorted, col.lowerIsBetter);
-                    return (
-                      <td
-                        key={col.key}
-                        style={bg ? { backgroundColor: bg } : undefined}
-                        className={`${DRILL_COL} ${!isNoSize && sorted.length ? leaderCls(v, best) : ""} ${isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""}`}
-                      >
-                        {col.fmt(c)}
-                      </td>
-                    );
-                  })}
-                </tr>
+                <td
+                  key={col.key}
+                  style={bg ? { backgroundColor: bg } : undefined}
+                  className={`px-3 py-1.5 text-right tabular-nums whitespace-nowrap ${
+                    !isNoSize && sorted.length ? leaderCls(v, best) : ""
+                  } ${isColGroupBoundary(idx) ? "border-l border-zinc-200 dark:border-zinc-800/60" : ""}`}
+                >
+                  {col.fmt(c)}
+                </td>
               );
             })}
-          </tbody>
-        </table>
-      </div>
-    </div>
+          </tr>
+        );
+      })}
+    </>
   );
 }
 

@@ -803,13 +803,26 @@ class GoHighLevelStatisticsSource:
                 await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
                 source_rows = []
 
-            # Per company-size funnel cells — powers the Employee count tab.
+            # Per company-size funnel cells — powers the Employee count tab —
+            # plus the segment × company-size cross behind the Segments-tab
+            # drill-down, both out of the same scan (see split_by_bucket).
+            employee_rows: list[dict[str, Any]] = []
+            segment_employee_rows: dict[str, list[dict[str, Any]]] = {}
             try:
-                employee_rows = await self._compute_per_employee_cells(db, w)
+                emp_cells = await self._compute_per_employee_cells(db, w, split_by_bucket=True)
+                for cell in emp_cells:
+                    seg = cell.get("bucketId")
+                    if seg is None:
+                        employee_rows.append(cell)
+                    else:
+                        segment_employee_rows.setdefault(seg, []).append(
+                            {"bucket": cell["bucket"], "metrics": cell["metrics"]}
+                        )
             except Exception:
                 logger.exception("per-employee cells failed for webinar %s — continuing without", w.number)
                 await db.rollback()
                 employee_rows = []
+                segment_employee_rows = {}
 
         return {
             "number": w.number,
@@ -821,6 +834,11 @@ class GoHighLevelStatisticsSource:
             "rows": rows,
             "sourceRows": source_rows,
             "employeeRows": employee_rows,
+            # {bucketId: [{bucket: size label, metrics}]} — the Segments-tab
+            # drill-down slice. Stripped from the bulk snapshot reads (see
+            # statistics_snapshot.read_all_payloads); the drill-down selects
+            # just the one segment's key out of JSONB.
+            "segmentEmployeeRows": segment_employee_rows,
             "summary": summary,
             "status": w.status,
             # Operators read this on the stats page to know whether
@@ -2036,7 +2054,7 @@ class GoHighLevelStatisticsSource:
 
 
     async def _compute_per_employee_cells(
-        self, db: AsyncSession, w: Webinar, bucket_id: str | None = None,
+        self, db: AsyncSession, w: Webinar, split_by_bucket: bool = False,
     ) -> list[dict[str, Any]]:
         """Per company-size funnel cells for a webinar's cold lists — the data
         behind the "Employee count" tab.
@@ -2047,22 +2065,21 @@ class GoHighLevelStatisticsSource:
         bucket ("0 - 2", "3 - 5", … "10000+"; see bucket_expr below) instead of
         lead_list_name. The bucket is derived from the numeric employee_count when
         present, else a stored canonical employee_range label; everything else
-        (foreign ranges, stray dates, no size) lands in "(no size)". Single
-        dimension, so one cell per bucket — no source/vintage rollup.
+        (foreign ranges, stray dates, no size) lands in "(no size)".
 
-        When `bucket_id` is given, restrict to that segment (assignment's bucket),
-        producing the segment × company-size cross the Segments-tab drill-down and
-        suggested-range use. Default None = webinar-wide (the Employee count tab).
+        With `split_by_bucket`, each query also emits a segment × company-size
+        cross via GROUPING SETS — one extra aggregation pass over the SAME scan,
+        so the webinar-wide rows and the per-segment rows cost barely more than
+        the webinar-wide rows alone. Those cells carry a "bucketId" and feed the
+        Segments-tab drill-down + suggested range straight out of the snapshot
+        (computing them live took ~50s per webinar per segment). Cells without a
+        "bucketId" are the webinar-wide rollup (the Employee count tab).
         """
         from sqlalchemy import text as sa_text
 
         wid = w.id
         N = w.number
         bid = w.broadcast_id
-        # Optional segment restriction: filter to one bucket via the assignment's
-        # bucket (matches the /segments per-bucket dimension). Bind name is
-        # distinct from `bid` (broadcast_id) to avoid collision.
-        seg_filter = " AND wla.bucket_id = CAST(:seg_bucket AS uuid)" if bucket_id else ""
         # wla.id IS NOT NULL keeps the LEFT-JOINed membership rows of DELETED
         # lists out of the cold funnels (legacy INNER-JOIN semantics) — without
         # it, a deleted NONJOINER list's contacts would leak in as "cold".
@@ -2100,63 +2117,85 @@ class GoHighLevelStatisticsSource:
             ELSE '(no size)'
           END"""
 
+        # Aggregation shape. Without the split it's the plain per-size rollup;
+        # with it, GROUPING SETS adds the segment × size cross in the same scan.
+        # GROUPING(seg) separates the rollup row from a genuine NULL bucket_id
+        # (an assignment with no segment attached).
+        seg_select = "t.seg, GROUPING(t.seg) AS is_rollup, "
+        group_by = (
+            "GROUP BY GROUPING SETS ((t.bucket), (t.bucket, t.seg))"
+            if split_by_bucket else "GROUP BY t.bucket"
+        )
+        if not split_by_bucket:
+            seg_select = "NULL::text AS seg, 1 AS is_rollup, "
+
         # Chunked probes + small-side joins want nested loops (see
         # _compute_per_source_cells).
         await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
 
-        # {bucket: {raw metric: count}} — merged across the batches.
-        raw: dict[str, dict[str, int]] = {}
+        # {(bucketId|None, size bucket): {raw metric: count}} — merged across the
+        # batches. bucketId None = the webinar-wide rollup row.
+        raw: dict[tuple[str | None, str], dict[str, int]] = {}
+
+        def _slot(row) -> dict[str, int]:
+            seg = None if int(row["is_rollup"] or 0) == 1 else (
+                str(row["seg"]) if row["seg"] is not None else "__none__"
+            )
+            return raw.setdefault((seg, row["bucket"]), {})
 
         # invited: distinct cold contacts per size bucket — chunked per
         # assignment like per-source (exact under summation).
         from sqlalchemy import bindparam as sa_bindparam
         inv_sql = f"""
-            SELECT {bucket_expr} AS bucket, COUNT(DISTINCT LOWER(c.email)) AS invited
-            FROM contacts c
-            JOIN webinar_contact_memberships m ON m.contact_id = c.id
-            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
-              AND m.assignment_id IN :aids
-            GROUP BY 1
+            SELECT t.bucket, {seg_select}COUNT(DISTINCT t.email) AS invited
+            FROM (
+                SELECT {bucket_expr} AS bucket,
+                    CAST(wla.bucket_id AS text) AS seg,
+                    LOWER(c.email) AS email
+                FROM contacts c
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+                  AND m.assignment_id IN :aids
+            ) t
+            {group_by}
         """
-        inv_params = {"wid": wid}
-        if bucket_id:
-            inv_params["seg_bucket"] = bucket_id
         for _aids in await self._assignment_chunks(db, wid):
             r = await db.execute(
-                sa_text(inv_sql).bindparams(sa_bindparam("aids", expanding=True), **inv_params),
+                sa_text(inv_sql).bindparams(sa_bindparam("aids", expanding=True), wid=wid),
                 {"aids": _aids},
             )
             for row in r.mappings().all():
-                slot = raw.setdefault(row["bucket"], {})
+                slot = _slot(row)
                 slot["invited"] = slot.get("invited", 0) + int(row["invited"] or 0)
 
         # regs / attended / 10m: WebinarGeek subscriber join (needs a broadcast).
         if bid:
             wg_sql = f"""
-                SELECT {bucket_expr} AS bucket,
-                    COUNT(DISTINCT LOWER(c.email)) AS total_regs,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (
-                        WHERE wgs.watched_live = TRUE OR wgs.minutes_viewing > 0
-                    ) AS total_attended,
-                    COUNT(DISTINCT LOWER(c.email)) FILTER (
-                        WHERE (wgs.watched_live = TRUE OR wgs.minutes_viewing > 0)
-                        AND wgs.minutes_viewing >= 10
+                SELECT t.bucket, {seg_select}
+                    COUNT(DISTINCT t.email) AS total_regs,
+                    COUNT(DISTINCT t.email) FILTER (WHERE t.attended) AS total_attended,
+                    COUNT(DISTINCT t.email) FILTER (
+                        WHERE t.attended AND t.minutes_viewing >= 10
                     ) AS total_10m
-                FROM contacts c
-                JOIN webinar_contact_memberships m ON m.contact_id = c.id
-            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-                JOIN webinargeek_subscribers wgs
-                    ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
-                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
-                GROUP BY 1
+                FROM (
+                    SELECT {bucket_expr} AS bucket,
+                        CAST(wla.bucket_id AS text) AS seg,
+                        LOWER(c.email) AS email,
+                        (wgs.watched_live = TRUE OR wgs.minutes_viewing > 0) AS attended,
+                        COALESCE(wgs.minutes_viewing, 0) AS minutes_viewing
+                    FROM contacts c
+                    JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                    LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+                    JOIN webinargeek_subscribers wgs
+                        ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
+                    WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+                ) t
+                {group_by}
             """
-            wg_params = {"wid": wid, "bid": bid}
-            if bucket_id:
-                wg_params["seg_bucket"] = bucket_id
-            r = await db.execute(sa_text(wg_sql).bindparams(**wg_params))
+            r = await db.execute(sa_text(wg_sql).bindparams(wid=wid, bid=bid))
             for row in r.mappings().all():
-                slot = raw.setdefault(row["bucket"], {})
+                slot = _slot(row)
                 slot["totalRegs"] = int(row["total_regs"] or 0)
                 slot["totalAttended"] = int(row["total_attended"] or 0)
                 slot["total10MinPlus"] = int(row["total_10m"] or 0)
@@ -2165,40 +2204,46 @@ class GoHighLevelStatisticsSource:
         # series number (mirrors _compute_per_source_cells' Batch C predicates).
         qual_in = "('" + "', '".join(QUALIFIED_SET) + "')"
         bk_sql = f"""
-            SELECT {bucket_expr} AS bucket,
-                COUNT(DISTINCT o.ghl_opportunity_id) AS total_bookings,
-                COUNT(DISTINCT g.ghl_contact_id) AS unique_bookers,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'confirmed') AS confirmed,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed') AS shows,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) IN ('noshow','no show','no-show')) AS no_shows,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'cancelled') AS canceled,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :won_stage) AS won,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.pipeline_stage_id = :dq_stage) AS disqualified,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE LOWER(COALESCE(o.call1_appointment_status, '')) = 'showed' AND o.lead_quality IN {qual_in}) AS qualified,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_great) AS lq_great,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_ok) AS lq_ok,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_barely) AS lq_barely,
-                COUNT(DISTINCT o.ghl_opportunity_id) FILTER (WHERE o.lead_quality = :lq_dq) AS lq_dq
-            FROM contacts c
-            JOIN webinar_contact_memberships m ON m.contact_id = c.id
-            LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-            JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
-            JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
-            WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}{seg_filter}
-              AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
-            GROUP BY 1
+            SELECT t.bucket, {seg_select}
+                COUNT(DISTINCT t.opp_id) AS total_bookings,
+                COUNT(DISTINCT t.ghl_contact_id) AS unique_bookers,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'confirmed') AS confirmed,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'showed') AS shows,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status IN ('noshow','no show','no-show')) AS no_shows,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'cancelled') AS canceled,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.stage_id = :won_stage) AS won,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.stage_id = :dq_stage) AS disqualified,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.appt_status = 'showed' AND t.lead_quality IN {qual_in}) AS qualified,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.lead_quality = :lq_great) AS lq_great,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.lead_quality = :lq_ok) AS lq_ok,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.lead_quality = :lq_barely) AS lq_barely,
+                COUNT(DISTINCT t.opp_id) FILTER (WHERE t.lead_quality = :lq_dq) AS lq_dq
+            FROM (
+                SELECT {bucket_expr} AS bucket,
+                    CAST(wla.bucket_id AS text) AS seg,
+                    o.ghl_opportunity_id AS opp_id,
+                    g.ghl_contact_id AS ghl_contact_id,
+                    LOWER(COALESCE(o.call1_appointment_status, '')) AS appt_status,
+                    o.pipeline_stage_id AS stage_id,
+                    o.lead_quality AS lead_quality
+                FROM contacts c
+                JOIN webinar_contact_memberships m ON m.contact_id = c.id
+                LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+                JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)
+                JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id
+                WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
+                  AND (o.webinar_source_number = :N OR g.booked_call_webinar_series = :N)
+            ) t
+            {group_by}
         """
-        bk_params = {
-            "wid": wid, "N": N,
-            "won_stage": DEAL_WON_STAGE_ID, "dq_stage": DISQUALIFIED_STAGE_ID,
-            "lq_great": LEAD_QUALITY_GREAT, "lq_ok": LEAD_QUALITY_OK,
-            "lq_barely": LEAD_QUALITY_BARELY, "lq_dq": LEAD_QUALITY_BAD_DQ,
-        }
-        if bucket_id:
-            bk_params["seg_bucket"] = bucket_id
-        r = await db.execute(sa_text(bk_sql).bindparams(**bk_params))
+        r = await db.execute(sa_text(bk_sql).bindparams(
+            wid=wid, N=N,
+            won_stage=DEAL_WON_STAGE_ID, dq_stage=DISQUALIFIED_STAGE_ID,
+            lq_great=LEAD_QUALITY_GREAT, lq_ok=LEAD_QUALITY_OK,
+            lq_barely=LEAD_QUALITY_BARELY, lq_dq=LEAD_QUALITY_BAD_DQ,
+        ))
         for row in r.mappings().all():
-            slot = raw.setdefault(row["bucket"], {})
+            slot = _slot(row)
             slot["totalBookings"] = int(row["total_bookings"] or 0)
             slot["uniqueBookers"] = int(row["unique_bookers"] or 0)
             slot["confirmed"] = int(row["confirmed"] or 0)
@@ -2213,13 +2258,21 @@ class GoHighLevelStatisticsSource:
             slot["leadQualityBarelyPassable"] = int(row["lq_barely"] or 0)
             slot["leadQualityBadDq"] = int(row["lq_dq"] or 0)
 
-        # One cell per size bucket.
+        # One cell per size bucket (webinar-wide), plus one per segment × size
+        # when split_by_bucket. Cells for memberships whose list carries no
+        # segment are dropped from the split ("__none__") — the drill-down is
+        # per named segment.
         cells: list[dict[str, Any]] = []
-        for bucket, metrics in raw.items():
-            cells.append({
+        for (seg, bucket), metrics in raw.items():
+            if seg == "__none__":
+                continue
+            cell: dict[str, Any] = {
                 "bucket": bucket,
                 "metrics": {k: int(metrics.get(k) or 0) for k in SOURCE_FUNNEL_RAW_KEYS},
-            })
+            }
+            if seg is not None:
+                cell["bucketId"] = seg
+            cells.append(cell)
         return cells
 
 

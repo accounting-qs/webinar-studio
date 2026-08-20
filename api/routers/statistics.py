@@ -737,6 +737,9 @@ class SegmentEmployeeResponse(BaseModel):
     statEmpMin: int | None = None
     statEmpMax: int | None = None
     includedWebinarIds: list[str] = []
+    # Selected webinars whose snapshot predates the segment x company-size cross
+    # — excluded from the bands until a recompute builds them (mirrors /segments).
+    pendingWebinarIds: list[str] = []
     bands: list[SegmentEmployeeBand]
 
 
@@ -744,10 +747,12 @@ class SegmentEmployeeResponse(BaseModel):
 async def get_statistics_segment_by_employee(
     bucket_id: str, source: str = "auto", webinars: str | None = None
 ):
-    """Per-segment × company-size funnel for one bucket, live across the selected
+    """Per-segment × company-size funnel for one bucket across the selected
     webinars. Powers the Segments-tab drill-down and the data-driven suggested
     employee range (conversion: booked calls + lead-quality tiers + won).
-    `webinars` is a comma-separated list of Webinar UUIDs; omit for all passed."""
+    `webinars` is a comma-separated list of Webinar UUIDs; omit for all passed.
+    Reads the precomputed snapshots only — instant once they're built (POST
+    /statistics/recompute); webinars without the cross come back as pending."""
     ids = [x.strip() for x in webinars.split(",")] if webinars else []
     ids = [x for x in ids if x]
     data = await stats_svc.get_statistics_segment_employee(

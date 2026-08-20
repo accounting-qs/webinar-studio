@@ -7,10 +7,13 @@ Later GoHighLevel integration swaps only the source behind the same interface.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import date as _date, datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -676,60 +679,67 @@ async def get_statistics_segment_employee(
     source: str = "auto",
     webinar_ids: list[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Live per-segment × company-size funnel for one bucket, summed across the
+    """Per-segment × company-size funnel for one bucket, summed across the
     selected webinars. Powers the Segments-tab drill-down and the data-driven
     suggested employee range (conversion: calls + lead-quality tiers + won).
 
-    Computed on demand (NOT from snapshots) so no recompute is needed; scoped to
-    one bucket so the funnel queries stay small. Returns raw per-band counts —
-    the frontend derives percentages and the suggested range from them, matching
-    the client-side quality-reco pattern. None if the bucket does not exist.
+    Reads the precomputed snapshots only — the recompute writes a
+    segment × size cross per webinar (see _compute_per_employee_cells's
+    split_by_bucket), and this pulls just this one segment's slice out of JSONB.
+    Computing it live cost ~50s per webinar per segment (~18 min over the full
+    passed set), which is what made the drill-down time out. Webinars whose
+    snapshot predates the cross are reported as `pendingWebinarIds` so the UI can
+    prompt a recompute instead of silently undercounting, exactly like /segments.
 
-    Note: runs the three funnel queries once per included webinar, so a very wide
-    webinar selection means more queries — acceptable for an on-click drill-down
-    into a single segment.
+    Returns raw per-band counts — the frontend derives percentages and the
+    suggested range from them. None if the bucket does not exist.
     """
-    from sqlalchemy import select, text as sa_text
+    from sqlalchemy import select
     from db.session import AsyncSessionLocal
-    from db.models import OutreachBucket, Webinar
-    from services.ghl_statistics_source import (
-        GoHighLevelStatisticsSource, SOURCE_FUNNEL_RAW_KEYS,
-    )
+    from db.models import OutreachBucket
+    from services.ghl_statistics_source import SOURCE_FUNNEL_RAW_KEYS
 
-    # Same passed-webinar set (+ optional filter) as /segments.
-    summaries = await get_statistics_webinar_list(source=source)
-    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
-    all_ids = [s.get("webinarId") for s in passed if s.get("webinarId")]
-    if webinar_ids:
-        wanted = set(webinar_ids)
-        target_ids = [i for i in all_ids if i in wanted]
-    else:
-        target_ids = all_ids
-
-    src = GoHighLevelStatisticsSource()
-    agg: dict[str, dict[str, int]] = {}
     async with AsyncSessionLocal() as db:
         bucket = (await db.execute(
             select(OutreachBucket).where(OutreachBucket.id == bucket_id)
         )).scalar_one_or_none()
         if bucket is None:
             return None
-        # Perf pragmas (mirror _build_raw_webinar), scoped to this transaction.
-        await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
-        await db.execute(sa_text("SET LOCAL work_mem = '128MB'"))
-        webinars = list((await db.execute(
-            select(Webinar).where(Webinar.id.in_(target_ids))
-        )).scalars().all()) if target_ids else []
-        for w in webinars:
-            cells = await src._compute_per_employee_cells(db, w, bucket_id=bucket_id)
-            for cell in cells:
-                label = cell.get("bucket")
-                if not label:
-                    continue
-                slot = agg.setdefault(label, {k: 0 for k in SOURCE_FUNNEL_RAW_KEYS})
-                metrics = cell.get("metrics") or {}
-                for k in SOURCE_FUNNEL_RAW_KEYS:
-                    slot[k] += int(metrics.get(k) or 0)
+
+    # Explicit ids come straight from /segments' own response, so take them as
+    # given — resolving the passed-webinar set means re-reading every snapshot,
+    # which is by far the most expensive thing this endpoint could do. Only the
+    # unscoped call (no ids) has to derive the set, same as /segments.
+    if webinar_ids:
+        target_ids = list(dict.fromkeys(webinar_ids))
+    else:
+        summaries = await get_statistics_webinar_list(source=source)
+        passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+        target_ids = [s.get("webinarId") for s in passed if s.get("webinarId")]
+
+    try:
+        from services import statistics_snapshot as snap
+        cells_by_webinar, computed_ids = await snap.read_segment_employee_cells(
+            source, bucket_id,
+        )
+    except Exception:
+        logger.exception("segment employee slice read failed for bucket %s", bucket_id)
+        cells_by_webinar, computed_ids = {}, set()
+
+    agg: dict[str, dict[str, int]] = {}
+    pending_ids: list[str] = []
+    for wid in target_ids:
+        if wid not in computed_ids:
+            pending_ids.append(wid)
+            continue
+        for cell in cells_by_webinar.get(wid) or []:
+            label = cell.get("bucket")
+            if not label:
+                continue
+            slot = agg.setdefault(label, {k: 0 for k in SOURCE_FUNNEL_RAW_KEYS})
+            metrics = cell.get("metrics") or {}
+            for k in SOURCE_FUNNEL_RAW_KEYS:
+                slot[k] += int(metrics.get(k) or 0)
 
     def _band(label: str, min_emp: int | None, max_emp: int | None, raw: dict[str, int]) -> dict[str, Any]:
         return {
@@ -767,6 +777,7 @@ async def get_statistics_segment_employee(
         "statEmpMin": bucket.stat_emp_min,
         "statEmpMax": bucket.stat_emp_max,
         "includedWebinarIds": target_ids,
+        "pendingWebinarIds": pending_ids,
         "bands": bands,
     }
 

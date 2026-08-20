@@ -1923,11 +1923,15 @@ export interface SegmentEmployeeResponse {
   statEmpMin: number | null;
   statEmpMax: number | null;
   includedWebinarIds: string[];
+  /** Selected webinars whose snapshot predates the segment × size cross — their
+   * numbers are missing from `bands` until a recompute builds them. */
+  pendingWebinarIds?: string[];
   bands: SegmentEmployeeBand[];
 }
 
-/** Live per-segment × company-size funnel for one bucket (drill-down + suggested
- * range). Scope with the same webinar UUIDs as the Segments table; omit for all. */
+/** Per-segment × company-size funnel for one bucket (drill-down + suggested
+ * range), read from the statistics snapshots. Scope with the same webinar UUIDs
+ * as the Segments table; omit for all. */
 export async function fetchSegmentEmployee(
   bucketId: string,
   webinarIds?: string[] | null,
