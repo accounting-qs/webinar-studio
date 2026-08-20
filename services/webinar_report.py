@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from services.nonjoiners import NONJOINER_WINDOW, nonjoiner_pool_emails
+from services.statistics_metric_filters import QUALIFIED_LEAD_QUALITIES
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +431,45 @@ async def _funnel_scope(wids: list[str]) -> dict[str, dict[str, dict[str, int]]]
         """).bindparams(wids=wids))
         _absorb(r.all(), {"regs": "regs", "attended": "attended", "att10": "att10"})
 
+    # Stage 3: booked-call outcomes (show rate + lead quality) per dimension.
+    # Reads webinar_booking_attribution — the table that owns which webinar
+    # drove each booked call — so a reused contact's call lands on the webinar
+    # that earned it. Tiny row count; the join back to contacts is what carries
+    # the dimension. Guarded: a failure here leaves the cells without sales
+    # numbers rather than sinking the whole funnel section.
+    quals = "','".join(QUALIFIED_LEAD_QUALITIES)
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
+            await db.execute(sa_text("SET LOCAL random_page_cost = 4"))
+            r = await db.execute(sa_text(f"""
+                SELECT {dim_cols},
+                    COUNT(DISTINCT b.ghl_contact_id) AS bookings,
+                    COUNT(DISTINCT b.ghl_contact_id) FILTER (
+                        WHERE b.call_at IS NOT NULL AND b.call_at <= NOW()
+                    ) AS calls_passed,
+                    COUNT(DISTINCT b.ghl_contact_id) FILTER (
+                        WHERE LOWER(COALESCE(b.call_status, '')) = 'showed'
+                    ) AS shows,
+                    COUNT(DISTINCT b.ghl_contact_id) FILTER (
+                        WHERE LOWER(COALESCE(b.call_status, '')) = 'showed'
+                          AND b.lead_quality IN ('{quals}')
+                    ) AS qualified
+                FROM webinar_booking_attribution b
+                JOIN contacts c ON c.id = b.contact_id
+                JOIN webinar_contact_memberships m
+                  ON m.contact_id = b.contact_id AND m.webinar_id = b.webinar_id
+                LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
+                WHERE b.webinar_id = ANY(CAST(:wids AS uuid[])) AND {_COLD}
+                GROUP BY GROUPING SETS ({sets})
+            """).bindparams(wids=wids))
+            _absorb(r.all(), {
+                "bookings": "bookings", "calls_passed": "callsPassed",
+                "shows": "shows", "qualified": "qualified",
+            })
+    except Exception as exc:
+        logger.warning("webinar_report: funnel sales stage failed: %s", exc)
+
     return out
 
 
@@ -477,12 +517,24 @@ def _funnel_cells(
         inv = m.get("invited", 0)
         regs = m.get("regs", 0)
         att = m.get("attended", 0)
+        books = m.get("bookings", 0)
+        passed = m.get("callsPassed", 0)
+        shows = m.get("shows", 0)
+        qualified = m.get("qualified", 0)
         return {
             "invited": round(inv / divisor, 1) if divisor > 1 else inv,
             "regs": round(regs / divisor, 1) if divisor > 1 else regs,
             "regRate": _rate(regs, inv),
             "attPctOfRegs": _rate(att, regs),
             "attendeesPer10kInv": round(att / inv * 10000, 1) if inv else None,
+            "bookings": round(books / divisor, 1) if divisor > 1 else books,
+            "callsPassed": round(passed / divisor, 1) if divisor > 1 else passed,
+            "shows": round(shows / divisor, 1) if divisor > 1 else shows,
+            # Show rate = shows / calls whose date has passed (matches the
+            # Statistics page's Show %); lead qual = qualified / shows.
+            "showRate": _rate(shows, passed),
+            "qualified": round(qualified / divisor, 1) if divisor > 1 else qualified,
+            "leadQualRate": _rate(qualified, shows),
         }
 
     labels = sorted(

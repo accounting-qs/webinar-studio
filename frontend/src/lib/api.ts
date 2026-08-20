@@ -1525,11 +1525,13 @@ export interface StatisticsMetrics {
   yesMarked: number | null;
   yesAttended: number | null;
   yes10MinPlus: number | null;
+  yes30MinPlus: number | null;
   yesAttendBySmsClick: number | null;
   yesBookings: number | null;
   maybeMarked: number | null;
   maybeAttended: number | null;
   maybe10MinPlus: number | null;
+  maybe30MinPlus: number | null;
   maybeAttendBySmsClick: number | null;
   maybeBookings: number | null;
   selfRegMarked: number | null;
@@ -1563,11 +1565,13 @@ export interface StatisticsMetrics {
   yesPercent: number | null;
   yesAttendPercent: number | null;
   yesStay10MinPercent: number | null;
+  yesStay30MinPercent: number | null;
   yesAttendBySmsClickPercent: number | null;
   yesBookingsPer1kInv: number | null;
   maybePer1kInv: number | null;
   maybeAttendPercent: number | null;
   maybeStay10MinPercent: number | null;
+  maybeStay30MinPercent: number | null;
   maybeAttendBySmsClickPercent: number | null;
   maybeBookingsPer1kInv: number | null;
   selfRegPer1kInv: number | null;
@@ -1725,6 +1729,16 @@ export interface WebinarReportFunnelCellSide {
   regRate: number | null;
   attPctOfRegs: number | null;
   attendeesPer10kInv: number | null;
+  /* Booked-call outcomes for this cell (absent on reports generated before
+   * the funnel sales stage shipped — render as "—"). */
+  bookings?: number | null;
+  callsPassed?: number | null;
+  shows?: number | null;
+  /** shows / calls whose date has passed. */
+  showRate?: number | null;
+  qualified?: number | null;
+  /** qualified (Great / Ok / Barely Passable) shows / shows. */
+  leadQualRate?: number | null;
 }
 
 export interface WebinarReportFunnelCell {
@@ -2128,6 +2142,57 @@ export async function fetchStatisticsEmployeeCount(
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to fetch employee-count funnel");
+  return res.json();
+}
+
+/* ── Overview series (Statistics Home charts) ────────────────────────────── */
+
+/** The audience scope a Home chart is reading. Mirrors the three rows the
+ * Statistics table shows per webinar. */
+export type OverviewScopeKey = "assigned" | "newJoiners" | "overall";
+
+export interface OverviewWebinar {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  date: string | null;
+  title: string | null;
+  label: string | null;
+  listCount: number;
+  scopes: Record<OverviewScopeKey, StatisticsMetrics>;
+}
+
+export interface OverviewWebinarOption {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  date: string | null;
+  title: string | null;
+  label: string | null;
+}
+
+export interface StatisticsOverviewResponse {
+  /** Oldest first — chart reading order. */
+  webinars: OverviewWebinar[];
+  allWebinars: OverviewWebinarOption[];
+  includedWebinarIds: string[];
+  /** Selected webinars with no stored snapshot yet (excluded from the charts). */
+  pendingWebinarIds: string[];
+  meta: StatisticsMeta;
+}
+
+/** Per-webinar metric series at three audience scopes — one snapshot read.
+ * Pass webinar UUIDs to scope; omit for all passed webinars. */
+export async function fetchStatisticsOverview(
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<StatisticsOverviewResponse> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(`${API_URL}/statistics/overview?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch statistics overview");
   return res.json();
 }
 

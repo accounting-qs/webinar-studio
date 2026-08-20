@@ -141,8 +141,8 @@ def spec_for_metric(
     # ── WG attendance metrics ─────────────────────────────────────────
     if metric.startswith(("totalAttended", "total10MinPlus", "total30MinPlus",
                          "totalRegs", "attendBySmsReminder",
-                         "yesAttended", "yes10MinPlus", "yesAttendBySmsClick",
-                         "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick",
+                         "yesAttended", "yes10MinPlus", "yes30MinPlus", "yesAttendBySmsClick",
+                         "maybeAttended", "maybe10MinPlus", "maybe30MinPlus", "maybeAttendBySmsClick",
                          "selfRegAttended", "selfReg10MinPlus")):
         if not broadcast_id:
             return MetricSpec(unavailable=True)

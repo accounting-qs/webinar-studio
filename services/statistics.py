@@ -95,6 +95,9 @@ def compute_derived_metrics(
         "yesPercent": _safe_div(m.get("yesMarked"), inv),
         "yesAttendPercent": _safe_div(m.get("yesAttended"), m.get("yesMarked")),
         "yesStay10MinPercent": _safe_div(m.get("yes10MinPlus"), m.get("yesAttended")),
+        # 30m% is the 10m→30m step-down (share of 10-minute watchers who made
+        # it to 30), NOT a share of all attendees — same rule in every section.
+        "yesStay30MinPercent": _safe_div(m.get("yes30MinPlus"), m.get("yes10MinPlus")),
         "yesAttendBySmsClickPercent": _safe_div(
             m.get("yesAttendBySmsClick"), m.get("yesAttended")
         ),
@@ -104,6 +107,9 @@ def compute_derived_metrics(
         "maybeAttendPercent": _safe_div(m.get("maybeAttended"), m.get("maybeMarked")),
         "maybeStay10MinPercent": _safe_div(
             m.get("maybe10MinPlus"), m.get("maybeAttended")
+        ),
+        "maybeStay30MinPercent": _safe_div(
+            m.get("maybe30MinPlus"), m.get("maybe10MinPlus")
         ),
         "maybeAttendBySmsClickPercent": _safe_div(
             m.get("maybeAttendBySmsClick"), m.get("maybeAttended")
@@ -135,14 +141,15 @@ def compute_derived_metrics(
         ),
         "total30MinPlusPer1kInv": _safe_per1k(m.get("total30MinPlus"), inv),
         "attend30MinPercent": _safe_div(
-            m.get("total30MinPlus"), m.get("totalAttended")
+            m.get("total30MinPlus"), m.get("total10MinPlus")
         ),
-        # Sales — booking rates use unique bookers (see `ub` above); Show% keeps
-        # total opportunities since its numerator (shows) is per-opportunity.
+        # Sales — booking rates use unique bookers (see `ub` above); Show% is
+        # per-opportunity and divides by the calls whose date has already
+        # passed, so upcoming calls never drag the rate down.
         "bookingsPerAttended": _safe_div(ub, m.get("totalAttended")),
         "bookingsPerPast10Min": _safe_div(ub, m.get("total10MinPlus")),
         "totalBookingsPer1kInv": _safe_per1k(ub, inv),
-        "showPercent": _safe_div(m.get("shows"), m.get("totalBookings")),
+        "showPercent": _safe_div(m.get("shows"), m.get("totalCallsDatePassed")),
         "closeRatePercent": _safe_div(m.get("won"), m.get("shows")),
         "qualPercent": _safe_div(m.get("qualified"), m.get("shows")),
     }
@@ -157,8 +164,8 @@ def compute_derived_metrics(
 _SUM_KEYS = [
     "accountsNeeded",
     "invited", "actuallyUsed", "unsubscribes", "lpRegs",
-    "yesMarked", "yesAttended", "yes10MinPlus", "yesAttendBySmsClick", "yesBookings",
-    "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick", "maybeBookings",
+    "yesMarked", "yesAttended", "yes10MinPlus", "yes30MinPlus", "yesAttendBySmsClick", "yesBookings",
+    "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybe30MinPlus", "maybeAttendBySmsClick", "maybeBookings",
     "selfRegMarked", "selfRegAttended", "selfReg10MinPlus", "selfRegBookings",
     "totalRegs", "totalAttended", "attendBySmsReminder",
     "total10MinPlus", "total30MinPlus", "totalBookings", "uniqueBookers",
@@ -499,6 +506,174 @@ def _segment_webinar_label(s: dict[str, Any]) -> str:
     if d:
         base += f" ({d})"
     return base
+
+
+async def get_statistics_overview(
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Per-webinar metric series for the Statistics Home charts.
+
+    One snapshot read for every passed webinar, reshaped into three scopes so
+    the charts can switch between them without refetching:
+
+      assigned    — the assigned list rows only (the page's headline row)
+      newJoiners  — assigned lists + NO LIST DATA, Nonjoiners excluded
+      overall     — everything attributed to the webinar
+
+    Each scope holds the full derived metric dict, summed from the raw child
+    counts and re-derived (never averaged), exactly like the dashboard's
+    aggregate rows. Webinars without a snapshot come back as pending so the UI
+    can prompt a recompute rather than silently charting a gap.
+    """
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    # Oldest first — charts read left-to-right in time order.
+    passed.sort(key=lambda s: (s.get("date") or "", s.get("number") or 0, s.get("variantLabel") or ""))
+
+    options = [
+        {
+            "webinarId": s.get("webinarId"),
+            "number": s.get("number"),
+            "variantLabel": s.get("variantLabel"),
+            "date": s.get("date"),
+            "title": s.get("title"),
+            "label": _segment_webinar_label(s),
+        }
+        for s in passed
+        if s.get("webinarId")
+    ]
+    all_ids = [o["webinarId"] for o in options]
+    wanted = set(webinar_ids) if webinar_ids else None
+    target_ids = [i for i in all_ids if wanted is None or i in wanted]
+
+    raw = await _overview_raw_counts(_snapshot_source(source))
+
+    by_id = {o["webinarId"]: o for o in options}
+    out_webinars: list[dict[str, Any]] = []
+    pending: list[str] = []
+    for wid in target_ids:
+        slot = raw.get(wid)
+        if slot is None:
+            pending.append(wid)
+            continue
+        out_webinars.append({
+            **by_id[wid],
+            "listCount": slot["listCount"],
+            # Derive every rate here rather than reading the snapshot's stored
+            # percentages: a snapshot written before a formula changed still
+            # carries the old rate, while its raw counts are always current.
+            "scopes": {
+                k: compute_derived_metrics(slot[k])[0]
+                for k in ("assigned", "newJoiners", "overall")
+            },
+        })
+
+    return {
+        "webinars": out_webinars,
+        "allWebinars": options,
+        "includedWebinarIds": [w["webinarId"] for w in out_webinars],
+        "pendingWebinarIds": pending,
+    }
+
+
+# Raw counts the Home charts read. Everything else in a snapshot payload stays
+# in the database — see _overview_raw_counts.
+_OVERVIEW_KEYS = (
+    "invited", "actuallyUsed", "gcalInvitedGhl", "unsubscribes", "lpRegs",
+    "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus",
+    "yesMarked", "yesAttended", "yes10MinPlus", "yes30MinPlus",
+    "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybe30MinPlus",
+    "selfRegMarked", "selfRegAttended", "selfReg10MinPlus",
+    "uniqueBookers", "totalBookings", "totalCallsDatePassed", "confirmed",
+    "shows", "noShows", "canceled", "won", "disqualified", "qualified",
+    "leadQualityGreat", "leadQualityOk", "leadQualityBarelyPassable", "leadQualityBadDq",
+)
+
+
+def _snapshot_source(source: str) -> str:
+    return "workbook" if source == "workbook" else "ghl"
+
+
+async def _overview_raw_counts(snap_source: str) -> dict[str, dict[str, Any]]:
+    """Per-webinar raw counts at the three Home scopes, summed in Postgres.
+
+    The snapshot payloads total a few MB of JSONB; shipping them to the app just
+    to add up thirty numbers per webinar makes this endpoint as slow as the
+    round trip. So the sums happen server-side and only the totals cross the
+    wire.
+
+    `assigned` and `newJoiners` are summed from the child rows. `overall` reads
+    the stored webinar-level summary instead of summing rows — that summary is
+    computed directly against WebinarGeek/GHL and legitimately exceeds the row
+    sum (registrants with no email, for one, never land on a list row).
+    """
+    from sqlalchemy import text as sa_text
+    from db.session import AsyncSessionLocal
+
+    def agg_cols(prefix: str, cond: str) -> str:
+        return ",\n                   ".join(
+            f'SUM(CASE WHEN {cond} THEN (m->>\'{k}\')::numeric END) AS "{prefix}{k}"'
+            for k in _OVERVIEW_KEYS
+        )
+
+    def ref_cols(prefix: str) -> str:
+        return ", ".join(f'a."{prefix}{k}"' for k in _OVERVIEW_KEYS)
+
+    summary_cols = ",\n               ".join(
+        f'(s.summary->>\'{k}\')::numeric AS "o_{k}"' for k in _OVERVIEW_KEYS
+    )
+
+    sql = f"""
+        WITH snap AS (
+            SELECT webinar_id,
+                   payload->'summary' AS summary,
+                   COALESCE(payload->'rows', '[]'::jsonb) AS rows
+            FROM statistics_snapshot
+            WHERE source = :src
+        ),
+        child AS (
+            SELECT s.webinar_id,
+                   e->>'kind' AS kind,
+                   e->'metrics' AS m
+            FROM snap s, LATERAL jsonb_array_elements(s.rows) AS e
+        ),
+        agg AS (
+            SELECT webinar_id,
+                   COUNT(*) FILTER (WHERE kind = 'list') AS list_count,
+                   {agg_cols("a_", "kind = 'list'")},
+                   {agg_cols("n_", "kind IN ('list', 'no_list_data')")}
+            FROM child
+            GROUP BY webinar_id
+        )
+        SELECT s.webinar_id,
+               COALESCE(a.list_count, 0) AS list_count,
+               {ref_cols("a_")},
+               {ref_cols("n_")},
+               {summary_cols}
+        FROM snap s
+        LEFT JOIN agg a ON a.webinar_id = s.webinar_id
+    """
+
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(sa_text(sql).bindparams(src=snap_source))).mappings().all()
+
+    def pick(row: Any, prefix: str) -> dict[str, float | None]:
+        out: dict[str, float | None] = {}
+        for k in _OVERVIEW_KEYS:
+            v = row.get(prefix + k)
+            out[k] = float(v) if v is not None else None
+        return out
+
+    return {
+        row["webinar_id"]: {
+            "listCount": int(row["list_count"] or 0),
+            "assigned": pick(row, "a_"),
+            "newJoiners": pick(row, "n_"),
+            "overall": pick(row, "o_"),
+        }
+        for row in rows
+    }
 
 
 async def get_statistics_segments(

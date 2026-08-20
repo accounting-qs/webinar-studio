@@ -233,6 +233,21 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     description: "Of Yes attendees, what % watched at least 10 minutes.",
   },
   {
+    key: "yes30MinPlus", label: "30m+", group: "Yes", format: "number",
+    description: "Yes-responders who watched 30 minutes or more of the live broadcast.",
+    fieldsUsed: [
+      { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Yes'" },
+      F_WG_BROADCAST,
+      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 30" },
+    ],
+  },
+  {
+    key: "yesStay30MinPercent", label: "Stay 30m %", group: "Yes", format: "percent",
+    formulaText: "yes30MinPlus / yes10MinPlus",
+    formulaSources: ["yes30MinPlus", "yes10MinPlus"],
+    description: "Of Yes 10-minute watchers, what % made it to 30 minutes (the 10m → 30m step-down).",
+  },
+  {
     key: "yesAttendBySmsClick", label: "SMS Click", group: "Yes", format: "number",
     description: "Yes-attendees who also clicked the SMS reminder.",
     fieldsUsed: [
@@ -302,6 +317,21 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     formulaText: "maybe10MinPlus / maybeAttended",
     formulaSources: ["maybe10MinPlus", "maybeAttended"],
     description: "Of Maybe attendees, what % stayed 10 minutes+.",
+  },
+  {
+    key: "maybe30MinPlus", label: "30m+", group: "Maybe", format: "number",
+    description: "Maybe attendees who watched ≥30 minutes.",
+    fieldsUsed: [
+      { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Maybe'" },
+      F_WG_BROADCAST,
+      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 30" },
+    ],
+  },
+  {
+    key: "maybeStay30MinPercent", label: "Stay 30m %", group: "Maybe", format: "percent",
+    formulaText: "maybe30MinPlus / maybe10MinPlus",
+    formulaSources: ["maybe30MinPlus", "maybe10MinPlus"],
+    description: "Of Maybe 10-minute watchers, what % made it to 30 minutes (the 10m → 30m step-down).",
   },
   {
     key: "maybeAttendBySmsClick", label: "SMS Click", group: "Maybe", format: "number",
@@ -471,9 +501,9 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   },
   {
     key: "attend30MinPercent", label: "30m %", group: "Attendance", format: "percent",
-    formulaText: "total30MinPlus / totalAttended",
-    formulaSources: ["total30MinPlus", "totalAttended"],
-    description: "Of attendees, what % stayed 30 minutes+.",
+    formulaText: "total30MinPlus / total10MinPlus",
+    formulaSources: ["total30MinPlus", "total10MinPlus"],
+    description: "Of the 10-minute watchers, what % made it to 30 minutes (the 10m → 30m step-down).",
   },
 
   // ── Sales ──
@@ -517,9 +547,9 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   },
   {
     key: "showPercent", label: "Show %", group: "Sales", format: "percent",
-    formulaText: "shows / totalBookings",
-    formulaSources: ["shows", "totalBookings"],
-    description: "Show-up rate for booked calls.",
+    formulaText: "shows / totalCallsDatePassed",
+    formulaSources: ["shows", "totalCallsDatePassed"],
+    description: "Show-up rate across the calls whose date has already passed (upcoming calls are excluded from the denominator).",
   },
   {
     key: "noShows", label: "No Shows", group: "Sales", format: "number",

@@ -787,7 +787,7 @@ function V2FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
   return (
     <Card>
       <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-2.5">{title}</div>
-      <div className="grid grid-cols-[minmax(160px,1.6fr)_repeat(3,minmax(84px,1fr))] gap-x-4 items-center">
+      <div className="grid grid-cols-[minmax(160px,1.6fr)_repeat(5,minmax(78px,1fr))] gap-x-4 items-center">
         <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5">
           {title} · invited
         </div>
@@ -799,6 +799,18 @@ function V2FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
         </div>
         <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5 text-right">
           Att / 10k inv
+        </div>
+        <div
+          title="Shows ÷ booked calls whose date has passed"
+          className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5 text-right"
+        >
+          Show rate
+        </div>
+        <div
+          title="Qualified shows (Great / Ok / Barely Passable) ÷ shows"
+          className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5 text-right"
+        >
+          Lead qual
         </div>
         {shown.map((cell) => {
           const c = cell.current ?? ({} as WebinarReportFunnelCell["current"]);
@@ -823,6 +835,18 @@ function V2FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
               </div>
               <div className="py-1.5 border-t border-zinc-100 dark:border-zinc-800">
                 <CellWithDelta cur={c.attendeesPer10kInv} base={b.attendeesPer10kInv} fmt="ratio" />
+              </div>
+              <div
+                className="py-1.5 border-t border-zinc-100 dark:border-zinc-800"
+                title={`${fmtInt(c.shows)} showed of ${fmtInt(c.callsPassed)} calls passed · ${fmtInt(c.bookings)} booked`}
+              >
+                <CellWithDelta cur={c.showRate} base={b.showRate} fmt="pct" />
+              </div>
+              <div
+                className="py-1.5 border-t border-zinc-100 dark:border-zinc-800"
+                title={`${fmtInt(c.qualified)} qualified of ${fmtInt(c.shows)} shows`}
+              >
+                <CellWithDelta cur={c.leadQualRate} base={b.leadQualRate} fmt="pct" />
               </div>
             </div>
           );
@@ -1107,6 +1131,8 @@ function V1FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
               <th className={TH}>Reg rate</th>
               <th className={TH}>Att % of regs</th>
               <th className={TH}>Att / 10k inv</th>
+              <th className={TH} title="Shows ÷ booked calls whose date has passed">Show rate</th>
+              <th className={TH} title="Qualified shows (Great / Ok / Barely Passable) ÷ shows">Lead qual</th>
             </tr>
           </thead>
           <tbody>
@@ -1132,6 +1158,12 @@ function V1FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
                   <td className={TD}>
                     {fmtR1(c.attendeesPer10kInv)}{" "}
                     <Delta cur={c.attendeesPer10kInv} base={b.attendeesPer10kInv} fmt="ratio" />
+                  </td>
+                  <td className={TD} title={`${fmtInt(c.shows)} showed of ${fmtInt(c.callsPassed)} calls passed · ${fmtInt(c.bookings)} booked`}>
+                    {fmtPct(c.showRate)} <Delta cur={c.showRate} base={b.showRate} fmt="pct" />
+                  </td>
+                  <td className={TD} title={`${fmtInt(c.qualified)} qualified of ${fmtInt(c.shows)} shows`}>
+                    {fmtPct(c.leadQualRate)} <Delta cur={c.leadQualRate} base={b.leadQualRate} fmt="pct" />
                   </td>
                 </tr>
               );

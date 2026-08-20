@@ -88,6 +88,12 @@ const sDescP = `${L_DESC} ${Z_ROW} ${BG_PARENT}`;
 const sNumSub = `${L_NUM} ${Z_ROW} ${BG_SUB}`;
 const sDescSub = `${L_DESC} ${Z_ROW} ${BG_SUB}`;
 
+// Webinar "New Joiners" sub-row — assigned lists + NO LIST DATA, nonjoiners
+// excluded. Sits between the assigned-lists headline and the Overall row and
+// shares the Overall row's shade; the two are told apart by their labels.
+const sNumNewJ = sNumSub;
+const sDescNewJ = sDescSub;
+
 const sNumG = `${L_NUM} ${Z_ROW} ${BG_GROUP}`;
 const sDescG = `${L_DESC} ${Z_ROW} ${BG_GROUP}`;
 const sCopyG = `${L_COPY} ${Z_ROW} ${BG_GROUP}`;
@@ -268,8 +274,8 @@ const DRILLDOWN_KEYS = new Set([
   "gcalInvitedGhl",
   "unsubscribes",
   "lpRegs",
-  "yesMarked", "yesAttended", "yes10MinPlus", "yesAttendBySmsClick", "yesBookings",
-  "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick", "maybeBookings",
+  "yesMarked", "yesAttended", "yes10MinPlus", "yes30MinPlus", "yesAttendBySmsClick", "yesBookings",
+  "maybeMarked", "maybeAttended", "maybe10MinPlus", "maybe30MinPlus", "maybeAttendBySmsClick", "maybeBookings",
   "selfRegMarked", "selfRegAttended", "selfReg10MinPlus", "selfRegBookings",
   "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus", "attendBySmsReminder",
   "totalBookings", "uniqueBookers", "totalCallsDatePassed", "confirmed", "shows", "noShows",
@@ -566,11 +572,23 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
   // avgProjectedDealSize is an average of child values, not a sum.
   m["avgProjectedDealSize"] = _avgOrNull(rows, "avgProjectedDealSize");
   // totalBookings is no longer a displayed column (the "Bookings" column now
-  // keys uniqueBookers), so the loop above doesn't sum it — but Show%'s
-  // denominator and the booking-rate fallback still need it. Sum the raw field
-  // (present on every child row) explicitly, else aggregate rows blank Show%.
+  // keys uniqueBookers), so the loop above doesn't sum it — but the
+  // booking-rate fallback still needs it on pre-uniqueBookers snapshots. Sum
+  // the raw field (present on every child row) explicitly.
   m["totalBookings"] = _sumOrNull(rows, "totalBookings");
+  return deriveMetrics(m);
+}
 
+/**
+ * Recompute every ratio / percent / per-1k field from a row's raw counts.
+ *
+ * Also applied to the webinar-level summary the API returns: a snapshot written
+ * before a formula changed still carries the OLD percentage, while its raw
+ * counts are always current. Re-deriving here keeps the webinar's three rows
+ * (assigned lists / new joiners / overall) on one set of formulas instead of
+ * making them agree only after the next recompute.
+ */
+function deriveMetrics(m: Record<string, number | null>): Record<string, number | null> {
   const au = m["actuallyUsed"];
   const inv = au == null || au === 0 ? (m["invited"] ?? null) : au;
   const g = (k: string) => m[k] ?? null;
@@ -581,11 +599,14 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
     yesPercent: _safeDiv(g("yesMarked"), inv),
     yesAttendPercent: _safeDiv(g("yesAttended"), g("yesMarked")),
     yesStay10MinPercent: _safeDiv(g("yes10MinPlus"), g("yesAttended")),
+    // 30m% is the 10m→30m step-down in every section, not a share of attendees.
+    yesStay30MinPercent: _safeDiv(g("yes30MinPlus"), g("yes10MinPlus")),
     yesAttendBySmsClickPercent: _safeDiv(g("yesAttendBySmsClick"), g("yesAttended")),
     yesBookingsPer1kInv: _safePer1k(g("yesBookings"), inv),
     maybePer1kInv: _safePer1k(g("maybeMarked"), inv),
     maybeAttendPercent: _safeDiv(g("maybeAttended"), g("maybeMarked")),
     maybeStay10MinPercent: _safeDiv(g("maybe10MinPlus"), g("maybeAttended")),
+    maybeStay30MinPercent: _safeDiv(g("maybe30MinPlus"), g("maybe10MinPlus")),
     maybeAttendBySmsClickPercent: _safeDiv(g("maybeAttendBySmsClick"), g("maybeAttended")),
     maybeBookingsPer1kInv: _safePer1k(g("maybeBookings"), inv),
     selfRegPer1kInv: _safePer1k(g("selfRegMarked"), inv),
@@ -601,14 +622,15 @@ function aggregateMetrics(rows: ApiStatisticsRow[]): Record<string, number | nul
     total10MinPlusPer1kInv: _safePer1k(g("total10MinPlus"), inv),
     attend10MinPercent: _safeDiv(g("total10MinPlus"), g("totalAttended")),
     total30MinPlusPer1kInv: _safePer1k(g("total30MinPlus"), inv),
-    attend30MinPercent: _safeDiv(g("total30MinPlus"), g("totalAttended")),
+    attend30MinPercent: _safeDiv(g("total30MinPlus"), g("total10MinPlus")),
     // Booking rates divide by unique bookers (the displayed "Bookings"); fall
-    // back to total opportunities on pre-uniqueBookers snapshots. Show% keeps
-    // total opps — its numerator (shows) is per-opportunity.
+    // back to total opportunities on pre-uniqueBookers snapshots. Show% divides
+    // by the calls whose date has already passed, so upcoming calls don't
+    // depress it.
     bookingsPerAttended: _safeDiv(g("uniqueBookers") ?? g("totalBookings"), g("totalAttended")),
     bookingsPerPast10Min: _safeDiv(g("uniqueBookers") ?? g("totalBookings"), g("total10MinPlus")),
     totalBookingsPer1kInv: _safePer1k(g("uniqueBookers") ?? g("totalBookings"), inv),
-    showPercent: _safeDiv(g("shows"), g("totalBookings")),
+    showPercent: _safeDiv(g("shows"), g("totalCallsDatePassed")),
     closeRatePercent: _safeDiv(g("won"), g("shows")),
     qualPercent: _safeDiv(g("qualified"), g("shows")),
   };
@@ -1284,6 +1306,33 @@ export function StatisticsPage() {
     return map;
   }, [filteredWebinars]);
 
+  /* ── New-Joiner totals per webinar ──────────────────────────────────
+   * The first-touch audience: assigned lists + NO LIST DATA, with the
+   * Nonjoiners row (people already invited to earlier webinars) left out.
+   * Rendered as a middle row between the assigned-lists headline and the
+   * Overall row, so the three rows read as widening scopes. */
+  const newJoinerTotalsById = useMemo(() => {
+    const map = new Map<string, Record<string, number | null>>();
+    for (const w of filteredWebinars) {
+      const rows = w.rows.filter((r) => r.kind === "list" || r.kind === "no_list_data");
+      // Only meaningful when a NO LIST DATA row exists — otherwise it would
+      // duplicate the assigned-lists headline verbatim.
+      if (rows.some((r) => r.kind === "no_list_data")) map.set(w.id, aggregateMetrics(rows));
+    }
+    return map;
+  }, [filteredWebinars]);
+
+  /* ── Re-derived webinar summaries ───────────────────────────────────
+   * The summary's raw counts are authoritative (the webinar-level query sees
+   * registrants that never land on a list row), but its stored percentages
+   * come from whenever the snapshot was written. Re-derive them so the Overall
+   * row uses the same formulas as the two rows above it. */
+  const overallMetricsById = useMemo(() => {
+    const map = new Map<string, Record<string, number | null>>();
+    for (const w of filteredWebinars) map.set(w.id, deriveMetrics({ ...w.summary }));
+    return map;
+  }, [filteredWebinars]);
+
   /* ── Global summary stats ───────────────────────────────────────── */
   const globalStats = useMemo(() => {
     const totalInvited = webinars.reduce((s, w) => s + (w.summary.invited ?? 0), 0);
@@ -1545,6 +1594,8 @@ export function StatisticsPage() {
             // to the smaller sub-row below. Falls back to overall (and skips
             // the sub-row) while this webinar's rows are still loading.
             const assignedTotals = assignedTotalsById.get(w.id) ?? null;
+            const newJoinerTotals = newJoinerTotalsById.get(w.id) ?? null;
+            const overallMetrics = overallMetricsById.get(w.id) ?? w.summary;
             const webinarLabel = `Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`;
 
             return (
@@ -1595,7 +1646,7 @@ export function StatisticsPage() {
                     <span>{listCount} lists</span>
                     {assignedTotals && (
                       <span
-                        title="These numbers are the sum of the assigned lists only — same as the 'Assigned Lists Total' row inside the dropdown. The row below shows the overall webinar numbers (assigned lists + Nonjoiners + NO LIST DATA)."
+                        title="These numbers are the sum of the assigned lists only — same as the 'Assigned Lists Total' row inside the dropdown. The rows below widen the scope: New Joiners (assigned lists + NO LIST DATA) and Overall (assigned lists + Nonjoiners + NO LIST DATA)."
                         className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30 align-middle"
                       >
                         assigned lists
@@ -1695,6 +1746,41 @@ export function StatisticsPage() {
                       ))}
                 </tr>
 
+                {/* ── New Joiners sub-row (assigned lists + NO LIST DATA) ── */}
+                {assignedTotals && newJoinerTotals && (
+                  <tr
+                    className="bg-zinc-200 dark:bg-zinc-900 hover:bg-zinc-300/70 dark:hover:bg-zinc-800/70 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
+                    onClick={() => toggleExpand(w.id)}
+                  >
+                    <td className="px-2 py-0.5"></td>
+                    <td className={`px-2 py-0.5 ${W_NUM} ${sNumNewJ}`}>
+                      <span
+                        title="First-touch audience — assigned lists plus NO LIST DATA, with Nonjoiners (people already invited to an earlier webinar) excluded."
+                        className="pl-4 text-[10px] font-semibold uppercase tracking-wide text-sky-600 dark:text-sky-400"
+                      >
+                        New Joiners
+                      </span>
+                    </td>
+                    <td className="px-2 py-0.5"></td>
+                    <td className="px-2 py-0.5"></td>
+                    <td className={`px-2 py-0.5 ${sDescNewJ}`} colSpan={4}></td>
+                    {METRIC_COLUMNS.map((col, idx) => {
+                      const v = newJoinerTotals[col.key];
+                      const show = showAggValue(col, v);
+                      return (
+                        <td
+                          key={col.key}
+                          className={`px-2 py-0.5 text-right font-mono text-[11px] whitespace-nowrap ${
+                            show ? "text-zinc-600 dark:text-zinc-300" : "text-zinc-400"
+                          } ${isGroupBoundary(idx) ? GROUP_BOUNDARY_CLASSES : ""}`}
+                        >
+                          {show ? formatMetricValue(v ?? null, col) : ""}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                )}
+
                 {/* ── Overall sub-row (assigned lists + specials) ───── */}
                 {assignedTotals && (
                   <tr
@@ -1716,14 +1802,14 @@ export function StatisticsPage() {
                     {METRIC_COLUMNS.map((col, idx) => (
                       <MetricCell
                         key={col.key}
-                        value={w.summary[col.key]}
+                        value={overallMetrics[col.key]}
                         col={col}
                         dense
                         boundary={isGroupBoundary(idx)}
                         webinarNumber={w.number}
                         webinarId={w.webinarId}
                         listLabel={webinarLabel}
-                        rowMetrics={w.summary}
+                        rowMetrics={overallMetrics}
                         onDrill={setDrill}
                       />
                     ))}

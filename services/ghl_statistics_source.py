@@ -1053,8 +1053,10 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)  AS total_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'yes')                                 AS yes_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'yes'   AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'yes'   AND wgs.minutes_viewing >= 30) AS yes_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe')                               AS maybe_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe' AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe' AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}))                                    AS self_reg_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}) AND wgs.minutes_viewing >= 10)      AS self_reg_10m
                 FROM webinargeek_subscribers wgs
@@ -1073,8 +1075,10 @@ class GoHighLevelStatisticsSource:
                 nj_metrics["total30MinPlus"] = int(wrow["total_30m"] or 0)
                 nj_metrics["yesAttended"] = int(wrow["yes_attended"] or 0)
                 nj_metrics["yes10MinPlus"] = int(wrow["yes_10m"] or 0)
+                nj_metrics["yes30MinPlus"] = int(wrow["yes_30m"] or 0)
                 nj_metrics["maybeAttended"] = int(wrow["maybe_attended"] or 0)
                 nj_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
+                nj_metrics["maybe30MinPlus"] = int(wrow["maybe_30m"] or 0)
                 if has_window:
                     nj_metrics["selfRegAttended"] = int(wrow["self_reg_attended"] or 0)
                     nj_metrics["selfReg10MinPlus"] = int(wrow["self_reg_10m"] or 0)
@@ -1177,7 +1181,8 @@ class GoHighLevelStatisticsSource:
         if broadcast_id:
             nj_default_zero.extend([
                 "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus",
-                "yesAttended", "yes10MinPlus", "maybeAttended", "maybe10MinPlus",
+                "yesAttended", "yes10MinPlus", "yes30MinPlus",
+                "maybeAttended", "maybe10MinPlus", "maybe30MinPlus",
             ])
             if has_window:
                 nj_default_zero.extend(["selfRegAttended", "selfReg10MinPlus"])
@@ -1390,8 +1395,10 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND wgs.minutes_viewing >= 30)                    AS thirty_min,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred})                                AS yes_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred}   AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_yes_pred}   AND wgs.minutes_viewing >= 30) AS yes_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred})                              AS maybe_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}))                               AS self_reg_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
                 FROM webinargeek_subscribers wgs
@@ -1409,8 +1416,10 @@ class GoHighLevelStatisticsSource:
                 # subscribers (we need the email match to know who responded).
                 nld_metrics["yesAttended"] = int(wrow["yes_attended"] or 0)
                 nld_metrics["yes10MinPlus"] = int(wrow["yes_10m"] or 0)
+                nld_metrics["yes30MinPlus"] = int(wrow["yes_30m"] or 0)
                 nld_metrics["maybeAttended"] = int(wrow["maybe_attended"] or 0)
                 nld_metrics["maybe10MinPlus"] = int(wrow["maybe_10m"] or 0)
+                nld_metrics["maybe30MinPlus"] = int(wrow["maybe_30m"] or 0)
                 nld_metrics["total10MinPlus"] = int(wrow["ten_min"] or 0)
                 nld_metrics["total30MinPlus"] = int(wrow["thirty_min"] or 0)
                 if has_window:
@@ -1744,9 +1753,11 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND g.has_sms_click_tag = TRUE) AS sms_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred}) AS yes_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred} AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred} AND wgs.minutes_viewing >= 30) AS yes_30m,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {yes_pred} AND g.has_sms_click_tag = TRUE) AS yes_sms,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred}) AS maybe_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
@@ -1776,9 +1787,11 @@ class GoHighLevelStatisticsSource:
                 m["attendBySmsReminder"] = int(row["sms_attended"] or 0)
                 m["yesAttended"] = int(row["yes_attended"] or 0)
                 m["yes10MinPlus"] = int(row["yes_10m"] or 0)
+                m["yes30MinPlus"] = int(row["yes_30m"] or 0)
                 m["yesAttendBySmsClick"] = int(row["yes_sms"] or 0)
                 m["maybeAttended"] = int(row["maybe_attended"] or 0)
                 m["maybe10MinPlus"] = int(row["maybe_10m"] or 0)
+                m["maybe30MinPlus"] = int(row["maybe_30m"] or 0)
                 m["maybeAttendBySmsClick"] = int(row["maybe_sms"] or 0)
                 if has_window:
                     m["selfRegAttended"] = int(row["self_reg_attended"] or 0)
@@ -1878,8 +1891,8 @@ class GoHighLevelStatisticsSource:
             default_zero.extend([
                 "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus",
                 "attendBySmsReminder",
-                "yesAttended", "yes10MinPlus", "yesAttendBySmsClick",
-                "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick",
+                "yesAttended", "yes10MinPlus", "yes30MinPlus", "yesAttendBySmsClick",
+                "maybeAttended", "maybe10MinPlus", "maybe30MinPlus", "maybeAttendBySmsClick",
             ])
             if has_window:
                 default_zero.extend(["selfRegAttended", "selfReg10MinPlus"])
@@ -2440,9 +2453,11 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND g.has_sms_click_tag = TRUE) AS sms_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg}) AS yes_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg} AND wgs.minutes_viewing >= 10) AS yes_10m,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg} AND wgs.minutes_viewing >= 30) AS yes_30m,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {yes_pred_wg} AND g.has_sms_click_tag = TRUE) AS yes_sms,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg}) AS maybe_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND wgs.minutes_viewing >= 10) AS maybe_10m,
+                    COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
@@ -2459,9 +2474,11 @@ class GoHighLevelStatisticsSource:
             metrics["attendBySmsReminder"] = int(row["sms_attended"] or 0)
             metrics["yesAttended"] = int(row["yes_attended"] or 0)
             metrics["yes10MinPlus"] = int(row["yes_10m"] or 0)
+            metrics["yes30MinPlus"] = int(row["yes_30m"] or 0)
             metrics["yesAttendBySmsClick"] = int(row["yes_sms"] or 0)
             metrics["maybeAttended"] = int(row["maybe_attended"] or 0)
             metrics["maybe10MinPlus"] = int(row["maybe_10m"] or 0)
+            metrics["maybe30MinPlus"] = int(row["maybe_30m"] or 0)
             metrics["maybeAttendBySmsClick"] = int(row["maybe_sms"] or 0)
             if has_window:
                 metrics["selfRegAttended"] = int(row["self_reg_attended"] or 0)
@@ -2472,8 +2489,8 @@ class GoHighLevelStatisticsSource:
         else:
             for k in (
                 "totalRegs", "totalAttended", "total10MinPlus", "total30MinPlus", "attendBySmsReminder",
-                "yesAttended", "yes10MinPlus", "yesAttendBySmsClick",
-                "maybeAttended", "maybe10MinPlus", "maybeAttendBySmsClick",
+                "yesAttended", "yes10MinPlus", "yes30MinPlus", "yesAttendBySmsClick",
+                "maybeAttended", "maybe10MinPlus", "maybe30MinPlus", "maybeAttendBySmsClick",
                 "selfRegAttended", "selfReg10MinPlus",
             ):
                 metrics[k] = None

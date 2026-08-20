@@ -28,11 +28,13 @@ class StatisticsMetrics(BaseModel):
     yesMarked: float | None = None
     yesAttended: float | None = None
     yes10MinPlus: float | None = None
+    yes30MinPlus: float | None = None
     yesAttendBySmsClick: float | None = None
     yesBookings: float | None = None
     maybeMarked: float | None = None
     maybeAttended: float | None = None
     maybe10MinPlus: float | None = None
+    maybe30MinPlus: float | None = None
     maybeAttendBySmsClick: float | None = None
     maybeBookings: float | None = None
     selfRegMarked: float | None = None
@@ -67,11 +69,13 @@ class StatisticsMetrics(BaseModel):
     yesPercent: float | None = None
     yesAttendPercent: float | None = None
     yesStay10MinPercent: float | None = None
+    yesStay30MinPercent: float | None = None
     yesAttendBySmsClickPercent: float | None = None
     yesBookingsPer1kInv: float | None = None
     maybePer1kInv: float | None = None
     maybeAttendPercent: float | None = None
     maybeStay10MinPercent: float | None = None
+    maybeStay30MinPercent: float | None = None
     maybeAttendBySmsClickPercent: float | None = None
     maybeBookingsPer1kInv: float | None = None
     selfRegPer1kInv: float | None = None
@@ -633,6 +637,60 @@ async def list_statistics_webinar_summaries(source: str = "auto"):
     webinars = await stats_svc.get_statistics_webinar_list(source=source)
     meta = await _resolve_meta(source)
     return {"webinars": webinars, "meta": meta}
+
+
+# ---------------------------------------------------------------------------
+# Overview series (Statistics Home charts)
+# ---------------------------------------------------------------------------
+
+class OverviewScopes(BaseModel):
+    """The same webinar at three widening audience scopes."""
+    assigned: StatisticsMetrics
+    newJoiners: StatisticsMetrics
+    overall: StatisticsMetrics
+
+
+class OverviewWebinar(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    title: str | None = None
+    label: str | None = None
+    listCount: int = 0
+    scopes: OverviewScopes
+
+
+class OverviewWebinarOption(BaseModel):
+    """A passed webinar, offered as a filter option on the Home charts."""
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    title: str | None = None
+    label: str | None = None
+
+
+class OverviewResponse(BaseModel):
+    webinars: list[OverviewWebinar]  # oldest first (chart reading order)
+    allWebinars: list[OverviewWebinarOption]  # every passed webinar (filter options)
+    includedWebinarIds: list[str] = []
+    pendingWebinarIds: list[str] = []
+    meta: StatisticsMetaResponse
+
+
+@router.get("/overview", response_model=OverviewResponse)
+async def get_statistics_overview(source: str = "auto", webinars: str | None = None):
+    """Per-webinar metric series for the Statistics Home charts — one snapshot
+    read for every passed webinar, at three audience scopes (assigned lists /
+    new joiners / overall). `webinars` is a comma-separated list of Webinar
+    UUIDs; omit for all passed. Reads the precomputed snapshots only, so it is
+    instant once they are built (POST /statistics/recompute)."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_overview(source=source, webinar_ids=ids or None)
+    meta = await _resolve_meta(source)
+    return {**data, "meta": meta}
 
 
 # ---------------------------------------------------------------------------
