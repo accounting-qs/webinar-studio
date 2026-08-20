@@ -88,11 +88,11 @@ const sDescP = `${L_DESC} ${Z_ROW} ${BG_PARENT}`;
 const sNumSub = `${L_NUM} ${Z_ROW} ${BG_SUB}`;
 const sDescSub = `${L_DESC} ${Z_ROW} ${BG_SUB}`;
 
-// Webinar "New Joiners" sub-row — assigned lists + NO LIST DATA, nonjoiners
-// excluded. Sits between the assigned-lists headline and the Overall row and
-// shares the Overall row's shade; the two are told apart by their labels.
-const sNumNewJ = sNumSub;
-const sDescNewJ = sDescSub;
+// Webinar "Assigned Lists" sub-row — the planned lists alone, sitting between
+// the New Joiners headline and the Overall row. Shares the Overall row's
+// shade; the two are told apart by their labels.
+const sNumAssigned = sNumSub;
+const sDescAssigned = sDescSub;
 
 const sNumG = `${L_NUM} ${Z_ROW} ${BG_GROUP}`;
 const sDescG = `${L_DESC} ${Z_ROW} ${BG_GROUP}`;
@@ -1293,10 +1293,9 @@ export function StatisticsPage() {
   /* ── Assigned-lists totals per webinar ──────────────────────────────
    * Sum of the assigned list rows only — the same set the expanded
    * "Assigned Lists Total" row covers (excludes NO LIST DATA / Nonjoiners).
-   * Rendered as the webinar's headline row, with the overall numbers kept
-   * on a second, smaller row right underneath. Empty while the webinar's
-   * metrics are still loading, in which case the headline row falls back to
-   * the overall summary and no sub-row is drawn. */
+   * Rendered as the smaller sub-row under the New Joiners headline. Empty
+   * while the webinar's metrics are still loading, in which case the headline
+   * falls back to the overall summary and no sub-rows are drawn. */
   const assignedTotalsById = useMemo(() => {
     const map = new Map<string, Record<string, number | null>>();
     for (const w of filteredWebinars) {
@@ -1309,14 +1308,14 @@ export function StatisticsPage() {
   /* ── New-Joiner totals per webinar ──────────────────────────────────
    * The first-touch audience: assigned lists + NO LIST DATA, with the
    * Nonjoiners row (people already invited to earlier webinars) left out.
-   * Rendered as a middle row between the assigned-lists headline and the
-   * Overall row, so the three rows read as widening scopes. */
+   * This is the webinar's headline row — the number the campaign is judged
+   * on — with Assigned Lists and Overall as smaller rows beneath it. */
   const newJoinerTotalsById = useMemo(() => {
     const map = new Map<string, Record<string, number | null>>();
     for (const w of filteredWebinars) {
       const rows = w.rows.filter((r) => r.kind === "list" || r.kind === "no_list_data");
       // Only meaningful when a NO LIST DATA row exists — otherwise it would
-      // duplicate the assigned-lists headline verbatim.
+      // equal the assigned-lists total, and the headline falls back to that.
       if (rows.some((r) => r.kind === "no_list_data")) map.set(w.id, aggregateMetrics(rows));
     }
     return map;
@@ -1590,12 +1589,20 @@ export function StatisticsPage() {
               ? w.rows.filter((r) => r.kind === "list").length
               : summary?.listCount ?? 0;
             const statusForBadge = w.rows[0]?.status ?? summary?.status ?? null;
-            // Headline metrics = assigned lists only; the overall numbers move
-            // to the smaller sub-row below. Falls back to overall (and skips
-            // the sub-row) while this webinar's rows are still loading.
+            // Headline metrics = New Joiners; assigned-lists and overall numbers
+            // move to the smaller sub-rows below. Falls back to the overall
+            // summary (and skips both sub-rows) while this webinar's rows are
+            // still loading.
             const assignedTotals = assignedTotalsById.get(w.id) ?? null;
             const newJoinerTotals = newJoinerTotalsById.get(w.id) ?? null;
             const overallMetrics = overallMetricsById.get(w.id) ?? w.summary;
+            // New Joiners is the headline the webinar is judged on. It only
+            // exists when the webinar has a NO LIST DATA row; without one it
+            // would equal the assigned-lists total, so that becomes the
+            // headline instead and the sub-row is dropped rather than
+            // repeating the same numbers twice.
+            const headlineTotals = newJoinerTotals ?? assignedTotals;
+            const showAssignedSubRow = newJoinerTotals != null && assignedTotals != null;
             const webinarLabel = `Webinar ${w.number}${w.variantLabel ? " · " + w.variantLabel : ""}`;
 
             return (
@@ -1644,12 +1651,16 @@ export function StatisticsPage() {
                   </td>
                   <td className="px-2 py-1.5 text-zinc-500 text-[10px]">
                     <span>{listCount} lists</span>
-                    {assignedTotals && (
+                    {headlineTotals && (
                       <span
-                        title="These numbers are the sum of the assigned lists only — same as the 'Assigned Lists Total' row inside the dropdown. The rows below widen the scope: New Joiners (assigned lists + NO LIST DATA) and Overall (assigned lists + Nonjoiners + NO LIST DATA)."
-                        className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-violet-500/15 text-violet-500 border border-violet-500/30 align-middle"
+                        title={
+                          showAssignedSubRow
+                            ? "First-touch audience — the assigned lists plus NO LIST DATA, with Nonjoiners (people already invited to an earlier webinar) excluded. The rows below narrow to the assigned lists alone, then widen to Overall (everything, Nonjoiners included)."
+                            : "This webinar has no NO LIST DATA row, so New Joiners would equal the assigned lists — these are the assigned-list totals. The row below shows Overall (assigned lists + Nonjoiners)."
+                        }
+                        className="ml-1.5 inline-block px-1.5 py-0.5 rounded text-[9px] font-semibold bg-sky-500/15 text-sky-600 dark:text-sky-400 border border-sky-500/30 align-middle"
                       >
-                        assigned lists
+                        {showAssignedSubRow ? "new joiners" : "assigned lists"}
                       </span>
                     )}
                     {w.usedFallback && (
@@ -1715,9 +1726,9 @@ export function StatisticsPage() {
                       </button>
                     )}
                   </td>
-                  {assignedTotals
+                  {headlineTotals
                     ? METRIC_COLUMNS.map((col, idx) => {
-                        const v = assignedTotals[col.key];
+                        const v = headlineTotals[col.key];
                         const show = showAggValue(col, v);
                         return (
                           <td
@@ -1746,26 +1757,26 @@ export function StatisticsPage() {
                       ))}
                 </tr>
 
-                {/* ── New Joiners sub-row (assigned lists + NO LIST DATA) ── */}
-                {assignedTotals && newJoinerTotals && (
+                {/* ── Assigned Lists sub-row (the planned lists alone) ───── */}
+                {showAssignedSubRow && (
                   <tr
                     className="bg-zinc-200 dark:bg-zinc-900 hover:bg-zinc-300/70 dark:hover:bg-zinc-800/70 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
                     onClick={() => toggleExpand(w.id)}
                   >
                     <td className="px-2 py-0.5"></td>
-                    <td className={`px-2 py-0.5 ${W_NUM} ${sNumNewJ}`}>
+                    <td className={`px-2 py-0.5 ${W_NUM} ${sNumAssigned}`}>
                       <span
-                        title="First-touch audience — assigned lists plus NO LIST DATA, with Nonjoiners (people already invited to an earlier webinar) excluded."
-                        className="pl-4 text-[10px] font-semibold uppercase tracking-wide text-sky-600 dark:text-sky-400"
+                        title="The planned lists only — same as the 'Assigned Lists Total' row inside the dropdown. Excludes NO LIST DATA and Nonjoiners."
+                        className="pl-4 text-[10px] font-semibold uppercase tracking-wide text-violet-600 dark:text-violet-400"
                       >
-                        New Joiners
+                        Assigned Lists
                       </span>
                     </td>
                     <td className="px-2 py-0.5"></td>
                     <td className="px-2 py-0.5"></td>
-                    <td className={`px-2 py-0.5 ${sDescNewJ}`} colSpan={4}></td>
+                    <td className={`px-2 py-0.5 ${sDescAssigned}`} colSpan={4}></td>
                     {METRIC_COLUMNS.map((col, idx) => {
-                      const v = newJoinerTotals[col.key];
+                      const v = assignedTotals![col.key];
                       const show = showAggValue(col, v);
                       return (
                         <td
@@ -1781,8 +1792,8 @@ export function StatisticsPage() {
                   </tr>
                 )}
 
-                {/* ── Overall sub-row (assigned lists + specials) ───── */}
-                {assignedTotals && (
+                {/* ── Overall sub-row (everything, Nonjoiners included) ── */}
+                {headlineTotals && (
                   <tr
                     className="bg-zinc-200 dark:bg-zinc-900 hover:bg-zinc-300/70 dark:hover:bg-zinc-800/70 cursor-pointer border-b border-zinc-200 dark:border-zinc-800/40 transition-colors"
                     onClick={() => toggleExpand(w.id)}
