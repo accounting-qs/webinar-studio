@@ -70,6 +70,14 @@ BATCH_SIZE = 2000  # ~10 cols per row → ~20k params, well under asyncpg's 3276
 NJ_POOL_TIMEOUT_S = 600
 
 
+def _is_transient_db_error(e: BaseException) -> bool:
+    """True for connection/timeout-class failures worth retrying. asyncpg's
+    connect timeout raises a bare asyncio.TimeoutError whose str() is "" —
+    match on the class name too, not just the message."""
+    text = f"{type(e).__name__} {e}".lower()
+    return "connection" in text or "timeout" in text
+
+
 def _supabase_base_url() -> str:
     base = SUPABASE_URL.strip()
     if not base:
@@ -948,20 +956,41 @@ async def resume_calendar_import(
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
-    if upload_id not in _active_import_tasks:
-        raise HTTPException(404, "No active import for this upload")
     ev = _import_pause_events.get(upload_id)
-    if not ev:
-        raise HTTPException(404, "No active import for this upload")
-    ev.set()
+    if upload_id in _active_import_tasks and ev:
+        # Live paused task in this process — just unblock it.
+        ev.set()
+        result = await db.execute(
+            select(WebinarCalendarUpload).where(WebinarCalendarUpload.id == upload_id)
+        )
+        upload = result.scalar_one_or_none()
+        if upload:
+            upload.status = "processing"
+            await db.flush()
+        return {"id": upload_id, "status": "processing"}
 
+    # No live task: a failed import, or a paused one orphaned by a restart.
+    # Every batch persists processed_rows/matched_count, and the source CSV is
+    # only deleted from Storage on success — so respawn the worker from the
+    # saved counters and continue where it stopped.
     result = await db.execute(
-        select(WebinarCalendarUpload).where(WebinarCalendarUpload.id == upload_id)
+        select(WebinarCalendarUpload).where(
+            WebinarCalendarUpload.id == upload_id,
+            WebinarCalendarUpload.user_id == LLOYD_USER_ID,
+        )
     )
     upload = result.scalar_one_or_none()
-    if upload:
-        upload.status = "processing"
-        await db.flush()
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    if upload.status not in ("failed", "paused"):
+        raise HTTPException(409, f"Cannot resume: status is '{upload.status}'")
+    if not upload.storage_path:
+        raise HTTPException(409, "Cannot resume: source file no longer in storage")
+
+    upload.status = "processing"
+    upload.error_message = None
+    await db.flush()
+    resume_orphan_calendar_import(upload)
     return {"id": upload_id, "status": "processing"}
 
 
@@ -1174,15 +1203,19 @@ async def _process_calendar_csv(
             raise Exception("CSV is empty")
 
         # Resume support: skip past rows we already processed in a previous run.
+        # `processed` never counts fully-blank lines (the main loop skips them
+        # before counting), so only non-blank rows advance the skip counter —
+        # otherwise a CSV with blank lines would resume past unprocessed rows.
         if start_from_row > 0:
             print(f"[CAL_IMPORT] Resuming {upload_id} — skipping first {start_from_row} rows")
             skipped_ahead = 0
-            for _ in range(start_from_row):
+            while skipped_ahead < start_from_row:
                 try:
-                    next(reader)
-                    skipped_ahead += 1
+                    raw = next(reader)
                 except StopIteration:
                     break
+                if any(cell.strip() for cell in raw):
+                    skipped_ahead += 1
             if skipped_ahead < start_from_row:
                 print(f"[CAL_IMPORT] Resume skip-ahead ran out of rows at {skipped_ahead} (expected {start_from_row}) — finalizing")
 
@@ -1287,9 +1320,9 @@ async def _process_calendar_csv(
                             rows_affected = result.rowcount or 0
                         break
                     except Exception as e:
-                        if attempt < 2 and ("connection" in str(e).lower() or "timeout" in str(e).lower()):
-                            print(f"[CAL_IMPORT] NJ upsert retry {attempt+1}: {e}")
-                            await asyncio.sleep(1)
+                        if attempt < 2 and _is_transient_db_error(e):
+                            print(f"[CAL_IMPORT] NJ upsert retry {attempt+1}: {type(e).__name__} {e}")
+                            await asyncio.sleep(1 + attempt * 2)
                         else:
                             raise
                 # No per-batch matching: non-joiners aren't a per-list cohort, so
@@ -1297,11 +1330,19 @@ async def _process_calendar_csv(
                 # are resolved once after the import (see _nonjoiner_match_counts).
                 return 0, 0, rows_affected
 
-            # Match: contacts assigned to this webinar via WebinarListAssignment
-            match_map: dict[str, tuple[str, str]] = {}  # email → (assignment_id, contact_id)
+            # Match + upsert on ONE connection per batch. Under NullPool every
+            # engine.begin() opens a fresh Postgres connection through the
+            # Supabase pooler, and that churn is what produced bare
+            # TimeoutError connect failures — so don't pay it twice. Retrying
+            # re-runs a read-only match plus an idempotent upsert: safe.
+            local_matched = 0
+            local_unmatched = 0
+            rows_affected = 0
             for attempt in range(3):
                 try:
                     async with engine.begin() as conn:
+                        # Match: contacts assigned to this webinar via WebinarListAssignment
+                        match_map: dict[str, tuple[str, str]] = {}  # email → (assignment_id, contact_id)
                         mres = await conn.execute(
                             select(
                                 sa_func.lower(Contact.__table__.c.email).label("email"),
@@ -1324,43 +1365,31 @@ async def _process_calendar_csv(
                             # If a contact appears in multiple assignments, take the first hit
                             if row.email not in match_map:
                                 match_map[row.email] = (row.assignment_id, row.contact_id)
-                    break
-                except Exception as e:
-                    if attempt < 2 and ("connection" in str(e).lower() or "timeout" in str(e).lower()):
-                        print(f"[CAL_IMPORT] Match retry {attempt+1}: {e}")
-                        await asyncio.sleep(1)
-                    else:
-                        raise
 
-            now = datetime.now(tz=timezone.utc)
-            insert_rows: list[dict] = []
-            local_matched = 0
-            for r in rows:
-                hit = match_map.get(r["email"])
-                if hit:
-                    local_matched += 1
-                insert_rows.append({
-                    "id": str(uuid.uuid4()),
-                    "upload_id": upload_id,
-                    "webinar_id": webinar_id,
-                    "email": r["email"],
-                    "calendar_invited_date": r["calendar_invited_date"],
-                    "calendar_account": r["calendar_account"],
-                    "calendar_account_prefix": r["calendar_account_prefix"],
-                    "calendar_webinar_series": r["calendar_webinar_series"],
-                    "calendar_invite_response": r["calendar_invite_response"],
-                    "matched_assignment_id": hit[0] if hit else None,
-                    "matched_contact_id": hit[1] if hit else None,
-                    "updated_at": now,
-                })
+                        now = datetime.now(tz=timezone.utc)
+                        insert_rows: list[dict] = []
+                        local_matched = 0
+                        for r in rows:
+                            hit = match_map.get(r["email"])
+                            if hit:
+                                local_matched += 1
+                            insert_rows.append({
+                                "id": str(uuid.uuid4()),
+                                "upload_id": upload_id,
+                                "webinar_id": webinar_id,
+                                "email": r["email"],
+                                "calendar_invited_date": r["calendar_invited_date"],
+                                "calendar_account": r["calendar_account"],
+                                "calendar_account_prefix": r["calendar_account_prefix"],
+                                "calendar_webinar_series": r["calendar_webinar_series"],
+                                "calendar_invite_response": r["calendar_invite_response"],
+                                "matched_assignment_id": hit[0] if hit else None,
+                                "matched_contact_id": hit[1] if hit else None,
+                                "updated_at": now,
+                            })
 
-            local_unmatched = len(insert_rows) - local_matched
+                        local_unmatched = len(insert_rows) - local_matched
 
-            # Upsert
-            rows_affected = 0
-            for attempt in range(3):
-                try:
-                    async with engine.begin() as conn:
                         stmt = pg_insert(WebinarCalendarInvite.__table__).values(insert_rows)
                         set_cols = {
                             "upload_id": stmt.excluded.upload_id,
@@ -1381,9 +1410,9 @@ async def _process_calendar_csv(
                         rows_affected = result.rowcount or 0
                     break
                 except Exception as e:
-                    if attempt < 2 and ("connection" in str(e).lower() or "timeout" in str(e).lower()):
-                        print(f"[CAL_IMPORT] Upsert retry {attempt+1}: {e}")
-                        await asyncio.sleep(1)
+                    if attempt < 2 and _is_transient_db_error(e):
+                        print(f"[CAL_IMPORT] Batch retry {attempt+1}: {type(e).__name__} {e}")
+                        await asyncio.sleep(1 + attempt * 2)
                     else:
                         raise
 
@@ -1442,13 +1471,22 @@ async def _process_calendar_csv(
                 elapsed = _time.monotonic() - start
                 rate = processed / elapsed if elapsed > 0 else 0
                 print(f"[CAL_IMPORT] {processed}/{total} ({pct}%) — {rate:.0f} rows/s — {matched} matched")
-                async with engine.begin() as conn:
-                    await conn.execute(
-                        update(WebinarCalendarUpload.__table__)
-                        .where(WebinarCalendarUpload.__table__.c.id == upload_id)
-                        .values(progress=pct, processed_rows=processed,
-                                matched_count=matched, unmatched_count=unmatched)
-                    )
+                for attempt in range(3):
+                    try:
+                        async with engine.begin() as conn:
+                            await conn.execute(
+                                update(WebinarCalendarUpload.__table__)
+                                .where(WebinarCalendarUpload.__table__.c.id == upload_id)
+                                .values(progress=pct, processed_rows=processed,
+                                        matched_count=matched, unmatched_count=unmatched)
+                            )
+                        break
+                    except Exception as e:
+                        if attempt < 2 and _is_transient_db_error(e):
+                            print(f"[CAL_IMPORT] Progress retry {attempt+1}: {type(e).__name__} {e}")
+                            await asyncio.sleep(1 + attempt * 2)
+                        else:
+                            raise
                 await asyncio.sleep(0)
 
         if batch:

@@ -251,7 +251,10 @@ function UploadsTable({
                         Pause
                       </button>
                     )}
-                    {u.status === "paused" && (
+                    {/* failed imports keep their processed_rows counter and the
+                        source CSV in Storage, so the backend can continue them
+                        from where they stopped */}
+                    {(u.status === "paused" || u.status === "failed") && (
                       <button
                         onClick={() => handleResume(u.id)}
                         disabled={busyId === u.id}
