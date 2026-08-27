@@ -1384,10 +1384,31 @@ export async function fetchWebinarNonjoiners(
   return res.json();
 }
 
+// Large selections are flipped server-side in the background (the row writes
+// take minutes at 10-50k contacts); the PUT returns a job to poll instead of
+// blocking until done. `job` is null when the selection was small enough to
+// handle synchronously.
+export interface MarkUsedJob {
+  id: string;
+  status: "running" | "done" | "failed";
+  total: number;
+  done: number;
+  marked: number;
+  error: string | null;
+}
+
+export async function fetchMarkUsedJob(jobId: string): Promise<MarkUsedJob> {
+  const res = await fetch(`${API_URL}/outreach/mark-used-jobs/${jobId}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch mark-used job");
+  return res.json();
+}
+
 export async function markContactsUsed(
   assignmentId: string,
   contactIds: string[]
-): Promise<{ marked: number }> {
+): Promise<{ marked: number; job: MarkUsedJob | null }> {
   const res = await fetch(`${API_URL}/outreach/assignments/${assignmentId}/contacts/mark-used`, {
     method: "PUT",
     headers: jsonHeaders(),
@@ -1500,7 +1521,7 @@ export async function downloadBucketContactsCsv(
 export async function markGroupContactsUsed(
   contactIds: string[],
   assignmentIds?: string[]
-): Promise<{ marked: number; by_assignment: Record<string, number> }> {
+): Promise<{ marked: number; by_assignment: Record<string, number>; job: MarkUsedJob | null }> {
   const res = await fetch(`${API_URL}/outreach/assignment-groups/contacts/mark-used`, {
     method: "PUT",
     headers: jsonHeaders(),

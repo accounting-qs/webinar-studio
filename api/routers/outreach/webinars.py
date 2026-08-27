@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -1291,6 +1292,221 @@ class MarkUsedRequest(BaseModel):
     contact_ids: list[str]
 
 
+# ── Mark-used at scale ──────────────────────────────────────────────────────
+#
+# Marking a contact used is a non-HOT UPDATE on BOTH memberships and contacts —
+# each row rewrites every index on its table (~3-6ms/row, migration 073) on an
+# instance already at its random-IO ceiling (074). A "select all" page of
+# 10-50k ids is therefore minutes of unavoidable DB write time: far past the
+# frontend's patience, and each 5k chunk was brushing the 120s
+# statement_timeout (observed up to 112s in pg_stat_statements).
+#
+# So: selections up to _MARK_SYNC_LIMIT are handled inline in the request as
+# before; anything larger returns immediately and a background task works
+# through the ids in _MARK_JOB_CHUNK-sized transactions, committing each chunk.
+# The flip's status='assigned' guard makes every chunk idempotent, so a task
+# killed by a deploy just leaves the tail un-marked — re-running Mark as Used
+# on the leftovers finishes the job. The UI polls the job endpoint below and
+# reloads when the job reports done.
+_MARK_SYNC_LIMIT = 500
+_MARK_JOB_CHUNK = 1000
+
+# job_id → progress dict. In-memory on purpose: progress is ephemeral, the
+# membership rows are the durable state. Pruned lazily on job creation.
+_MARK_JOBS: dict[str, dict] = {}
+_active_mark_tasks: dict[str, asyncio.Task] = {}
+
+
+def _is_retryable_db_error(e: BaseException) -> bool:
+    """Statement timeouts and transient pool/connection drops are worth a
+    retry from a background chunk; anything else means the statement is wrong."""
+    if _is_statement_timeout(e):
+        return True
+    orig = getattr(e, "orig", None)
+    blob = f"{type(e).__name__} {type(orig or e).__name__} {orig or ''} {e}".lower()
+    return "timeout" in blob or "connection" in blob
+
+
+async def _mark_used_chunk(
+    db: AsyncSession,
+    chunk_ids: list[str],
+    now: datetime,
+    *,
+    assignment_id: str | None = None,
+    scope_ids: list[str] | None = None,
+) -> dict[str, int]:
+    """Flip one chunk of contact ids assigned→used, with every side-write.
+
+    Two modes: single-assignment (assignment_id set) or group (optionally
+    scoped to scope_ids). Does NOT commit/flush. Returns {assignment_id: n}
+    counting flipped memberships (None-assignment flips are counted under "").
+
+    The contacts pass is ONE statement combining the legacy slot dual-write
+    (same per-mode guards as before) with the cache-column maintenance that
+    recompute_contact_caches would re-derive. Incremental math is exact here:
+    every flipped membership is precisely one assigned→used transition, so
+    counts shift by the per-contact flip count and last_invited_at rises to
+    the flipped membership's webinar date (used_at fallback, like recompute).
+    """
+    if assignment_id is not None:
+        flip_sql = (
+            "UPDATE webinar_contact_memberships "
+            "SET status = 'used', used_at = :now, updated_at = now() "
+            "WHERE assignment_id = CAST(:aid AS uuid) AND status = 'assigned' "
+            "  AND contact_id = ANY(CAST(:cids AS uuid[])) "
+            "RETURNING contact_id, assignment_id, assigned_date"
+        )
+        flip_params = {"now": now, "aid": assignment_id, "cids": chunk_ids}
+    else:
+        scope_pred = "AND assignment_id = ANY(CAST(:scope AS uuid[])) " if scope_ids else ""
+        flip_sql = (
+            "UPDATE webinar_contact_memberships "
+            "SET status = 'used', used_at = :now, updated_at = now() "
+            "WHERE user_id = CAST(:uid AS uuid) AND status = 'assigned' "
+            "  AND contact_id = ANY(CAST(:cids AS uuid[])) "
+            f"{scope_pred}"
+            "RETURNING contact_id, assignment_id, assigned_date"
+        )
+        flip_params = {"now": now, "uid": LLOYD_USER_ID, "cids": chunk_ids}
+        if scope_ids:
+            flip_params["scope"] = scope_ids
+    rows = (await db.execute(sa_text(flip_sql), flip_params)).all()
+    if not rows:
+        return {}
+
+    # Aggregate per contact — in group mode one contact can flip memberships on
+    # several assignments, and UPDATE ... FROM applies only ONE matching join
+    # row, so the deltas must be pre-summed. Raw rows carry uuid.UUID/date.
+    per_contact: dict[str, tuple[int, datetime]] = {}
+    per_assignment: dict[str, int] = {}
+    for contact_id, asgn_id, assigned_date in rows:
+        cid = str(contact_id)
+        wdate = (
+            datetime(assigned_date.year, assigned_date.month, assigned_date.day, tzinfo=timezone.utc)
+            if assigned_date else now
+        )
+        n, mx = per_contact.get(cid, (0, wdate))
+        per_contact[cid] = (n + 1, max(mx, wdate))
+        key = str(asgn_id) if asgn_id else ""
+        per_assignment[key] = per_assignment.get(key, 0) + 1
+
+    # Legacy slot dual-write guard: fresh-origin contacts only. The single-
+    # assignment mode additionally requires the slot to point at THIS
+    # assignment (reused contacts keep their prior slot), mirroring the
+    # original per-endpoint conditions.
+    dw_cond = "c.outreach_status = 'assigned'"
+    upd_params: dict = {"now": now, "uid": LLOYD_USER_ID}
+    if assignment_id is not None:
+        dw_cond += " AND c.assignment_id = CAST(:aid AS uuid)"
+        upd_params["aid"] = assignment_id
+    cids = list(per_contact)
+    upd_params.update({
+        "cids2": cids,
+        "ns": [per_contact[c][0] for c in cids],
+        "wdates": [per_contact[c][1] for c in cids],
+    })
+    await db.execute(sa_text(
+        "UPDATE contacts c SET "
+        f"  outreach_status = CASE WHEN {dw_cond} THEN 'used' ELSE c.outreach_status END, "
+        f"  used_at         = CASE WHEN {dw_cond} THEN :now ELSE c.used_at END, "
+        "  assigned_membership_count = GREATEST(0, c.assigned_membership_count - k.n), "
+        "  times_invited   = c.times_invited + k.n, "
+        "  last_invited_at = GREATEST(COALESCE(c.last_invited_at, k.wdate), k.wdate), "
+        "  updated_at      = now() "
+        "FROM unnest(CAST(:cids2 AS uuid[]), CAST(:ns AS int[]), CAST(:wdates AS timestamptz[])) "
+        "     AS k(cid, n, wdate) "
+        "WHERE c.id = k.cid AND c.user_id = CAST(:uid AS uuid)"
+    ), upd_params)
+    return per_assignment
+
+
+async def _run_mark_used_job(
+    job_id: str,
+    contact_ids: list[str],
+    *,
+    assignment_id: str | None = None,
+    scope_ids: list[str] | None = None,
+) -> None:
+    """Background worker: one committed transaction per chunk, so progress
+    survives any single failure and a dead task never holds locks."""
+    job = _MARK_JOBS[job_id]
+    try:
+        for i in range(0, len(contact_ids), _MARK_JOB_CHUNK):
+            chunk = contact_ids[i : i + _MARK_JOB_CHUNK]
+            for attempt in range(3):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        now = datetime.now(timezone.utc)
+                        per_asgn = await _mark_used_chunk(
+                            db, chunk, now,
+                            assignment_id=assignment_id, scope_ids=scope_ids,
+                        )
+                        for aid, n in per_asgn.items():
+                            if aid:
+                                await db.execute(sa_text(
+                                    "UPDATE webinar_list_assignments "
+                                    "SET remaining = GREATEST(0, remaining - :n), updated_at = now() "
+                                    "WHERE id = CAST(:aid AS uuid)"
+                                ), {"n": n, "aid": aid})
+                        await db.commit()
+                    job["marked"] += sum(per_asgn.values())
+                    break
+                except Exception as exc:
+                    if attempt < 2 and _is_retryable_db_error(exc):
+                        await asyncio.sleep(1 + 2 * attempt)
+                        continue
+                    raise
+            job["done"] = min(i + len(chunk), job["total"])
+        job["status"] = "done"
+    except Exception as exc:
+        logger.exception(
+            "Mark-used job %s failed at %s/%s", job_id, job["done"], job["total"]
+        )
+        job["status"] = "failed"
+        job["error"] = str(exc)[:300]
+    finally:
+        job["_ts"] = datetime.now(timezone.utc).timestamp()
+        _active_mark_tasks.pop(job_id, None)
+
+
+def _mark_job_public(job: dict) -> dict:
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+def _spawn_mark_used_job(
+    contact_ids: list[str],
+    *,
+    assignment_id: str | None = None,
+    scope_ids: list[str] | None = None,
+) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for jid in [
+        jid for jid, j in _MARK_JOBS.items()
+        if j["status"] != "running" and j["_ts"] < now_ts - 3600
+    ]:
+        _MARK_JOBS.pop(jid, None)
+    job_id = str(uuid4())
+    job = {
+        "id": job_id, "status": "running", "total": len(contact_ids),
+        "done": 0, "marked": 0, "error": None, "_ts": now_ts,
+    }
+    _MARK_JOBS[job_id] = job
+    _active_mark_tasks[job_id] = asyncio.create_task(
+        _run_mark_used_job(
+            job_id, contact_ids, assignment_id=assignment_id, scope_ids=scope_ids
+        )
+    )
+    return job
+
+
+@router.get("/mark-used-jobs/{job_id}")
+async def get_mark_used_job(job_id: str, _: str = Depends(require_auth)):
+    job = _MARK_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Mark-used job not found")
+    return _mark_job_public(job)
+
+
 @router.put("/assignments/{assignment_id}/contacts/mark-used")
 async def mark_contacts_used(
     assignment_id: str,
@@ -1309,43 +1525,21 @@ async def mark_contacts_used(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    now = datetime.now(timezone.utc)
-    # Chunk the id lists: "select all" pages can submit tens of thousands of ids
-    # and asyncpg caps a statement at 32,767 bind params.
-    MARK_CHUNK = 5000
-    used_ids: list[str] = []
-    for i in range(0, len(body.contact_ids), MARK_CHUNK):
-        chunk = body.contact_ids[i : i + MARK_CHUNK]
-        # Mark this assignment's memberships used (authoritative) — an invite was sent.
-        used_ids.extend((await db.execute(
-            update(WebinarContactMembership)
-            .where(
-                WebinarContactMembership.assignment_id == assignment_id,
-                WebinarContactMembership.contact_id.in_(chunk),
-                WebinarContactMembership.status == "assigned",
-            )
-            .values(status="used", used_at=now)
-            .returning(WebinarContactMembership.contact_id)
-        )).scalars().all())
-        # Legacy slot dual-write — only contacts whose slot still points at this
-        # assignment (fresh-origin); reused contacts keep their prior slot.
-        await db.execute(
-            update(Contact)
-            .where(
-                Contact.id.in_(chunk),
-                Contact.assignment_id == assignment_id,
-                Contact.user_id == LLOYD_USER_ID,
-                Contact.outreach_status == "assigned",
-            )
-            .values(outreach_status="used", used_at=now)
+    ids = [c for c in dict.fromkeys(body.contact_ids) if c]
+    if len(ids) <= _MARK_SYNC_LIMIT:
+        per_asgn = await _mark_used_chunk(
+            db, ids, datetime.now(timezone.utc), assignment_id=assignment_id
         )
-    marked = len(used_ids)
-    if marked:
-        await recompute_contact_caches(db, used_ids)
-        assignment.remaining = max(0, (assignment.remaining or 0) - marked)
-    await db.flush()
+        marked = sum(per_asgn.values())
+        if marked:
+            assignment.remaining = max(0, (assignment.remaining or 0) - marked)
+        await db.flush()
+        return {"marked": marked, "remaining": assignment.remaining, "job": None}
 
-    return {"marked": marked, "remaining": assignment.remaining}
+    # Large selection: flip in the background, respond now. `marked` lands on
+    # the job; the UI polls it and reloads for authoritative counts.
+    job = _spawn_mark_used_job(ids, assignment_id=assignment_id)
+    return {"marked": 0, "remaining": assignment.remaining, "job": _mark_job_public(job)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1580,54 +1774,20 @@ async def mark_group_contacts_used(
     _: str = Depends(require_auth),
 ):
     if not body.contact_ids:
-        return {"marked": 0, "by_assignment": {}}
+        return {"marked": 0, "by_assignment": {}, "job": None}
 
-    now = datetime.now(timezone.utc)
+    ids = [c for c in dict.fromkeys(body.contact_ids) if c]
+    if len(ids) > _MARK_SYNC_LIMIT:
+        # Large selection: flip in the background, respond now (see the
+        # single-assignment endpoint). The UI polls the job and reloads.
+        job = _spawn_mark_used_job(ids, scope_ids=body.assignment_ids)
+        return {"marked": 0, "by_assignment": {}, "job": _mark_job_public(job)}
 
-    # Mark this user's 'assigned' memberships for these contacts as used
-    # (authoritative), capturing which assignment each belonged to so we can
-    # decrement its remaining counter. Chunked: "select all" pages can submit
-    # tens of thousands of ids (asyncpg 32,767-param cap).
-    MARK_CHUNK = 5000
-    scope = [
-        WebinarContactMembership.assignment_id.in_(body.assignment_ids)
-    ] if body.assignment_ids else []
-    rows = []
-    for i in range(0, len(body.contact_ids), MARK_CHUNK):
-        chunk = body.contact_ids[i : i + MARK_CHUNK]
-        rows.extend((await db.execute(
-            update(WebinarContactMembership)
-            .where(
-                WebinarContactMembership.user_id == LLOYD_USER_ID,
-                WebinarContactMembership.contact_id.in_(chunk),
-                WebinarContactMembership.status == "assigned",
-                *scope,
-            )
-            .values(status="used", used_at=now)
-            .returning(WebinarContactMembership.contact_id, WebinarContactMembership.assignment_id)
-        )).all())
-    if not rows:
-        return {"marked": 0, "by_assignment": {}}
-
-    used_ids = [r.contact_id for r in rows]
-    marked = len(used_ids)
-    per_assignment: dict[str, int] = {}
-    for r in rows:
-        if r.assignment_id:
-            per_assignment[r.assignment_id] = per_assignment.get(r.assignment_id, 0) + 1
-
-    # Legacy slot dual-write — fresh-origin contacts only (chunked).
-    for i in range(0, len(used_ids), MARK_CHUNK):
-        await db.execute(
-            update(Contact)
-            .where(
-                Contact.id.in_(used_ids[i : i + MARK_CHUNK]),
-                Contact.user_id == LLOYD_USER_ID,
-                Contact.outreach_status == "assigned",
-            )
-            .values(outreach_status="used", used_at=now)
-        )
-    await recompute_contact_caches(db, used_ids)
+    per_assignment = await _mark_used_chunk(
+        db, ids, datetime.now(timezone.utc), scope_ids=body.assignment_ids
+    )
+    marked = sum(per_assignment.values())
+    per_assignment.pop("", None)  # memberships whose list was deleted
 
     # Decrement each affected assignment's remaining counter atomically in the
     # same transaction. Bound at zero to mirror the single-assignment endpoint.
@@ -1644,7 +1804,7 @@ async def mark_group_contacts_used(
                 asgn.remaining = max(0, (asgn.remaining or 0) - dec)
     await db.flush()
 
-    return {"marked": marked, "by_assignment": per_assignment}
+    return {"marked": marked, "by_assignment": per_assignment, "job": None}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

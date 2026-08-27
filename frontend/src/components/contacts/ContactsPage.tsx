@@ -5,6 +5,7 @@ import {
   downloadAssignmentGroupContactsCsv,
   fetchAssignmentContacts,
   fetchAssignmentGroupContacts,
+  fetchMarkUsedJob,
   fetchWebinarNonjoiners,
   markContactsUsed,
   markGroupContactsUsed,
@@ -68,6 +69,7 @@ export function ContactsPage(props: ContactsPageProps) {
   const [copying, setCopying] = useState(false);
   const [copiedBtn, setCopiedBtn] = useState<"emails" | "names" | null>(null);
   const [marking, setMarking] = useState(false);
+  const [markProgress, setMarkProgress] = useState<{ done: number; total: number } | null>(null);
   const [releasing, setReleasing] = useState(false);
 
   /* ── Fetch contacts ─────────────────────────────────────────────────── */
@@ -243,10 +245,28 @@ export function ContactsPage(props: ContactsPageProps) {
     if (selectedIds.size === 0) return;
     setMarking(true);
     try {
-      if (isGroup) {
-        await markGroupContactsUsed(Array.from(selectedIds), props.groupAssignmentIds);
-      } else {
-        await markContactsUsed(props.assignmentId!, Array.from(selectedIds));
+      const res = isGroup
+        ? await markGroupContactsUsed(Array.from(selectedIds), props.groupAssignmentIds)
+        : await markContactsUsed(props.assignmentId!, Array.from(selectedIds));
+      // Large selections flip server-side in the background (minutes of row
+      // writes at 10k+); poll the job for progress until it finishes.
+      let job = res.job;
+      if (job) {
+        setMarkProgress({ done: job.done, total: job.total });
+        while (job.status === "running") {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            job = await fetchMarkUsedJob(job.id);
+          } catch {
+            // Server restarted mid-job: reload below shows what completed;
+            // re-running Mark as Used on the leftovers finishes it.
+            break;
+          }
+          setMarkProgress({ done: job.done, total: job.total });
+        }
+        if (job.status === "failed") {
+          alert(`Marking stopped partway (${job.done.toLocaleString()} of ${job.total.toLocaleString()} processed). Re-run Mark as Used on the remaining contacts.`);
+        }
       }
       // Reload to get fresh counts and filter out used ones
       setSelectedIds(new Set());
@@ -256,8 +276,9 @@ export function ContactsPage(props: ContactsPageProps) {
       console.error("Failed to mark contacts:", err);
     } finally {
       setMarking(false);
+      setMarkProgress(null);
     }
-  }, [isGroup, props.assignmentId, selectedIds, filter, load]);
+  }, [isGroup, props.assignmentId, props.groupAssignmentIds, selectedIds, filter, load]);
 
   /* ── Release selected contacts back to the bucket ────────────────────── */
 
@@ -506,7 +527,9 @@ export function ContactsPage(props: ContactsPageProps) {
               {marking && (
                 <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
               )}
-              Mark as Used
+              {markProgress
+                ? `Marking… ${markProgress.done.toLocaleString()}/${markProgress.total.toLocaleString()}`
+                : "Mark as Used"}
             </button>
           )}
 
