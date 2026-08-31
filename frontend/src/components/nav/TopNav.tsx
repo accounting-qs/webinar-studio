@@ -4,18 +4,22 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { ThemeToggle } from "./ThemeToggle";
 
-const NAV_LINKS = [
+const NAV_LINKS_LEFT = [
   { href: "/", label: "Planning" },
+  { href: "/statistics", label: "Statistics" },
   { href: "/copy-generator", label: "Copy Generator" },
   { href: "/upload", label: "List Upload" },
-  { href: "/library", label: "Library" },
-  { href: "/statistics", label: "Statistics" },
+  { href: "/contacts", label: "Contacts" },
   { href: "/blocklist", label: "Blocklist" },
+  { href: "/library", label: "Library" },
+];
+
+const NAV_LINKS_RIGHT = [
+  { href: "/sop", label: "SOP" },
+  { href: "/api-docs", label: "API Docs" },
   { href: "/connectors", label: "Connectors" },
   { href: "/reports", label: "Reports" },
   { href: "/sync", label: "Sync" },
-  { href: "/sop", label: "SOP" },
-  { href: "/api-docs", label: "API Docs" },
 ];
 
 export function TopNav() {
@@ -41,7 +45,7 @@ export function TopNav() {
         <div className="w-px h-3 bg-zinc-100 dark:bg-zinc-800" />
 
         <nav className="flex items-center gap-0.5">
-          {NAV_LINKS.map(({ href, label }) => (
+          {NAV_LINKS_LEFT.map(({ href, label }) => (
             <Link
               key={href}
               href={href}
@@ -56,7 +60,22 @@ export function TopNav() {
           ))}
         </nav>
 
-        <div className="ml-auto flex items-center">
+        <div className="ml-auto flex items-center gap-3">
+          <nav className="flex items-center gap-0.5">
+            {NAV_LINKS_RIGHT.map(({ href, label }) => (
+              <Link
+                key={href}
+                href={href}
+                className={`px-2.5 py-1 rounded text-[13px] font-medium transition-colors duration-100 ${
+                  isActive(href)
+                    ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
+                    : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800/50"
+                }`}
+              >
+                {label}
+              </Link>
+            ))}
+          </nav>
           <ThemeToggle />
         </div>
       </div>

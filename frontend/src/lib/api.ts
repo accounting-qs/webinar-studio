@@ -3210,3 +3210,127 @@ export async function sendTestReport(webinarId?: string): Promise<TestReportResu
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to send test report"));
   return res.json();
 }
+
+/* ── Contacts directory ───────────────────────────────────────────────────── */
+
+export interface ApiContactSummary {
+  id: string;
+  email: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  company_website: string | null;
+  bucket_name: string | null;
+  lead_list_name: string | null;
+  country: string | null;
+  employee_range: string | null;
+  outreach_status: "available" | "assigned" | "used";
+  is_blocklisted: boolean;
+  times_invited: number;
+  last_invited_at: string | null;
+  created_at: string | null;
+}
+
+export interface ContactsDirectoryResponse {
+  mode: "browse" | "search";
+  contacts: ApiContactSummary[];
+  total: number;
+  // estimated: planner row estimate (browse); exact: true match count (search);
+  // capped: more matches than the server's cap — total is the cap.
+  total_kind: "estimated" | "exact" | "capped";
+  next_cursor: string | null;
+}
+
+export async function fetchContactsDirectory(opts: {
+  search?: string;
+  limit?: number;
+  offset?: number;
+  cursor?: string | null;
+}): Promise<ContactsDirectoryResponse> {
+  const params = new URLSearchParams();
+  if (opts.search) params.set("search", opts.search);
+  if (opts.limit != null) params.set("limit", String(opts.limit));
+  if (opts.offset != null) params.set("offset", String(opts.offset));
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  const res = await fetch(`${API_URL}/outreach/contacts?${params.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch contacts"));
+  return res.json();
+}
+
+export interface ApiContactWebinarHistoryRow {
+  webinar_id: string;
+  webinar_number: number | null;
+  variant_label: string | null;
+  webinar_date: string | null;
+  list_label: string | null;
+  is_nonjoiners: boolean;
+  // null = no membership row (e.g. released after invite, or No List Data)
+  membership_status: "assigned" | "used" | null;
+  assigned_date: string | null;
+  used_at: string | null;
+  calendar_response: string | null;
+  calendar_invited_date: string | null;
+  calendar_account: string | null;
+}
+
+export interface ApiContactBooking {
+  appointment_id: string;
+  booked_at: string | null;
+  call_at: string | null;
+  call_status: string | null;
+  lead_quality: string | null;
+  won: boolean | null;
+  disqualified: boolean | null;
+  attribution_source: string | null;
+  webinar_number: number | null;
+  variant_label: string | null;
+}
+
+export interface ApiContactDetail {
+  contact: {
+    id: string;
+    email: string | null;
+    first_name: string | null;
+    last_name: string | null;
+    title: string | null;
+    seniority: string | null;
+    company_website: string | null;
+    industry: string | null;
+    sector: string | null;
+    country: string | null;
+    list_location: string | null;
+    company_country: string | null;
+    employee_range: string | null;
+    employee_count: number | null;
+    company_founded_year: string | null;
+    company_annual_revenue: string | null;
+    company_total_funding: string | null;
+    bucket_name: string | null;
+    lead_list_name: string | null;
+    segment_name: string | null;
+    classification: string | null;
+    enrichment_classification: string | null;
+    primary_identity: string | null;
+    sub_identity: string | null;
+    database_provider: string | null;
+    scraper: string | null;
+    outreach_status: "available" | "assigned" | "used";
+    is_blocklisted: boolean;
+    times_invited: number;
+    last_invited_at: string | null;
+    created_at: string | null;
+    custom_data: Record<string, unknown>;
+    upload: { file_name: string; uploaded_at: string | null } | null;
+  };
+  webinar_history: ApiContactWebinarHistoryRow[];
+  bookings: ApiContactBooking[];
+}
+
+export async function fetchContactDetail(contactId: string): Promise<ApiContactDetail> {
+  const res = await fetch(`${API_URL}/outreach/contacts/${contactId}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch contact"));
+  return res.json();
+}
