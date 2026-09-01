@@ -441,6 +441,20 @@ export async function downloadWebinarListExport(
 
 /* ── Webinar contact release ──────────────────────────────────────────── */
 
+export interface ReleaseJob {
+  id: string;
+  status: "running" | "done" | "failed";
+  total: number;
+  done: number;
+  release_batch_id: string;
+  released: number;
+  not_found: string[];
+  already_available: string[];
+  by_status: { assigned: number; used: number };
+  bucket_updates: Record<string, number>;
+  error: string | null;
+}
+
 export interface ReleaseContactsResponse {
   release_batch_id: string;
   released: number;
@@ -449,6 +463,21 @@ export interface ReleaseContactsResponse {
   out_of_scope?: string[];
   by_status: { assigned: number; used: number };
   bucket_updates: Record<string, number>;
+  /** Present (non-null) when the upload was too large to release inside the
+   * request. The release runs server-side; poll getReleaseJob until `status`
+   * leaves "running" and read the totals off the job, not off this response. */
+  job?: ReleaseJob | null;
+}
+
+export async function getReleaseJob(jobId: string): Promise<ReleaseJob> {
+  const res = await fetch(`${API_URL}/outreach/release-jobs/${jobId}`, {
+    headers: jsonHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to read release job");
+  }
+  return res.json();
 }
 
 export async function releaseWebinarContacts(

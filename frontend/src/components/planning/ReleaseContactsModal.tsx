@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  getReleaseJob,
   releaseWebinarContacts,
   type ReleaseContactsResponse,
 } from "@/lib/api";
@@ -19,8 +20,6 @@ interface ParsedCsv {
 interface ReleaseProgress {
   processed: number;
   total: number;
-  chunkIndex: number;
-  chunkCount: number;
 }
 
 interface Props {
@@ -32,10 +31,11 @@ interface Props {
   onReleased: (result: ReleaseContactsResponse) => void;
 }
 
-// Send emails to the backend in 1k-row chunks. The server can handle larger
-// payloads, but smaller chunks give a smoother progress bar (~30 ticks for a
-// 30k-row CSV) and bound any individual request's blast radius.
-const RELEASE_CHUNK_SIZE = 1000;
+// The whole email list goes up in ONE request and the server answers with a job
+// that keeps running after the response, so the upload no longer depends on the
+// request staying alive — a release that outran the request used to roll back
+// everything it had done. We poll the job for the progress bar.
+const RELEASE_POLL_MS = 1500;
 
 /** Minimal RFC4180-ish CSV parser. Handles quoted fields with embedded quotes
  * ("") and commas. The release CSV is expected to be small (an emails list)
@@ -90,6 +90,10 @@ export function ReleaseContactsModal({ webinarId, webinarNumber, onClose, onRele
   const [result, setResult] = useState<ReleaseContactsResponse | null>(null);
   const [progress, setProgress] = useState<ReleaseProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Stops the poll loop once the modal is gone. The job itself keeps running
+  // server-side — closing the modal abandons the progress bar, not the release.
+  const closedRef = useRef(false);
+  useEffect(() => () => { closedRef.current = true; }, []);
 
   // Lock body scroll while open + close on Escape.
   useEffect(() => {
@@ -157,63 +161,68 @@ export function ReleaseContactsModal({ webinarId, webinarNumber, onClose, onRele
     }
     setStep("submitting");
     setError(null);
+    setProgress({ processed: 0, total: extractedEmails.length });
 
-    const chunks: string[][] = [];
-    for (let i = 0; i < extractedEmails.length; i += RELEASE_CHUNK_SIZE) {
-      chunks.push(extractedEmails.slice(i, i + RELEASE_CHUNK_SIZE));
-    }
-
-    setProgress({ processed: 0, total: extractedEmails.length, chunkIndex: 0, chunkCount: chunks.length });
-
-    // Aggregate the per-chunk reports into a single response shape the UI
-    // can render. We also reuse the batch_id from the first chunk so all
-    // released contacts land in one audit-log batch.
-    const aggregate: ReleaseContactsResponse = {
-      release_batch_id: "",
-      released: 0,
-      not_found: [],
-      already_available: [],
-      by_status: { assigned: 0, used: 0 },
-      bucket_updates: {},
-    };
+    // What actually landed, so an error part-way can still say so. Released
+    // contacts are committed chunk by chunk server-side and are never rolled
+    // back by a later failure.
+    let landed = 0;
 
     try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const res = await releaseWebinarContacts(
-          webinarId,
-          chunk,
-          aggregate.release_batch_id || undefined,
-        );
-        if (!aggregate.release_batch_id) aggregate.release_batch_id = res.release_batch_id;
-        aggregate.released += res.released;
-        aggregate.not_found.push(...res.not_found);
-        aggregate.already_available.push(...res.already_available);
-        aggregate.by_status.assigned += res.by_status.assigned;
-        aggregate.by_status.used += res.by_status.used;
-        // Last write wins — bucket_updates is the *current* available count
-        // per bucket, so the latest chunk's value is the most accurate.
-        Object.assign(aggregate.bucket_updates, res.bucket_updates);
+      const res = await releaseWebinarContacts(webinarId, extractedEmails);
 
-        setProgress({
-          processed: Math.min((i + 1) * RELEASE_CHUNK_SIZE, extractedEmails.length),
-          total: extractedEmails.length,
-          chunkIndex: i + 1,
-          chunkCount: chunks.length,
-        });
+      // Defensive: the server always returns a job today, but an older build
+      // (or a future inline fast path) answers with the finished result.
+      if (!res.job) {
+        landed = res.released;
+        setProgress({ processed: extractedEmails.length, total: extractedEmails.length });
+        setResult(res);
+        setStep("done");
+        onReleased(res);
+        return;
       }
+
+      // Large upload — the server keeps working after the response. Poll until
+      // the job settles, then render the job's totals as the result.
+      let job = res.job;
+      while (job.status === "running") {
+        await new Promise((r) => setTimeout(r, RELEASE_POLL_MS));
+        if (closedRef.current) return;
+        job = await getReleaseJob(job.id);
+        landed = job.released;
+        setProgress({ processed: job.done, total: job.total });
+      }
+
+      const aggregate: ReleaseContactsResponse = {
+        release_batch_id: job.release_batch_id,
+        released: job.released,
+        not_found: job.not_found,
+        already_available: job.already_available,
+        by_status: job.by_status,
+        bucket_updates: job.bucket_updates,
+      };
+
+      if (job.status === "failed") {
+        setError(
+          `${job.error ?? "Release failed."} (released ${job.released.toLocaleString()} of ${job.total.toLocaleString()} — those are already saved. Re-upload the same CSV to finish the rest; already-released emails are skipped.)`,
+        );
+        setStep("error");
+        if (job.released > 0) onReleased(aggregate);
+        return;
+      }
+
       setResult(aggregate);
       setStep("done");
       onReleased(aggregate);
     } catch (e) {
+      // A poll that fails doesn't stop the release — the job keeps going on the
+      // server — so report what we last saw rather than claiming it stopped.
       setError(
         e instanceof Error
-          ? `${e.message} (released ${aggregate.released.toLocaleString()} contacts before the error — they're already saved)`
+          ? `${e.message}${landed > 0 ? ` (${landed.toLocaleString()} contacts released so far are already saved; reopen the webinar to see the final counts)` : ""}`
           : "Release failed.",
       );
       setStep("error");
-      // Still notify the parent so the planning page reflects what *did* land.
-      if (aggregate.released > 0) onReleased(aggregate);
     }
   }
 
@@ -368,9 +377,11 @@ export function ReleaseContactsModal({ webinarId, webinarNumber, onClose, onRele
                   Releasing contacts…
                 </div>
                 <div className="text-xs text-zinc-500 mt-0.5">
-                  Batch {progress.chunkIndex.toLocaleString()} of {progress.chunkCount.toLocaleString()}
-                  {" — "}
                   {progress.processed.toLocaleString()} / {progress.total.toLocaleString()} emails
+                </div>
+                <div className="text-[11px] text-zinc-400 mt-1">
+                  Large uploads keep running on the server — released contacts are
+                  saved as they go.
                 </div>
               </div>
               <div className="h-2 w-full bg-zinc-200 dark:bg-zinc-800 rounded-full overflow-hidden">

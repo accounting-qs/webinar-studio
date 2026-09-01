@@ -287,6 +287,62 @@ async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> 
         ), {"ids": chunk})
 
 
+async def reconcile_bucket_remaining(
+    db: AsyncSession, bucket_ids, *, user_id: str = LLOYD_USER_ID
+) -> dict[str, int]:
+    """Restore each bucket's `remaining_contacts` to the live fresh baseline
+    (never invited, not in-flight) and return {bucket_id: count}.
+
+    ONE grouped query for every bucket instead of a count per bucket, scoped by
+    user_id and split on is_blocklisted so each half is served by a partial
+    index (ix_contacts_good_avail / ix_contacts_bl_bucket). The unscoped
+    per-bucket form this replaces matched no index — it heap-fetched every
+    contact in the bucket, and a *single* bucket blew the 120s statement cap on
+    its own, rolling back the whole release.
+
+    The stored counter is the RAW baseline (blocklisted contacts included);
+    `bucket_dict` subtracts the blocklisted share at serialization time, so the
+    two halves are summed here rather than filtered.
+
+    Call AFTER flushing pending cache updates so the counts see them. Does NOT
+    commit.
+    """
+    ids = [b for b in dict.fromkeys(bucket_ids) if b]
+    if not ids:
+        return {}
+
+    fresh = (
+        Contact.last_invited_at.is_(None),
+        Contact.assigned_membership_count == 0,
+    )
+    # Buckets with zero fresh contacts left drop out of the GROUP BY entirely,
+    # so seed 0 — otherwise a fully-drained bucket would keep a stale counter.
+    counts: dict[str, int] = dict.fromkeys(ids, 0)
+    for blocklisted in (False, True):
+        result = await db.execute(
+            select(Contact.bucket_id, sa_func.count())
+            .where(
+                Contact.user_id == user_id,
+                Contact.bucket_id.in_(ids),
+                Contact.is_blocklisted.is_(blocklisted),
+                *fresh,
+            )
+            .group_by(Contact.bucket_id)
+        )
+        for bucket_id, n in result.all():
+            counts[bucket_id] += n or 0
+
+    await db.execute(
+        sa_text(
+            "UPDATE outreach_buckets b SET remaining_contacts = v.n "
+            "FROM unnest(CAST(:ids AS uuid[]), CAST(:ns AS integer[])) AS v(bid, n) "
+            "WHERE b.id = v.bid"
+        ),
+        {"ids": list(counts.keys()), "ns": list(counts.values())},
+    )
+    return counts
+
+
 # ── Blocklist helpers ─────────────────────────────────────────────────────
 #
 # Blocklist membership is denormalized onto Contact.is_blocklisted and kept in

@@ -8,9 +8,19 @@ comparison on the statistics page.
 
 Each released contact is recorded in `contact_release_log` for a future undo /
 auth-aware audit trail.
+
+A CSV release runs as a background job (`_run_release_job`) that commits one
+chunk at a time, because a release does far more work than its row count
+suggests: every released contact rewrites 12 contact indexes, and the touched
+buckets' fresh baselines get re-derived from scratch. Doing that inside the
+request meant one slow release hit the 120s statement cap and rolled the WHOLE
+upload back — the operator saw a stuck progress bar and "released 0". See
+`_RELEASE_JOBS` below.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -21,14 +31,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, recompute_contact_caches, reconcile_legacy_slots,
+    LLOYD_USER_ID, recompute_contact_caches, reconcile_bucket_remaining,
+    reconcile_legacy_slots,
 )
+from api.routers.outreach.webinars import _is_retryable_db_error
 from db.models import (
-    Contact, ContactReleaseLog, OutreachBucket, Webinar,
+    Contact, ContactReleaseLog, Webinar,
     WebinarContactMembership, WebinarListAssignment,
 )
-from db.session import get_db
+from db.session import AsyncSessionLocal, get_db
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -71,35 +84,51 @@ def _chunked(seq: list, size: int):
         yield seq[i : i + size]
 
 
-@router.post("/webinars/{webinar_id}/releases", status_code=201)
-async def release_contacts(
+# A CSV release ALWAYS runs as a background job — there is no "small enough to
+# do inline" size. The dominant cost is re-deriving each touched bucket's fresh
+# baseline, which scales with BUCKET size, not with how many emails were
+# uploaded: releasing 200 emails across webinar 154's 18 buckets measured 64s,
+# essentially all of it the recount. Inline, that put every release one cold
+# cache away from the 120s statement cap, and because the request is a single
+# transaction, blowing it rolled back the entire upload — the operator saw a
+# frozen progress bar and "released 0".
+#
+# Emails per committed transaction inside the job. Each chunk is independently
+# committed, so a failure only costs the chunk in flight. Sized generously
+# because the per-chunk cost is dominated by fixed work (the bucket recount),
+# not by the emails themselves — the individual statements stay well under the
+# 120s cap either way.
+_RELEASE_JOB_CHUNK = 2000
+
+# job_id → progress dict. In-memory on purpose: progress is ephemeral, the
+# membership deletes + contact_release_log rows are the durable state. Pruned
+# lazily on job creation. Mirrors _MARK_JOBS in webinars.py.
+_RELEASE_JOBS: dict[str, dict] = {}
+_active_release_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _release_emails_chunk(
+    db: AsyncSession,
     webinar_id: str,
-    body: ReleaseRequest,
-    db: AsyncSession = Depends(get_db),
-    _: str = Depends(require_auth),
-):
-    """Release contacts in this webinar back to `available`.
+    emails: list[str],
+    release_batch_id: str,
+    now: datetime,
+    *,
+    reconcile_buckets: bool = True,
+) -> dict:
+    """Release one chunk of (already normalized, deduped) emails from this
+    webinar. Flushes but does NOT commit — the caller owns the transaction.
 
-    For each email in `body.emails` that maps to a contact assigned to one of
-    this webinar's WebinarListAssignments and currently in status `assigned`
-    or `used`: revert the contact (clear assignment_id, used_at, assigned_date;
-    set status to `available`) and snapshot the prior state into
-    `contact_release_log` under one shared `release_batch_id`.
+    Idempotent: an email with no membership in this webinar (already released,
+    or never scheduled here) is reported, not re-released, so re-running the
+    same CSV after a partial failure finishes the job instead of double-counting.
 
-    Bucket `remaining_contacts` is restored from the live `available` count for
-    each touched bucket. Assignment `volume` is intentionally untouched so the
-    planned-send number is preserved for statistics comparison.
+    `reconcile_buckets=False` skips the bucket recount and just reports the
+    touched buckets in `touched_bucket_ids`. The recount is a full re-derivation
+    of each bucket's fresh baseline, so its cost depends on bucket size, not on
+    this chunk — a multi-chunk job runs it once at the end over the union
+    instead of paying it per chunk.
     """
-    w_result = await db.execute(
-        select(Webinar).where(
-            Webinar.id == webinar_id,
-            Webinar.user_id == LLOYD_USER_ID,
-        )
-    )
-    webinar = w_result.scalar_one_or_none()
-    if not webinar:
-        raise HTTPException(404, "Webinar not found")
-
     a_result = await db.execute(
         select(WebinarListAssignment).where(
             WebinarListAssignment.webinar_id == webinar_id,
@@ -114,24 +143,12 @@ async def release_contacts(
     # still be releasable. assignments_by_id is only needed for the `remaining`
     # counter decrement below, which no-ops for NULL/missing assignments.
 
-    # Normalize + dedupe input emails, drop empties
-    seen: set[str] = set()
-    normalized: list[str] = []
-    for raw in body.emails:
-        e = _normalize_email(raw)
-        if e and e not in seen:
-            seen.add(e)
-            normalized.append(e)
-
-    if not normalized:
-        raise HTTPException(400, "No valid emails provided")
-
     # Match against THIS webinar's membership rows (not the single legacy slot),
     # so a reused contact can be released from this webinar even though its legacy
     # slot points at an earlier one. UNIQUE(webinar_id, contact_id) ⇒ at most one
     # membership per email here. Keyed by lowercased email.
     by_email: dict[str, dict] = {}
-    for chunk in _chunked(normalized, _DB_CHUNK_SIZE):
+    for chunk in _chunked(emails, _DB_CHUNK_SIZE):
         c_result = await db.execute(
             select(
                 WebinarContactMembership.contact_id,
@@ -159,9 +176,6 @@ async def release_contacts(
                 "legacy_assignment_id": row.legacy_assignment_id,
             }
 
-    release_batch_id = body.release_batch_id or str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-
     not_found: list[str] = []
     already_available: list[str] = []
     by_status_count = {"assigned": 0, "used": 0}
@@ -173,7 +187,7 @@ async def release_contacts(
     # Classify unmatched emails: a contact that EXISTS but has no membership in
     # this webinar was already released (or never scheduled here) → mirror the
     # legacy "already_available" bucket so the modal's tiles stay meaningful.
-    unmatched = [e for e in normalized if e not in by_email]
+    unmatched = [e for e in emails if e not in by_email]
     known_emails: set[str] = set()
     for chunk in _chunked(unmatched, _DB_CHUNK_SIZE):
         k_result = await db.execute(
@@ -185,7 +199,7 @@ async def release_contacts(
         )
         known_emails.update(k_result.scalars().all())
 
-    for email in normalized:
+    for email in emails:
         target = by_email.get(email)
         if target is None:
             # No membership in this webinar — already released, or unknown email.
@@ -259,39 +273,193 @@ async def release_contacts(
     # Reconcile bucket.remaining_contacts from the live fresh baseline (never
     # invited, not in-flight) — keeps the field self-healing if it ever drifts.
     bucket_updates: dict[str, int] = {}
-    if touched_bucket_ids:
+    if touched_bucket_ids and reconcile_buckets:
         await db.flush()  # so the cache updates are visible to the count query
-        for bucket_id in touched_bucket_ids:
-            cnt_result = await db.execute(
-                select(sa_func.count()).where(
-                    Contact.bucket_id == bucket_id,
-                    Contact.last_invited_at.is_(None),
-                    Contact.assigned_membership_count == 0,
-                )
-            )
-            available_count = int(cnt_result.scalar() or 0)
-            await db.execute(
-                update(OutreachBucket)
-                .where(OutreachBucket.id == bucket_id)
-                .values(remaining_contacts=available_count)
-            )
-            bucket_updates[bucket_id] = available_count
+        bucket_updates = await reconcile_bucket_remaining(db, touched_bucket_ids)
 
     await db.flush()
-    released_count = len(contact_ids_to_release)
 
-    # Always return the batch_id (even on a 0-released chunk) so the client
-    # can pass it through to subsequent chunks of the same upload.
     # Remaining counts changed — drop the eligible-counts micro-cache.
     from api.routers.outreach.buckets import invalidate_eligible_cache
     invalidate_eligible_cache()
     return {
-        "release_batch_id": release_batch_id,
-        "released": released_count,
+        "released": len(contact_ids_to_release),
         "not_found": not_found,
         "already_available": already_available,
         "by_status": by_status_count,
         "bucket_updates": bucket_updates,
+        "touched_bucket_ids": sorted(touched_bucket_ids),
+    }
+
+
+def _release_job_public(job: dict) -> dict:
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+async def _run_release_job(
+    job_id: str, webinar_id: str, emails: list[str], release_batch_id: str
+) -> None:
+    """Background worker: one committed transaction per chunk, so progress
+    survives any single failure and a dead task never holds locks.
+
+    Every chunk is idempotent (see `_release_emails_chunk`), so a task killed
+    mid-upload — a deploy, a timeout that outlives the retries — just leaves the
+    tail unreleased; re-running the same CSV finishes it.
+    """
+    job = _RELEASE_JOBS[job_id]
+    touched: set[str] = set()
+    try:
+        for i in range(0, len(emails), _RELEASE_JOB_CHUNK):
+            chunk = emails[i : i + _RELEASE_JOB_CHUNK]
+            for attempt in range(3):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        res = await _release_emails_chunk(
+                            db, webinar_id, chunk, release_batch_id,
+                            datetime.now(timezone.utc),
+                            reconcile_buckets=False,
+                        )
+                        await db.commit()
+                    job["released"] += res["released"]
+                    job["not_found"].extend(res["not_found"])
+                    job["already_available"].extend(res["already_available"])
+                    job["by_status"]["assigned"] += res["by_status"]["assigned"]
+                    job["by_status"]["used"] += res["by_status"]["used"]
+                    touched.update(res["touched_bucket_ids"])
+                    break
+                except Exception as exc:
+                    if attempt < 2 and _is_retryable_db_error(exc):
+                        await asyncio.sleep(1 + 2 * attempt)
+                        continue
+                    raise
+            job["done"] = min(i + len(chunk), job["total"])
+        job["status"] = "done"
+    except Exception as exc:
+        logger.exception(
+            "Release job %s failed at %s/%s", job_id, job["done"], job["total"]
+        )
+        job["status"] = "failed"
+        job["error"] = str(exc)[:300]
+    finally:
+        # Recount every touched bucket ONCE, after the last chunk — including
+        # when the job failed part-way, so a partial release still leaves the
+        # counters true rather than stale. Its own transaction: the releases are
+        # already committed and must not be undone by a reconcile failure.
+        for attempt in range(3):
+            if not touched:
+                break
+            try:
+                async with AsyncSessionLocal() as db:
+                    job["bucket_updates"] = await reconcile_bucket_remaining(db, touched)
+                    await db.commit()
+                from api.routers.outreach.buckets import invalidate_eligible_cache
+                invalidate_eligible_cache()
+                break
+            except Exception as exc:
+                if attempt < 2 and _is_retryable_db_error(exc):
+                    await asyncio.sleep(1 + 2 * attempt)
+                    continue
+                logger.exception(
+                    "Release job %s: bucket reconcile failed for %d bucket(s); "
+                    "remaining_contacts may read low until the next release",
+                    job_id, len(touched),
+                )
+                break
+        job["_ts"] = datetime.now(timezone.utc).timestamp()
+        _active_release_tasks.pop(job_id, None)
+
+
+def _spawn_release_job(
+    webinar_id: str, emails: list[str], release_batch_id: str
+) -> dict:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for jid in [
+        jid for jid, j in _RELEASE_JOBS.items()
+        if j["status"] != "running" and j["_ts"] < now_ts - 3600
+    ]:
+        _RELEASE_JOBS.pop(jid, None)
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id, "status": "running", "total": len(emails), "done": 0,
+        "release_batch_id": release_batch_id, "released": 0,
+        "not_found": [], "already_available": [],
+        "by_status": {"assigned": 0, "used": 0}, "bucket_updates": {},
+        "error": None, "_ts": now_ts,
+    }
+    _RELEASE_JOBS[job_id] = job
+    _active_release_tasks[job_id] = asyncio.create_task(
+        _run_release_job(job_id, webinar_id, emails, release_batch_id)
+    )
+    return job
+
+
+@router.get("/release-jobs/{job_id}")
+async def get_release_job(job_id: str, _: str = Depends(require_auth)):
+    job = _RELEASE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Release job not found")
+    return _release_job_public(job)
+
+
+@router.post("/webinars/{webinar_id}/releases", status_code=201)
+async def release_contacts(
+    webinar_id: str,
+    body: ReleaseRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Release contacts in this webinar back to `available`.
+
+    For each email in `body.emails` that maps to a contact assigned to one of
+    this webinar's WebinarListAssignments and currently in status `assigned`
+    or `used`: revert the contact (clear assignment_id, used_at, assigned_date;
+    set status to `available`) and snapshot the prior state into
+    `contact_release_log` under one shared `release_batch_id`.
+
+    Bucket `remaining_contacts` is restored from the live `available` count for
+    each touched bucket. Assignment `volume` is intentionally untouched so the
+    planned-send number is preserved for statistics comparison.
+
+    Always returns immediately with a `job` the client polls at
+    `GET /outreach/release-jobs/{job_id}`; `released` is 0 on this response and
+    accumulates on the job.
+    """
+    w_result = await db.execute(
+        select(Webinar).where(
+            Webinar.id == webinar_id,
+            Webinar.user_id == LLOYD_USER_ID,
+        )
+    )
+    webinar = w_result.scalar_one_or_none()
+    if not webinar:
+        raise HTTPException(404, "Webinar not found")
+
+    # Normalize + dedupe input emails, drop empties
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for raw in body.emails:
+        e = _normalize_email(raw)
+        if e and e not in seen:
+            seen.add(e)
+            normalized.append(e)
+
+    if not normalized:
+        raise HTTPException(400, "No valid emails provided")
+
+    release_batch_id = body.release_batch_id or str(uuid.uuid4())
+
+    # Hand the whole list to the background job and answer now. `released` is 0
+    # here by construction and accumulates on the job; the client polls
+    # GET /outreach/release-jobs/{job_id} for progress and the final totals.
+    job = _spawn_release_job(webinar_id, normalized, release_batch_id)
+    return {
+        "release_batch_id": release_batch_id,
+        "released": 0,
+        "not_found": [],
+        "already_available": [],
+        "by_status": {"assigned": 0, "used": 0},
+        "bucket_updates": {},
+        "job": _release_job_public(job),
     }
 
 
@@ -510,21 +678,7 @@ async def release_contacts_by_id(
     bucket_updates: dict[str, int] = {}
     if touched_bucket_ids:
         await db.flush()
-        for bucket_id in touched_bucket_ids:
-            cnt_result = await db.execute(
-                select(sa_func.count()).where(
-                    Contact.bucket_id == bucket_id,
-                    Contact.last_invited_at.is_(None),
-                    Contact.assigned_membership_count == 0,
-                )
-            )
-            available_count = int(cnt_result.scalar() or 0)
-            await db.execute(
-                update(OutreachBucket)
-                .where(OutreachBucket.id == bucket_id)
-                .values(remaining_contacts=available_count)
-            )
-            bucket_updates[bucket_id] = available_count
+        bucket_updates = await reconcile_bucket_remaining(db, touched_bucket_ids)
 
     await db.flush()
 
