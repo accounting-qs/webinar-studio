@@ -9,14 +9,17 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID
 from api.schemas import CustomFieldCreate
 from db.models import (
+    CalendarAccountSender,
     Contact,
     ContactCustomField,
     OutreachBucket,
+    OutreachSender,
     UploadHistory,
     Webinar,
     WebinarBookingAttribution,
     WebinarCalendarInvite,
     WebinarContactMembership,
+    WebinarGeekSubscriber,
     WebinarListAssignment,
     WebinarNonjoinerInvite,
 )
@@ -221,13 +224,14 @@ async def get_contact_detail(
 
     m = WebinarContactMembership
     mem_rows = (await db.execute(
-        select(m, Webinar, WebinarListAssignment, OutreachBucket)
+        select(m, Webinar, WebinarListAssignment, OutreachBucket, OutreachSender)
         .join(Webinar, Webinar.id == m.webinar_id)
         .outerjoin(WebinarListAssignment, WebinarListAssignment.id == m.assignment_id)
         .outerjoin(OutreachBucket, OutreachBucket.id == m.bucket_id)
+        .outerjoin(OutreachSender, OutreachSender.id == WebinarListAssignment.sender_id)
         .where(m.contact_id == contact_id, m.user_id == LLOYD_USER_ID)
     )).all()
-    member_webinar_ids = [mem.webinar_id for (mem, _w, _a, _b) in mem_rows]
+    member_webinar_ids = [mem.webinar_id for (mem, _w, _a, _b, _s) in mem_rows]
 
     # Calendar responses: rows matched to this contact at import time, plus (for
     # the webinars they belong to) rows that share the raw email but were never
@@ -265,17 +269,89 @@ async def get_contact_detail(
         .where(WebinarBookingAttribution.contact_id == contact_id)
     )).all()
 
+    # WebinarGeek attendance: subscriber rows by email (ix_wg_subs_email), tied
+    # to webinars through webinars.broadcast_id. Exact-match on both the raw and
+    # lowercased email so the index stays usable either way.
+    subs_by_broadcast: dict[str, WebinarGeekSubscriber] = {}
+    email_variants = {e for e in {contact.email, (contact.email or "").lower()} if e}
+    if email_variants:
+        for s in (await db.execute(
+            select(WebinarGeekSubscriber).where(WebinarGeekSubscriber.email.in_(email_variants))
+        )).scalars():
+            subs_by_broadcast[s.broadcast_id] = s
+
     # History rows keyed by webinar: memberships first, then invite-only rows
-    # (e.g. the contact was since released — membership deleted, invite kept).
-    webinars_by_id: dict[str, Webinar] = {w.id: w for (_m, w, _a, _b) in mem_rows}
+    # (e.g. the contact was since released — membership deleted, invite kept),
+    # then registration-only rows (a WG subscription with no invite footprint).
+    webinars_by_id: dict[str, Webinar] = {w.id: w for (_m, w, _a, _b, _s) in mem_rows}
     extra_ids = set(invites) - set(webinars_by_id)
     if extra_ids:
         for w in (await db.execute(select(Webinar).where(Webinar.id.in_(extra_ids)))).scalars():
             webinars_by_id[w.id] = w
+    if subs_by_broadcast:
+        known_bids = {w.broadcast_id for w in webinars_by_id.values() if w.broadcast_id}
+        missing_bids = set(subs_by_broadcast) - known_bids
+        if missing_bids:
+            for w in (await db.execute(
+                select(Webinar).where(
+                    Webinar.user_id == LLOYD_USER_ID, Webinar.broadcast_id.in_(missing_bids)
+                )
+            )).scalars():
+                webinars_by_id.setdefault(w.id, w)
+
+    # Sender fallback for rows without an assignment sender: the per-webinar
+    # calendar-account → sender mapping maintained on Account Health.
+    cas_sender: dict[tuple[str, str], str] = {}
+    inv_wids = {inv.webinar_id for inv in invites.values() if inv.calendar_account}
+    if inv_wids:
+        for wid, acct, name in (await db.execute(
+            select(CalendarAccountSender.webinar_id, CalendarAccountSender.calendar_account, OutreachSender.name)
+            .join(OutreachSender, OutreachSender.id == CalendarAccountSender.sender_id)
+            .where(CalendarAccountSender.webinar_id.in_(inv_wids))
+        )).all():
+            cas_sender[(wid, acct)] = name
+
+    # One booking summary per attributed webinar for the history table; the
+    # full per-appointment list still ships in `bookings` below.
+    booking_by_webinar: dict[str, dict] = {}
+    for (b, _w) in booking_rows:
+        if not b.webinar_id:
+            continue
+        cur = booking_by_webinar.get(b.webinar_id)
+        if cur is None or (b.booked_at and (cur["booked_at"] or "") < _iso(b.booked_at)):
+            booking_by_webinar[b.webinar_id] = {
+                "booked_at": _iso(b.booked_at),
+                "call_at": _iso(b.call_at),
+                "call_status": b.call_status,
+                "won": (cur or {}).get("won") or b.won,
+                "disqualified": (cur or {}).get("disqualified") or b.disqualified,
+            }
+        else:
+            cur["won"] = cur["won"] or b.won
+            cur["disqualified"] = cur["disqualified"] or b.disqualified
+
+    def _attendance_for(w: Webinar) -> dict | None:
+        s = subs_by_broadcast.get(w.broadcast_id) if w.broadcast_id else None
+        if s is None:
+            return None
+        return {
+            "subscribed_at": _iso(s.subscribed_at),
+            "watched_live": s.watched_live,
+            "watched_replay": s.watched_replay,
+            "minutes_viewing": s.minutes_viewing,
+            "unsubscribed_at": _iso(s.unsubscribed_at),
+        }
+
+    def _sender_for(w: Webinar, asgn_sender_name, inv) -> str | None:
+        if asgn_sender_name:
+            return asgn_sender_name
+        if inv is not None and inv.calendar_account:
+            return cas_sender.get((w.id, inv.calendar_account))
+        return None
 
     history = []
     seen_webinars = set()
-    for (mem, w, asgn, bucket) in mem_rows:
+    for (mem, w, asgn, bucket, sender) in mem_rows:
         seen_webinars.add(w.id)
         if asgn is not None and asgn.list_name:
             list_label = asgn.list_name
@@ -301,6 +377,9 @@ async def get_contact_detail(
                 or (nj.calendar_invite_response if nj else None),
             "calendar_invited_date": _iso(inv.calendar_invited_date) if inv else None,
             "calendar_account": inv.calendar_account if inv else None,
+            "sender_name": _sender_for(w, sender.name if sender else None, inv),
+            "attendance": _attendance_for(w),
+            "booking": booking_by_webinar.get(w.id),
         })
     for wid, inv in invites.items():
         if wid in seen_webinars:
@@ -308,6 +387,7 @@ async def get_contact_detail(
         w = webinars_by_id.get(wid)
         if w is None:
             continue
+        seen_webinars.add(wid)
         history.append({
             "webinar_id": w.id,
             "webinar_number": w.number,
@@ -321,6 +401,32 @@ async def get_contact_detail(
             "calendar_response": inv.calendar_invite_response,
             "calendar_invited_date": _iso(inv.calendar_invited_date),
             "calendar_account": inv.calendar_account,
+            "sender_name": _sender_for(w, None, inv),
+            "attendance": _attendance_for(w),
+            "booking": booking_by_webinar.get(w.id),
+        })
+    # Registration-only rows: a WebinarGeek subscription for a webinar with no
+    # membership or calendar invite (e.g. self-registered via the funnel).
+    for w in webinars_by_id.values():
+        if w.id in seen_webinars or not w.broadcast_id or w.broadcast_id not in subs_by_broadcast:
+            continue
+        seen_webinars.add(w.id)
+        history.append({
+            "webinar_id": w.id,
+            "webinar_number": w.number,
+            "variant_label": w.variant_label,
+            "webinar_date": _iso(w.date),
+            "list_label": None,
+            "is_nonjoiners": False,
+            "membership_status": None,
+            "assigned_date": None,
+            "used_at": None,
+            "calendar_response": None,
+            "calendar_invited_date": None,
+            "calendar_account": None,
+            "sender_name": None,
+            "attendance": _attendance_for(w),
+            "booking": booking_by_webinar.get(w.id),
         })
     history.sort(
         key=lambda h: (h["webinar_date"] or "", h["webinar_number"] or 0),

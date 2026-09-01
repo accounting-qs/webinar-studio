@@ -114,7 +114,9 @@ export function ContactsDirectoryPage() {
   }
 
   return (
-    <main className="flex-1 bg-zinc-50 dark:bg-zinc-950 min-h-0">
+    // While the drawer is open, pad the content out of the covered half so
+    // every row stays fully visible and clickable for one-by-one browsing.
+    <main className={`flex-1 bg-zinc-50 dark:bg-zinc-950 min-h-0 transition-[padding] duration-200 ${selectedId ? "pr-[max(50vw,600px)]" : ""}`}>
       <div className="px-6 py-5 max-w-[1400px] mx-auto">
 
         {/* ── Header ────────────────────────────────────────────────── */}
@@ -198,7 +200,11 @@ export function ContactsDirectoryPage() {
                       <tr
                         key={c.id}
                         onClick={() => setSelectedId(c.id)}
-                        className="border-b border-zinc-100 dark:border-zinc-800/30 transition-colors cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/20"
+                        className={`border-b border-zinc-100 dark:border-zinc-800/30 transition-colors cursor-pointer ${
+                          selectedId === c.id
+                            ? "bg-violet-50/60 dark:bg-violet-500/10"
+                            : "hover:bg-zinc-50 dark:hover:bg-zinc-800/20"
+                        }`}
                       >
                         <td className="px-3 py-2.5 font-mono text-xs text-zinc-800 dark:text-zinc-200 max-w-[260px] truncate" title={c.email ?? undefined}>
                           {c.email || "—"}

@@ -3258,6 +3258,22 @@ export async function fetchContactsDirectory(opts: {
   return res.json();
 }
 
+export interface ApiContactWebinarAttendance {
+  subscribed_at: string | null;
+  watched_live: boolean | null;
+  watched_replay: boolean | null;
+  minutes_viewing: number | null;
+  unsubscribed_at: string | null;
+}
+
+export interface ApiContactWebinarBooking {
+  booked_at: string | null;
+  call_at: string | null;
+  call_status: string | null;
+  won: boolean | null;
+  disqualified: boolean | null;
+}
+
 export interface ApiContactWebinarHistoryRow {
   webinar_id: string;
   webinar_number: number | null;
@@ -3265,13 +3281,17 @@ export interface ApiContactWebinarHistoryRow {
   webinar_date: string | null;
   list_label: string | null;
   is_nonjoiners: boolean;
-  // null = no membership row (e.g. released after invite, or No List Data)
+  // null = no membership row (e.g. released after invite, No List Data, or a
+  // registration-only row from WebinarGeek)
   membership_status: "assigned" | "used" | null;
   assigned_date: string | null;
   used_at: string | null;
   calendar_response: string | null;
   calendar_invited_date: string | null;
   calendar_account: string | null;
+  sender_name: string | null;
+  attendance: ApiContactWebinarAttendance | null;
+  booking: ApiContactWebinarBooking | null;
 }
 
 export interface ApiContactBooking {
