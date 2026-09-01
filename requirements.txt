@@ -36,3 +36,6 @@ python-multipart==0.0.20
 
 # Mojibake repair for imported CSVs (double-encoded UTF-8 names/companies)
 ftfy==6.3.1
+
+# MX lookups for the mailbox-provider breakdown (email_domain_provider cache)
+dnspython==2.7.0

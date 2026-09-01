@@ -2245,6 +2245,56 @@ export async function fetchStatisticsOverview(
   return res.json();
 }
 
+/* ── Mailbox-provider breakdown (invite response by email provider) ─────── */
+
+/** The four widening cohorts a provider breakdown is reported at. */
+export type ProviderScopeKey =
+  | "assigned" | "noListData" | "nonjoiners" | "newJoiners" | "overall";
+
+export interface ProviderRow {
+  provider: string;
+  invited: number;
+  yes: number;
+  maybe: number;
+  /** yes / invited. null when nothing was invited on that provider. */
+  yesPct: number | null;
+  maybePct: number | null;
+  /** (yes + maybe) / invited. */
+  respondedPct: number | null;
+}
+
+export type ProviderScopes = Record<ProviderScopeKey, ProviderRow[]>;
+
+export interface ProviderWebinar {
+  webinarId: string;
+  number: number | null;
+  variantLabel: string | null;
+  date: string | null;
+  title: string | null;
+  scopes: ProviderScopes;
+}
+
+export interface ProviderBreakdownResponse {
+  webinars: ProviderWebinar[];
+  totals: ProviderScopes;
+  includedWebinarIds: string[];
+  /** How far the MX backfill has reached, so a partial cache reads as partial. */
+  resolution: { domains: number; resolved: number; last_resolved_at: string | null };
+}
+
+/** Yes/Maybe response by recipient mailbox provider, for the given webinars.
+ * Scans membership per webinar (no snapshot), so it is capped at 12 ids. */
+export async function fetchEmailProviderBreakdown(
+  webinarIds: string[],
+): Promise<ProviderBreakdownResponse> {
+  const qs = new URLSearchParams({ webinars: webinarIds.join(",") });
+  const res = await fetch(`${API_URL}/statistics/email-providers?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch email-provider breakdown");
+  return res.json();
+}
+
 /* ── Precomputed snapshot store (recompute trigger + status) ─────────────── */
 
 export interface StatisticsRecomputeStatus {

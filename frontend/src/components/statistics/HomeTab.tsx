@@ -44,6 +44,7 @@ import {
   type FunnelStage,
   type LineSeries,
 } from "./charts";
+import { EmailProviderCard } from "./EmailProviderCard";
 import { RecomputeControl } from "./RecomputeControl";
 
 /* ── metric helpers ────────────────────────────────────────────────────── */
@@ -539,6 +540,16 @@ export function HomeTab() {
           <EmployeeBars rows={employee} />
         </ChartCard>
       </div>
+
+      {/* ── invite response by mailbox provider ────────────────────
+       * Capped at the 3 most recent of the selected webinars. This one scans
+       * membership per webinar instead of reading a snapshot (~30s each), and
+       * the MX cache is backfilled newest-first, so widening the window costs
+       * minutes to add webinars whose domains are mostly unresolved anyway. */}
+      <EmailProviderCard
+        webinarIds={perWebinar.slice(-3).map((p) => p.w.webinarId)}
+        subtitle={`Where the invite actually landed, from each domain's MX record. Covering the ${Math.min(perWebinar.length, 3)} most recent of the selected webinars.`}
+      />
 
       {/* ── one webinar in focus ───────────────────────────────────── */}
       {focus && (

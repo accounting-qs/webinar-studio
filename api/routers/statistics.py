@@ -694,6 +694,76 @@ async def get_statistics_overview(source: str = "auto", webinars: str | None = N
 
 
 # ---------------------------------------------------------------------------
+# Mailbox-provider x cohort breakdown (invite response by email provider)
+# ---------------------------------------------------------------------------
+
+class ProviderRow(BaseModel):
+    """One mailbox provider's invited volume and invite response, for one
+    cohort scope. Rates are derived from these counts, never averaged."""
+    provider: str
+    invited: int
+    yes: int
+    maybe: int
+    yesPct: float | None = None
+    maybePct: float | None = None
+    respondedPct: float | None = None
+
+
+class ProviderScopes(BaseModel):
+    """The four widening cohorts. newJoiners and overall are sums of the
+    queried ones, so the scopes can never disagree."""
+    assigned: list[ProviderRow] = []
+    noListData: list[ProviderRow] = []
+    nonjoiners: list[ProviderRow] = []
+    newJoiners: list[ProviderRow] = []
+    overall: list[ProviderRow] = []
+
+
+class ProviderWebinar(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    title: str | None = None
+    scopes: ProviderScopes
+
+
+class ProviderResolutionStatus(BaseModel):
+    """How far the MX backfill has reached — a partial cache must read as
+    partial, not as a provider named "Not resolved yet"."""
+    domains: int = 0
+    resolved: int = 0
+    last_resolved_at: str | None = None
+
+
+class ProviderBreakdownResponse(BaseModel):
+    webinars: list[ProviderWebinar]
+    totals: ProviderScopes
+    includedWebinarIds: list[str] = []
+    resolution: ProviderResolutionStatus
+
+
+@router.get("/email-providers", response_model=ProviderBreakdownResponse)
+async def get_email_provider_breakdown(webinars: str):
+    """Invite response (Yes / Maybe) by recipient mailbox provider.
+
+    `webinars` is a comma-separated list of Webinar UUIDs — required, because
+    this scans membership per webinar rather than reading a snapshot. Providers
+    come from the MX cache built by scripts/resolve_email_providers.py; domains
+    it has not reached yet are reported under "Not resolved yet" so the invited
+    volumes still add up to the real audience."""
+    from services import email_provider_stats as eps
+
+    ids = [x.strip() for x in webinars.split(",") if x.strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="webinars is required")
+    if len(ids) > 12:
+        raise HTTPException(status_code=400, detail="at most 12 webinars per request")
+    data = await eps.get_provider_breakdown(ids)
+    return {**data, "resolution": await eps.resolution_status()}
+
+
+# ---------------------------------------------------------------------------
 # By-bucket funnel (Segments tab)
 # ---------------------------------------------------------------------------
 

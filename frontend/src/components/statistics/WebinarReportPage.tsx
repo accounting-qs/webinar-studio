@@ -16,6 +16,8 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { EmailProviderCard } from "./EmailProviderCard";
+import { VizStyles } from "./charts";
 import {
   ApiStatisticsWebinarSummary,
   ApiWebinarReport,
@@ -523,6 +525,7 @@ function TocChips() {
   const chips = [
     ["scorecard", "Scorecard"],
     ["funnels", "Funnels"],
+    ["providers", "Providers"],
     ["bookings", "Bookings"],
     ["nonjoiners", "Non-joiners"],
     ["insights", "Insights"],
@@ -700,6 +703,13 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
         if (!block || !block.cells?.length) return null;
         return <V2FunnelCard key={dim} title={title} cells={block.cells} />;
       })}
+
+      {/* mailbox providers — computed live, not part of the frozen artifact,
+          so it reflects the current MX cache without a report regenerate */}
+      <VizStyles />
+      <div id="providers" className="scroll-mt-16">
+        <EmailProviderCard webinarIds={[payload.webinarId]} />
+      </div>
 
       {/* bookings */}
       <SectionHeading
@@ -1062,6 +1072,10 @@ function V1Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
         if (!block || !block.cells?.length) return null;
         return <V1FunnelCard key={dim} title={title} cells={block.cells} />;
       })}
+
+      {/* mailbox providers — live, see the V2 note above */}
+      <VizStyles />
+      <EmailProviderCard webinarIds={[payload.webinarId]} />
 
       {/* 3 — bookings */}
       <SectionHeading
