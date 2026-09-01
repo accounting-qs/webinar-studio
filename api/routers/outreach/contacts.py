@@ -3,7 +3,7 @@ import uuid as uuid_mod
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text as sa_text, func as sa_func
+from sqlalchemy import and_ as sa_and, or_ as sa_or, select, text as sa_text, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
@@ -484,9 +484,8 @@ async def _scanned_page(
 
     if rows:
         scanned, filtered_total = rows[0]["scanned"], rows[0]["filtered_total"]
-    else:
-        # Empty page (no matches, or paged past the end): the counts still have
-        # to come back, so re-run just the aggregates.
+    elif offset:
+        # Paged past the end: both counts still have to come back.
         meta = (await db.execute(sa_text(f"""
             WITH scan AS MATERIALIZED ({scan_sql} LIMIT :scan_limit)
             SELECT count(*) AS scanned,
@@ -494,6 +493,15 @@ async def _scanned_page(
             FROM scan s
         """), params)).mappings().first()
         scanned, filtered_total = (meta["scanned"], meta["filtered_total"]) if meta else (0, 0)
+    else:
+        # Nothing matched at all. filtered_total is 0 by definition, so only
+        # `scanned` is unknown — and it is needed just to say whether the scan
+        # stopped early. Re-run the scan WITHOUT the refinements, which is where
+        # the per-candidate probes live.
+        filtered_total = 0
+        scanned = (await db.execute(sa_text(
+            f"WITH scan AS MATERIALIZED ({scan_sql} LIMIT :scan_limit) SELECT count(*) FROM scan"
+        ), params)).scalar() or 0
 
     scan_capped = scanned >= scan_limit and (refined or scan_cap is not None)
     if count_sql and not refined and scan_cap is None:
@@ -779,8 +787,8 @@ async def _list_by_bucket(
 async def _list_by_blocklist(
     db: AsyncSession, *, search_fields, limit, offset, **f
 ) -> dict:
-    """Driver: the partial is_blocklisted indexes — ~12k rows, small enough to
-    scan the whole cohort under the cap and refine it in place."""
+    """Driver: the partial is_blocklisted indexes — only the blocklisted rows
+    are in them, so both the page and the count stay cheap."""
     params: dict = {"user_id": LLOYD_USER_ID}
     refine = _build_refinements(
         alias="s", params=params, terms=[], search_fields=search_fields,
@@ -791,9 +799,12 @@ async def _list_by_blocklist(
         FROM contacts
         WHERE user_id = :user_id AND is_blocklisted
     """
+    # The partial is_blocklisted indexes hold only the blocklisted rows, so this
+    # count is a scan of ~150 kB rather than of the table.
+    count_sql = "SELECT count(*) FROM contacts WHERE user_id = :user_id AND is_blocklisted"
     return await _scanned_page(
-        db, mode="blocklist", scan_sql=scan_sql, refine_sql=refine, params=params,
-        limit=limit, offset=offset, scan_cap=SEARCH_MATCH_CAP,
+        db, mode="blocklist", scan_sql=scan_sql, refine_sql=refine,
+        count_sql=count_sql, params=params, limit=limit, offset=offset,
     )
 
 
@@ -1039,19 +1050,25 @@ async def get_contact_detail(
     # the webinars they belong to) rows that share the raw email but were never
     # matched. Both paths are index hits; merged by webinar with matched-rows
     # priority.
+    # One statement, two index paths (uq_wci_webinar_email + ix_wci_matched_contact_id)
+    # OR'd together: the round trip to the pooler costs far more than the extra
+    # bitmap. Matched rows win, so they are applied last.
     invites: dict[str, WebinarCalendarInvite] = {}
+    inv_conds = [WebinarCalendarInvite.matched_contact_id == contact_id]
     if contact.email and member_webinar_ids:
-        for inv in (await db.execute(
-            select(WebinarCalendarInvite).where(
-                WebinarCalendarInvite.webinar_id.in_(member_webinar_ids),
-                WebinarCalendarInvite.email == contact.email,
-            )
-        )).scalars():
+        inv_conds.append(sa_and(
+            WebinarCalendarInvite.webinar_id.in_(member_webinar_ids),
+            WebinarCalendarInvite.email == contact.email,
+        ))
+    inv_rows = (await db.execute(
+        select(WebinarCalendarInvite).where(sa_or(*inv_conds))
+    )).scalars().all()
+    for inv in inv_rows:
+        if inv.matched_contact_id != contact_id:
             invites[inv.webinar_id] = inv
-    for inv in (await db.execute(
-        select(WebinarCalendarInvite).where(WebinarCalendarInvite.matched_contact_id == contact_id)
-    )).scalars():
-        invites[inv.webinar_id] = inv
+    for inv in inv_rows:
+        if inv.matched_contact_id == contact_id:
+            invites[inv.webinar_id] = inv
 
     # Non-joiner re-invites live in their own table (email-keyed, no contact FK);
     # they label the response on nonjoiner memberships.
@@ -1279,79 +1296,57 @@ async def get_contact_detail(
                 "custom_list_name": up.custom_list_name,
             }
 
-    # Releases: the contact was pulled back out of a webinar list after being
-    # claimed. Invisible everywhere else, and the reason a webinar can appear in
-    # the history with no membership row.
-    release_rows = (await db.execute(
-        select(ContactReleaseLog, Webinar)
-        .outerjoin(Webinar, Webinar.id == ContactReleaseLog.webinar_id)
-        .where(ContactReleaseLog.contact_id == contact_id)
-        .order_by(ContactReleaseLog.released_at.desc())
-        .limit(50)
-    )).all()
-    releases = [
-        {
-            "released_at": _iso(r.released_at),
-            "prior_status": r.prior_status,
-            "prior_used_at": _iso(r.prior_used_at),
-            "webinar_number": w.number if w else None,
-            "variant_label": w.variant_label if w else None,
-        }
-        for (r, w) in release_rows
-    ]
+    # Three sidecars that each need a single index probe — releases
+    # (ix_release_log_contact), the blocklist entry (uq_blocklist_user_email)
+    # and the CRM record (ix_ghl_contact_email). Issued as one statement: the
+    # round trip to the pooler costs an order of magnitude more than the reads.
+    sidecars = (await db.execute(sa_text("""
+        SELECT
+          (SELECT json_agg(r) FROM (
+             SELECT rl.released_at, rl.prior_status, rl.prior_used_at,
+                    w.number AS webinar_number, w.variant_label
+             FROM contact_release_log rl
+             LEFT JOIN webinars w ON w.id = rl.webinar_id
+             WHERE rl.contact_id = CAST(:contact_id AS uuid)
+             ORDER BY rl.released_at DESC
+             LIMIT 50
+           ) r) AS releases,
+          (SELECT row_to_json(b) FROM (
+             SELECT source, reason, source_ref, created_at
+             FROM blocklist
+             WHERE user_id = CAST(:user_id AS uuid) AND email = :email
+             LIMIT 1
+           ) b) AS blocklist,
+          (SELECT row_to_json(g) FROM (
+             SELECT ghl_contact_id, date_added, tags, is_booked_call,
+                    booked_call_webinar_series,
+                    webinar_registration_in_form_date AS self_registered_at,
+                    cold_calendar_unsubscribe_date AS unsubscribed_at,
+                    has_sms_click_tag,
+                    calendar_invite_response_history AS invite_response_history,
+                    calendar_webinar_series_history AS webinar_series_history,
+                    calendar_webinar_series_non_joiners AS nonjoiner_series_history,
+                    registration_campaign_source, registration_campaign_medium,
+                    registration_campaign_name, book_campaign_source,
+                    book_campaign_medium, book_campaign_name,
+                    zoom_viewing_time_in_minutes_total AS minutes_watched_total,
+                    zoom_webinar_series_attended_total_count AS sessions_attended,
+                    zoom_webinar_series_registered_total_count AS sessions_registered,
+                    synced_at
+             FROM ghl_contact
+             WHERE email = ANY(CAST(:email_variants AS text[]))
+             LIMIT 1
+           ) g) AS crm
+    """), {
+        "contact_id": contact_id,
+        "user_id": LLOYD_USER_ID,
+        "email": contact.email,
+        "email_variants": sorted(email_variants) or [""],
+    })).mappings().first()
 
-    blocklist = None
-    if contact.email:
-        entry = (await db.execute(
-            select(BlocklistEntry).where(
-                BlocklistEntry.user_id == LLOYD_USER_ID,
-                BlocklistEntry.email == contact.email,
-            )
-        )).scalar_one_or_none()
-        if entry:
-            blocklist = {
-                "source": entry.source,
-                "reason": entry.reason,
-                "source_ref": entry.source_ref,
-                "created_at": _iso(entry.created_at),
-            }
-
-    # CRM record, matched by email (ix_ghl_contact_email). Carries the signals
-    # that never reach the contacts table: tags, unsubscribe date, self-registration
-    # and the campaign attribution GHL captured at booking time.
-    crm = None
-    if contact.email:
-        g = (await db.execute(
-            select(GHLContact).where(GHLContact.email == contact.email.lower()).limit(1)
-        )).scalar_one_or_none()
-        if g is None:
-            g = (await db.execute(
-                select(GHLContact).where(GHLContact.email == contact.email).limit(1)
-            )).scalar_one_or_none()
-        if g is not None:
-            crm = {
-                "ghl_contact_id": g.ghl_contact_id,
-                "date_added": _iso(g.date_added),
-                "tags": g.tags or [],
-                "is_booked_call": g.is_booked_call,
-                "booked_call_webinar_series": g.booked_call_webinar_series,
-                "self_registered_at": _iso(g.webinar_registration_in_form_date),
-                "unsubscribed_at": _iso(g.cold_calendar_unsubscribe_date),
-                "has_sms_click_tag": g.has_sms_click_tag,
-                "invite_response_history": g.calendar_invite_response_history,
-                "webinar_series_history": g.calendar_webinar_series_history,
-                "nonjoiner_series_history": g.calendar_webinar_series_non_joiners,
-                "registration_campaign_source": g.registration_campaign_source,
-                "registration_campaign_medium": g.registration_campaign_medium,
-                "registration_campaign_name": g.registration_campaign_name,
-                "book_campaign_source": g.book_campaign_source,
-                "book_campaign_medium": g.book_campaign_medium,
-                "book_campaign_name": g.book_campaign_name,
-                "minutes_watched_total": g.zoom_viewing_time_in_minutes_total,
-                "sessions_attended": g.zoom_webinar_series_attended_total_count,
-                "sessions_registered": g.zoom_webinar_series_registered_total_count,
-                "synced_at": _iso(g.synced_at),
-            }
+    releases = sidecars["releases"] or []
+    blocklist = sidecars["blocklist"]
+    crm = sidecars["crm"]
 
     return {
         "contact": {
