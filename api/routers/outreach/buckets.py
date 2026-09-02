@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import functools
 import io
 import logging
 import uuid
@@ -163,7 +164,7 @@ def patch_eligible_cache_after_claim(
 # 4.4M rows per request (that pushed pure-exclude totals past the 120s cap).
 # Effective location mirrors country_filter_conditions: per-contact country,
 # else list_location; "" both → the no-location sentinel.
-_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
+_TOTALS_ROLLUP: dict = {"name": "totals", "ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
 _TOTALS_ROLLUP_TTL = 600.0
 
 # A rebuild that dies on the statement timeout has burned up to 120s of the very
@@ -250,11 +251,11 @@ async def _build_rollup(*, fresh_only: bool = False) -> dict:
 # operator watches it drop. Claims mark it stale immediately (see
 # touch_fresh_rollup) so the background rebuild lands well inside the 60s
 # _ELIGIBLE_CACHE window that the claim exact-patches.
-_FRESH_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
+_FRESH_ROLLUP: dict = {"name": "fresh", "ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
 _FRESH_ROLLUP_TTL = 60.0
 
 
-def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
+def _schedule_rollup_rebuild(slot: dict, builder):
     """Start a background rebuild of `slot` unless one is already running.
     Returns the in-flight task, or None when there is no running loop to attach
     to (scripts importing this module)."""
@@ -281,7 +282,7 @@ def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
         try:
             while True:
                 slot["dirty"] = False
-                built = await _build_rollup(fresh_only=fresh_only)
+                built = await builder()
                 slot["data"] = built
                 slot["ts"] = _t.monotonic()
                 slot["retry_after"] = 0.0
@@ -289,8 +290,8 @@ def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
                     break
         except Exception:
             slot["retry_after"] = _t.monotonic() + _ROLLUP_RETRY_BACKOFF
-            logger.warning("rollup rebuild failed (fresh_only=%s); backing off %.0fs",
-                           fresh_only, _ROLLUP_RETRY_BACKOFF, exc_info=True)
+            logger.warning("rollup rebuild failed (%s); backing off %.0fs",
+                           slot["name"], _ROLLUP_RETRY_BACKOFF, exc_info=True)
         finally:
             slot["building"] = None
 
@@ -298,7 +299,7 @@ def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
     return slot["building"]
 
 
-async def _serve_rollup(slot: dict, ttl: float, *, fresh_only: bool, allow_stale: bool = True):
+async def _serve_rollup(slot: dict, ttl: float, builder, *, allow_stale: bool = True):
     """Serve a rollup slot, stale-while-revalidate: a fresh copy returns as-is; a
     stale copy is returned immediately while a background task rebuilds; only
     the very first call (no copy at all) builds inline."""
@@ -306,7 +307,7 @@ async def _serve_rollup(slot: dict, ttl: float, *, fresh_only: bool, allow_stale
 
     if slot["data"] is not None and (_t.monotonic() - slot["ts"]) < ttl:
         return slot["data"]
-    building = _schedule_rollup_rebuild(slot, fresh_only=fresh_only)
+    building = _schedule_rollup_rebuild(slot, builder)
     if slot["data"] is not None and allow_stale:
         return slot["data"]
     # first-ever build (or stale disallowed): build inline, dedup with any
@@ -318,12 +319,14 @@ async def _serve_rollup(slot: dict, ttl: float, *, fresh_only: bool, allow_stale
 
 async def _totals_rollup(*, allow_stale: bool = True):
     return await _serve_rollup(
-        _TOTALS_ROLLUP, _TOTALS_ROLLUP_TTL, fresh_only=False, allow_stale=allow_stale)
+        _TOTALS_ROLLUP, _TOTALS_ROLLUP_TTL,
+        functools.partial(_build_rollup, fresh_only=False), allow_stale=allow_stale)
 
 
 async def _fresh_rollup(*, allow_stale: bool = True):
     return await _serve_rollup(
-        _FRESH_ROLLUP, _FRESH_ROLLUP_TTL, fresh_only=True, allow_stale=allow_stale)
+        _FRESH_ROLLUP, _FRESH_ROLLUP_TTL,
+        functools.partial(_build_rollup, fresh_only=True), allow_stale=allow_stale)
 
 
 def touch_fresh_rollup() -> None:
@@ -334,7 +337,7 @@ def touch_fresh_rollup() -> None:
     _ELIGIBLE_CACHE entry, and the rebuild lands well inside that entry's 60s
     life, so the operator never sees remaining bounce back up."""
     _FRESH_ROLLUP["ts"] = 0.0
-    _schedule_rollup_rebuild(_FRESH_ROLLUP, fresh_only=True)
+    _schedule_rollup_rebuild(_FRESH_ROLLUP, functools.partial(_build_rollup, fresh_only=True))
 
 
 def _totals_from_rollup(data, include=None, exclude=None) -> dict:
@@ -654,7 +657,6 @@ def _norm_location(s: str | None) -> str:
 
 @router.get("/buckets/good-available")
 async def good_available_counts(
-    db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
     """Fresh 'ideal' inventory for the Planning header.
@@ -671,6 +673,37 @@ async def good_available_counts(
     splits are subsets of the total — the rest of the world (APAC/LATAM/etc.) is
     in the total but in none of the three splits.
     """
+    data = await _good_available_rollup()
+    if data is None:
+        # Never built, or backing off from a failed rebuild. The caller renders
+        # "—" for an unknown value, which beats a 500.
+        raise HTTPException(503, "Inventory counts are still being computed")
+    return data
+
+
+# Same stale-while-revalidate treatment as the rollups: this is a header stat on
+# every Planning load, and its scan covers the whole ~1.1M-contact fresh pool.
+# Unchunked it was a single statement over that pool and 500'd three times in the
+# 2026-09-02 logs; even when it survives it is tens of seconds, which is not a
+# thing to run per page load.
+_GOOD_AVAIL: dict = {"name": "good-available", "ts": 0.0, "data": None,
+                     "building": None, "dirty": False, "retry_after": 0.0}
+_GOOD_AVAIL_TTL = 300.0
+
+
+async def _good_available_rollup(*, allow_stale: bool = True):
+    return await _serve_rollup(
+        _GOOD_AVAIL, _GOOD_AVAIL_TTL, _build_good_available, allow_stale=allow_stale)
+
+
+async def _build_good_available() -> dict:
+    """Build the Planning header's fresh 'ideal' inventory, in bucket-group chunks
+    so no single statement approaches the 120s cap. Semantics are unchanged from
+    the one-shot query this replaces: the bucket join, the quality/disqualified
+    exclusions and the per-bucket employee range all still apply — the only
+    difference is that the scan is split by bucket_id and merged in process."""
+    from db.session import AsyncSessionLocal as _S
+
     # Per-bucket employee range: apply the saved range where set (excluding
     # unknown-size contacts), otherwise no size restriction.
     emp_ok = or_(
@@ -686,36 +719,59 @@ async def good_available_counts(
         sa_func.nullif(sa_func.trim(Contact.country), ""),
         sa_func.nullif(sa_func.trim(Contact.list_location), ""),
     )
-    result = await db.execute(
-        select(loc_expr.label("loc"), sa_func.count())
-        .select_from(Contact)
-        .join(OutreachBucket, OutreachBucket.id == Contact.bucket_id)
+    qualifying = (
+        select(OutreachBucket.id, sa_func.greatest(OutreachBucket.remaining_contacts, 1))
         .where(
-            Contact.user_id == LLOYD_USER_ID,
+            OutreachBucket.user_id == LLOYD_USER_ID,
             OutreachBucket.deleted_at.is_(None),
             # good + medium + unmarked → exclude only 'bad'
             or_(OutreachBucket.quality.is_(None), OutreachBucket.quality != "bad"),
             sa_func.lower(OutreachBucket.name) != "disqualified",
-            # NOT form matches ix_contacts_claimable's partial predicate.
-            ~Contact.is_blocklisted,
-            Contact.last_invited_at.is_(None),
-            Contact.assigned_membership_count == 0,
-            emp_ok,
         )
-        .group_by(loc_expr)
     )
+    async with _S() as s0:
+        sizes = (await s0.execute(qualifying)).all()
+
+    chunks: list[list] = []
+    cur: list = []
+    cur_n = 0
+    for bid, n in sorted(sizes, key=lambda r: -r[1]):
+        if cur and cur_n + n > 150_000:
+            chunks.append(cur)
+            cur, cur_n = [], 0
+        cur.append(bid)
+        cur_n += n
+    if cur:
+        chunks.append(cur)
 
     total = us_ca = europe = no_location = 0
-    for loc, cnt in result:
-        cnt = int(cnt or 0)
-        total += cnt
-        n = _norm_location(loc)
-        if not n:
-            no_location += cnt
-        elif n in _GOOD_GEO_US_CA:
-            us_ca += cnt
-        elif n in _GOOD_GEO_EUROPE:
-            europe += cnt
+    for chunk in chunks:
+        async with _S() as s0:
+            rows = (await s0.execute(
+                select(loc_expr.label("loc"), sa_func.count())
+                .select_from(Contact)
+                .join(OutreachBucket, OutreachBucket.id == Contact.bucket_id)
+                .where(
+                    Contact.user_id == LLOYD_USER_ID,
+                    Contact.bucket_id.in_(chunk),
+                    # NOT form matches ix_contacts_claimable's partial predicate.
+                    ~Contact.is_blocklisted,
+                    Contact.last_invited_at.is_(None),
+                    Contact.assigned_membership_count == 0,
+                    emp_ok,
+                )
+                .group_by(loc_expr)
+            )).all()
+        for loc, cnt in rows:
+            cnt = int(cnt or 0)
+            total += cnt
+            n = _norm_location(loc)
+            if not n:
+                no_location += cnt
+            elif n in _GOOD_GEO_US_CA:
+                us_ca += cnt
+            elif n in _GOOD_GEO_EUROPE:
+                europe += cnt
     return {"total": total, "us_ca": us_ca, "europe": europe, "no_location": no_location}
 
 

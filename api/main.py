@@ -16,16 +16,32 @@ async def lifespan(app: FastAPI):
     logger.info("Webinar Studio starting up")
     # Tables are managed by Alembic migrations — do not create_all here
 
-    # Pre-warm the (bucket × location) rollups in the background so the first
-    # country-filtered eligible request never pays the chunked build. Both are
-    # needed: the totals rollup backs the assign panel's TOTAL column, the fresh
-    # rollup its REMAINING column.
+    # Pre-warm the Planning aggregates in the background so the first request
+    # never pays their chunked build: the totals rollup backs the assign panel's
+    # TOTAL column, the fresh rollup its REMAINING column, and good-available the
+    # header inventory stat.
+    #
+    # SEQUENTIALLY, in one task, not three concurrent ones. Each is a scan over
+    # the same contacts table on a database whose ceiling is random reads, so
+    # running them together just makes all three slower and lands a 3x I/O burst
+    # on every deploy — while live traffic is competing for the same disk.
     try:
         import asyncio as _a
 
-        from api.routers.outreach.buckets import _fresh_rollup, _totals_rollup
-        app.state._rollup_prewarm = _a.create_task(_totals_rollup())
-        app.state._fresh_rollup_prewarm = _a.create_task(_fresh_rollup())
+        from api.routers.outreach.buckets import (
+            _fresh_rollup, _good_available_rollup, _totals_rollup,
+        )
+
+        async def _prewarm():
+            for name, build in (("totals", _totals_rollup),
+                                ("fresh", _fresh_rollup),
+                                ("good-available", _good_available_rollup)):
+                try:
+                    await build()
+                except Exception:
+                    logger.exception("%s prewarm failed (non-fatal)", name)
+
+        app.state._rollup_prewarm = _a.create_task(_prewarm())
     except Exception:
         logger.exception("rollup prewarm failed to start (non-fatal)")
 
