@@ -850,7 +850,8 @@ export async function fetchAssignCountries(
  *  uses the static bucket.total_contacts). Both reflect the country/employee
  *  filters; remaining also reflects the reuse cutoff. */
 export async function fetchBucketEligible(
-  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[]; country_exclude?: string[]; emp_min?: number; emp_max?: number }
+  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[]; country_exclude?: string[]; emp_min?: number; emp_max?: number },
+  signal?: AbortSignal,
 ): Promise<{ remaining: Record<string, number>; totals: Record<string, number> }> {
   const qs = new URLSearchParams();
   if (params.reuse_cutoff) qs.set("reuse_cutoff", params.reuse_cutoff);
@@ -863,6 +864,7 @@ export async function fetchBucketEligible(
   if (params.emp_max != null) qs.set("emp_max", String(params.emp_max));
   const res = await fetch(`${API_URL}/outreach/buckets/eligible?${qs.toString()}`, {
     headers: jsonHeaders(),
+    signal,
   });
   if (!res.ok) return { remaining: {}, totals: {} };
   const data = await res.json();

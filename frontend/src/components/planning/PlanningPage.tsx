@@ -1060,6 +1060,12 @@ export function PlanningPage() {
     // Custom mode needs a date before it can query.
     if (assignReuseCutoff === "custom" && !assignReuseBefore) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); return; }
     let cancelled = false;
+    // ABORT the previous fetch rather than just ignoring its result: each of
+    // these costs seconds of index scans server-side, and flipping through
+    // filters used to leave every superseded request running (and queued
+    // against the browser's per-host connection limit, delaying the one that
+    // matters). Only the newest filter combo stays in flight.
+    const ctrl = new AbortController();
     // Invalidate immediately so a filter change never shows the PREVIOUS
     // filter's counts while the new fetch is in flight (brief fresh-baseline
     // fallback instead of stale-wrong numbers).
@@ -1075,10 +1081,10 @@ export function PlanningPage() {
       country_exclude: assignCountryMode === "exclude" && assignFilterCountries.length ? assignFilterCountries : undefined,
       emp_min: debEmpMin === "" ? undefined : debEmpMin,
       emp_max: debEmpMax === "" ? undefined : debEmpMax,
-    })
+    }, ctrl.signal)
       .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); setAssignEligibleLoading(false); } })
       .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); } });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; ctrl.abort(); };
   }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignCountryMode, debEmpMin, debEmpMax, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket. When the eligible map is loaded, a

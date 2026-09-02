@@ -8,7 +8,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, or_, select, func as sa_func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -249,8 +249,38 @@ def _totals_from_rollup(data, include=None, exclude=None) -> dict:
     return out
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    while not await request.is_disconnected():
+        await asyncio.sleep(0.25)
+
+
+async def _gather_or_abandon(request: Request, coros: list):
+    """Run the aggregates concurrently, but drop them the moment the client hangs
+    up. The Planning panel aborts superseded /buckets/eligible requests as the
+    operator flips filters; without this an abandoned request keeps its
+    seconds-long index scans running and holds pooled connections that the filter
+    combo the operator IS waiting on needs. Cancelling the gather cancels the
+    asyncpg statements, which sends a real cancel to Postgres. Returns None when
+    the client went away."""
+    work = asyncio.ensure_future(asyncio.gather(*coros))
+    watch = asyncio.ensure_future(_wait_for_disconnect(request))
+    try:
+        await asyncio.wait({work, watch}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        watch.cancel()
+    if work.done():
+        return work.result()
+    work.cancel()
+    try:
+        await work
+    except BaseException:
+        pass
+    return None
+
+
 @router.get("/buckets/eligible")
 async def bucket_eligible_counts(
+    request: Request,
     reuse_cutoff: str | None = Query(None),
     reuse_before: str | None = Query(None),
     reuse_only: bool = Query(False),
@@ -336,8 +366,6 @@ async def bucket_eligible_counts(
     # The 1-3 aggregates below are independent — run them CONCURRENTLY on their
     # own pooled connections (they ran sequentially before; with filters active
     # that stacked 2-8s of index scans back to back).
-    import asyncio as _asyncio
-
     from db.session import AsyncSessionLocal as _Session
 
     async def _grouped(stmt) -> dict:
@@ -436,7 +464,11 @@ async def bucket_eligible_counts(
         tasks.append(_grouped(totals_stmt))
     if totals_minus_stmt is not None:
         tasks.append(_grouped(totals_minus_stmt))
-    results = await _asyncio.gather(*tasks)
+    results = await _gather_or_abandon(request, tasks)
+    if results is None:
+        # Client aborted (superseded filter change): the queries are cancelled and
+        # there is nobody left to answer. 499 = client closed request.
+        return Response(status_code=499)
 
     counts = results[0]
     idx = 1
