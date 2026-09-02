@@ -163,8 +163,14 @@ def patch_eligible_cache_after_claim(
 # 4.4M rows per request (that pushed pure-exclude totals past the 120s cap).
 # Effective location mirrors country_filter_conditions: per-contact country,
 # else list_location; "" both → the no-location sentinel.
-_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False}
+_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
 _TOTALS_ROLLUP_TTL = 600.0
+
+# A rebuild that dies on the statement timeout has burned up to 120s of the very
+# I/O the request needed and produced nothing. Without this, the next read simply
+# starts another one, so a loaded database gets hammered by back-to-back doomed
+# rebuilds. Back off instead and keep serving the last good copy.
+_ROLLUP_RETRY_BACKOFF = 120.0
 
 
 async def _build_rollup(*, fresh_only: bool = False) -> dict:
@@ -186,12 +192,17 @@ async def _build_rollup(*, fresh_only: bool = False) -> dict:
             f"SELECT id, GREATEST({size_col}, 1) FROM outreach_buckets "
             "WHERE user_id = CAST(:uid AS uuid) AND deleted_at IS NULL"
         ), {"uid": str(LLOYD_USER_ID)})).all()
-    # Greedy-pack buckets into ≤500k-contact chunks (each scan = seconds).
+    # Greedy-pack buckets into chunks small enough that each scan is seconds.
+    # The fresh pool packs tighter: its rebuild fires on every claim and release,
+    # so it competes with the assign writes that triggered it. At 500k its chunks
+    # were hitting the 120s cap on prod under exactly that load (2026-09-02 logs),
+    # and a failed rebuild is pure wasted I/O — it returns nothing.
+    chunk_cap = 150_000 if fresh_only else 500_000
     chunks: list[list] = []
     cur: list = []
     cur_n = 0
     for bid, n in sorted(sizes, key=lambda r: -r[1]):
-        if cur and cur_n + n > 500_000:
+        if cur and cur_n + n > chunk_cap:
             chunks.append(cur)
             cur, cur_n = [], 0
         cur.append(bid)
@@ -239,7 +250,7 @@ async def _build_rollup(*, fresh_only: bool = False) -> dict:
 # operator watches it drop. Claims mark it stale immediately (see
 # touch_fresh_rollup) so the background rebuild lands well inside the 60s
 # _ELIGIBLE_CACHE window that the claim exact-patches.
-_FRESH_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False}
+_FRESH_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False, "retry_after": 0.0}
 _FRESH_ROLLUP_TTL = 60.0
 
 
@@ -256,6 +267,9 @@ def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
         # running task builds once more instead.
         slot["dirty"] = True
         return slot["building"]
+    if _t.monotonic() < slot["retry_after"]:
+        # Still backing off from a rebuild that timed out.
+        return None
     try:
         _a.get_running_loop()
     except RuntimeError:
@@ -270,8 +284,13 @@ def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
                 built = await _build_rollup(fresh_only=fresh_only)
                 slot["data"] = built
                 slot["ts"] = _t.monotonic()
+                slot["retry_after"] = 0.0
                 if not slot["dirty"]:
                     break
+        except Exception:
+            slot["retry_after"] = _t.monotonic() + _ROLLUP_RETRY_BACKOFF
+            logger.warning("rollup rebuild failed (fresh_only=%s); backing off %.0fs",
+                           fresh_only, _ROLLUP_RETRY_BACKOFF, exc_info=True)
         finally:
             slot["building"] = None
 
@@ -463,9 +482,12 @@ async def bucket_eligible_counts(
     # to the live query: the rollup arithmetic applies one side only.
     # (reuse_only is meaningless without a cutoff and is already ignored above;
     # the member-overlap subtraction is provably zero in fresh-only mode.)
-    use_fresh_rollup = (
-        cutoff_ts is None and not emp_conds and not (country and country_exclude)
-    )
+    # A rollup read can come back None (never built, or backing off after a failed
+    # rebuild) — fall through to the live query rather than failing the request.
+    fresh_data = None
+    if cutoff_ts is None and not emp_conds and not (country and country_exclude):
+        fresh_data = await _fresh_rollup()
+    use_fresh_rollup = fresh_data is not None
 
     counts_stmt = None
     counts_minus_stmt = None
@@ -525,9 +547,11 @@ async def bucket_eligible_counts(
     # per-request totals queries below remain only for emp-filtered combos.
     rollup_totals = None
     if (country or country_exclude) and not emp_conds:
-        rollup_totals = _totals_from_rollup(
-            await _totals_rollup(), include=country, exclude=country_exclude,
-        )
+        totals_data = await _totals_rollup()
+        if totals_data is not None:
+            rollup_totals = _totals_from_rollup(
+                totals_data, include=country, exclude=country_exclude,
+            )
 
     totals_stmt = None
     totals_minus_stmt = None
@@ -568,7 +592,7 @@ async def bucket_eligible_counts(
 
     if use_fresh_rollup:
         counts = _totals_from_rollup(
-            await _fresh_rollup(), include=country, exclude=country_exclude,
+            fresh_data, include=country, exclude=country_exclude,
         )
         idx = 0
     else:

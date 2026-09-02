@@ -635,7 +635,15 @@ async def assign_bucket(
     # revisiting phase 2: it binds one param per candidate id, against asyncpg's
     # 32,767-param cap. _CLAIM_CHUNK_FLOOR lets a loaded database back off
     # further instead of failing the request outright.
-    CLAIM_CHUNK = 1500
+    # Measured on prod 2026-09-02 (idle): the phase-3 UPDATE costs ~11ms per row,
+    # not the ~3ms this was originally sized against — `contacts` now carries 12
+    # indexes totalling 4.0GB, including the 1,060MB trgm GIN added 2026-08-31, and
+    # a claim is a non-HOT update that rewrites an entry in EVERY one of them. At
+    # 1500 that put a single chunk at ~17s idle, which needs only ~7x contention to
+    # reach the 120s cap — and that is exactly what the 500s in the logs were. 600
+    # keeps a chunk near the ~7s the design intended. Total assign time is
+    # unchanged (same rows, more statements); only the per-statement risk drops.
+    CLAIM_CHUNK = 600
     _CLAIM_CHUNK_FLOOR = 200
 
     # Fresh (never-invited) contacts claimed across all pools — feeds the exact
@@ -703,6 +711,15 @@ async def assign_bucket(
                         .where(Contact.id.in_(cand_ids), *where_conds)
                         .with_for_update(skip_locked=True)
                     )).all() if cand_ids else []
+                    # Phases 3-4 (the writes) run inside the SAME savepoint as the
+                    # reads above. They used to sit outside it, so a statement
+                    # timeout on the UPDATE — by far the most expensive statement in
+                    # an assign — could not be retried and 500'd the request instead
+                    # of just halving the chunk. That is the 2026-09-02 failure:
+                    # POST /assign returned 500 with this UPDATE as the cancelled
+                    # statement. Nothing was ever half-claimed (the savepoint rolls
+                    # the INSERT back with it) but the operator lost the assign.
+                    n, fresh_now = await _write_chunk(cand_rows) if cand_rows else (0, 0)
                     await sp.commit()
                     break
                 except DBAPIError as exc:
@@ -712,70 +729,13 @@ async def assign_bucket(
                     chunk = max(_CLAIM_CHUNK_FLOOR, chunk_limit // 2)
                     chunk_limit = min(chunk, target - got)
                     logger.warning(
-                        "assign: candidate scan hit the statement timeout, "
+                        "assign: chunk hit the statement timeout, "
                         "retrying with chunk=%d (claimed %d/%d so far)",
                         chunk_limit, got, target,
                     )
             if not cand_rows:
                 break
-            candidate_ids = [r[0] for r in cand_rows]
-            # Keys normalized with str(): contacts.id is mapped UUID(as_uuid=False),
-            # so the ORM select above yields `str`, while the raw-SQL INSERT below
-            # returns `uuid.UUID` (sa_text carries no type info, so asyncpg's native
-            # uuid decoding stands). Looking a UUID up in a str-keyed dict silently
-            # missed EVERY row, which pinned fresh_claimed at 0 and meant
-            # bucket.remaining_contacts was never decremented by an assign — the
-            # bucket's AVAILABLE stat only self-corrected when a release recomputed
-            # it (releases.py). Normalize both sides rather than one, so this cannot
-            # regress if either side's typing changes.
-            status_by_id = {str(r[0]): r[1] for r in cand_rows}
-            # unnest-array insert: one bind param regardless of chunk size (the
-            # old per-row VALUES form hit asyncpg's 32,767-param cap at ~4k rows,
-            # which is what capped chunks at 2000).
-            inserted_ids = (await db.execute(
-                sa_text("""
-                    INSERT INTO webinar_contact_memberships
-                        (user_id, contact_id, webinar_id, assignment_id, bucket_id, status, assigned_date)
-                    SELECT CAST(:uid AS uuid), u.cid, CAST(:wid AS uuid), CAST(:aid AS uuid),
-                           CAST(:bid AS uuid), 'assigned', CAST(:adate AS date)
-                    FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
-                    ON CONFLICT (webinar_id, contact_id) DO NOTHING
-                    RETURNING contact_id
-                """),
-                {
-                    "uid": str(LLOYD_USER_ID),
-                    "wid": str(webinar_id),
-                    "aid": str(assignment.id),
-                    "bid": str(membership_source_bucket) if membership_source_bucket else None,
-                    "adate": webinar.date,
-                    "ids": [str(c) for c in candidate_ids],
-                },
-            )).scalars().all()
-            n = len(inserted_ids)
-            if n:
-                # ONE merged write per chunk (was two): cache bump for every
-                # claimed row + the legacy slot dual-write CASEd to still-fresh
-                # rows. Each contacts write rewrites ~9 indexes, so halving the
-                # statements roughly halves the claim's dominant cost.
-                await db.execute(
-                    sa_text("""
-                        UPDATE contacts c SET
-                            assigned_membership_count = c.assigned_membership_count + 1,
-                            assignment_id  = CASE WHEN c.outreach_status = 'available' THEN CAST(:aid AS uuid) ELSE c.assignment_id END,
-                            assigned_date  = CASE WHEN c.outreach_status = 'available' THEN CAST(:adate AS date) ELSE c.assigned_date END,
-                            outreach_status = CASE WHEN c.outreach_status = 'available' THEN 'assigned' ELSE c.outreach_status END
-                        FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
-                        WHERE c.id = u.cid
-                    """),
-                    {
-                        "aid": str(assignment.id),
-                        "adate": webinar.date,
-                        "ids": [str(c) for c in inserted_ids],
-                    },
-                )
-                fresh_claimed["n"] += sum(
-                    1 for cid in inserted_ids if status_by_id.get(str(cid)) == "available"
-                )
+            fresh_claimed["n"] += fresh_now
             got += n
             if exhausted or n == 0:
                 # exhausted → phase 1 scraped the bottom of the pool. n == 0 →
@@ -787,6 +747,75 @@ async def assign_bucket(
                 # advances onto fresh rows.
                 break
         return got
+
+    async def _write_chunk(cand_rows) -> tuple[int, int]:
+        """Claim the locked candidates: the membership rows plus the contacts
+        cache bump. Returns (claimed, how many of those were fresh).
+
+        Called INSIDE the caller's savepoint so a statement timeout on these
+        writes rolls back with the reads and can be retried on a smaller chunk.
+        The UPDATE is the most expensive statement in the whole assign — every
+        claimed row is a non-HOT update rewriting all 12 contacts indexes,
+        measured at ~11ms/row on an idle prod on 2026-09-02."""
+        candidate_ids = [r[0] for r in cand_rows]
+        # Keys normalized with str(): contacts.id is mapped UUID(as_uuid=False),
+        # so _claim_pool's ORM select yields `str`, while the raw-SQL INSERT below
+        # returns `uuid.UUID` (sa_text carries no type info, so asyncpg's native
+        # uuid decoding stands). Looking a UUID up in a str-keyed dict silently
+        # missed EVERY row, which pinned fresh_claimed at 0 and meant
+        # bucket.remaining_contacts was never decremented by an assign — the
+        # bucket's AVAILABLE stat only self-corrected when a release recomputed
+        # it (releases.py). Normalize both sides rather than one, so this cannot
+        # regress if either side's typing changes.
+        status_by_id = {str(r[0]): r[1] for r in cand_rows}
+        # unnest-array insert: one bind param regardless of chunk size (the
+        # old per-row VALUES form hit asyncpg's 32,767-param cap at ~4k rows,
+        # which is what capped chunks at 2000).
+        inserted_ids = (await db.execute(
+            sa_text("""
+                INSERT INTO webinar_contact_memberships
+                    (user_id, contact_id, webinar_id, assignment_id, bucket_id, status, assigned_date)
+                SELECT CAST(:uid AS uuid), u.cid, CAST(:wid AS uuid), CAST(:aid AS uuid),
+                       CAST(:bid AS uuid), 'assigned', CAST(:adate AS date)
+                FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
+                ON CONFLICT (webinar_id, contact_id) DO NOTHING
+                RETURNING contact_id
+            """),
+            {
+                "uid": str(LLOYD_USER_ID),
+                "wid": str(webinar_id),
+                "aid": str(assignment.id),
+                "bid": str(membership_source_bucket) if membership_source_bucket else None,
+                "adate": webinar.date,
+                "ids": [str(c) for c in candidate_ids],
+            },
+        )).scalars().all()
+        n = len(inserted_ids)
+        if n:
+            # ONE merged write per chunk (was two): cache bump for every
+            # claimed row + the legacy slot dual-write CASEd to still-fresh
+            # rows. Each contacts write rewrites an entry in all 12 indexes, so
+            # halving the statements roughly halves the claim's dominant cost.
+            await db.execute(
+                sa_text("""
+                    UPDATE contacts c SET
+                        assigned_membership_count = c.assigned_membership_count + 1,
+                        assignment_id  = CASE WHEN c.outreach_status = 'available' THEN CAST(:aid AS uuid) ELSE c.assignment_id END,
+                        assigned_date  = CASE WHEN c.outreach_status = 'available' THEN CAST(:adate AS date) ELSE c.assigned_date END,
+                        outreach_status = CASE WHEN c.outreach_status = 'available' THEN 'assigned' ELSE c.outreach_status END
+                    FROM unnest(CAST(:ids AS uuid[])) AS u(cid)
+                    WHERE c.id = u.cid
+                """),
+                {
+                    "aid": str(assignment.id),
+                    "adate": webinar.date,
+                    "ids": [str(c) for c in inserted_ids],
+                },
+            )
+            return n, sum(
+                1 for cid in inserted_ids if status_by_id.get(str(cid)) == "available"
+            )
+        return n, 0
 
     # Mixed reuse (a cutoff is set AND fresh are NOT excluded) → aim for a ~50/50
     # fresh/reused split rather than whatever physical scan order happens to return,
