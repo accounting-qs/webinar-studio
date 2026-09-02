@@ -114,6 +114,9 @@ _ELIGIBLE_TTL = 60.0
 
 def invalidate_eligible_cache() -> None:
     _ELIGIBLE_CACHE.clear()
+    # Releases move contacts back INTO the claimable pool, so the fresh rollup
+    # that now serves the remaining counts is stale too.
+    touch_fresh_rollup()
 
 
 def patch_eligible_cache_after_claim(
@@ -132,6 +135,12 @@ def patch_eligible_cache_after_claim(
         tuple(sorted(country_exclude)) if country_exclude else None,
         emp_min, emp_max,
     )
+    # The claim moved contacts OUT of the claimable pool — the fresh rollup that
+    # serves the fresh-only counts no longer reflects it. Marking it stale here
+    # starts the background rebuild immediately, so it lands inside the 60s life
+    # of the cache entry patched just below (which keeps THIS combo exact
+    # meanwhile).
+    touch_fresh_rollup()
     bid = str(bucket_id)
     for key in list(_ELIGIBLE_CACHE.keys()):
         if key != match_key:
@@ -154,20 +163,27 @@ def patch_eligible_cache_after_claim(
 # 4.4M rows per request (that pushed pure-exclude totals past the 120s cap).
 # Effective location mirrors country_filter_conditions: per-contact country,
 # else list_location; "" both → the no-location sentinel.
-_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None}
+_TOTALS_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False}
 _TOTALS_ROLLUP_TTL = 600.0
 
 
-async def _build_rollup() -> dict:
+async def _build_rollup(*, fresh_only: bool = False) -> dict:
     """One (bucket, effective-location) count rollup, built in bucket-group
     chunks so no single statement approaches the 120s cap (the whole-table
-    GROUP BY measured ~120s)."""
+    GROUP BY measured ~120s).
+
+    `fresh_only` restricts to the claimable-fresh pool (never invited, not
+    in-flight) — the same population `claimable_conditions(None, ...)` builds —
+    so the eligible REMAINING counts can be served from arithmetic too, not just
+    the totals. Chunks are then packed by remaining_contacts, since that is the
+    size of the slice each statement actually walks."""
     from db.session import AsyncSessionLocal as _S
     from sqlalchemy import text as _text
 
+    size_col = "remaining_contacts" if fresh_only else "total_contacts"
     async with _S() as s:
         sizes = (await s.execute(_text(
-            "SELECT id, GREATEST(total_contacts, 1) FROM outreach_buckets "
+            f"SELECT id, GREATEST({size_col}, 1) FROM outreach_buckets "
             "WHERE user_id = CAST(:uid AS uuid) AND deleted_at IS NULL"
         ), {"uid": str(LLOYD_USER_ID)})).all()
     # Greedy-pack buckets into ≤500k-contact chunks (each scan = seconds).
@@ -183,10 +199,13 @@ async def _build_rollup() -> dict:
     if cur:
         chunks.append(cur)
 
+    # Matches claimable_conditions(None, None) — fresh-only, nothing in flight.
+    pool = ("AND assigned_membership_count = 0 AND last_invited_at IS NULL"
+            if fresh_only else "")
     data: dict = {}
     for chunk in chunks:
         async with _S() as s:
-            rows = (await s.execute(_text("""
+            rows = (await s.execute(_text(f"""
                 SELECT bucket_id,
                        CASE WHEN country IS NOT NULL AND country <> '' THEN country
                             WHEN list_location IS NOT NULL AND list_location <> '' THEN list_location
@@ -194,6 +213,7 @@ async def _build_rollup() -> dict:
                        count(*) AS n
                 FROM contacts
                 WHERE user_id = CAST(:uid AS uuid) AND NOT is_blocklisted
+                  {pool}
                   AND bucket_id = ANY(CAST(:bids AS uuid[]))
                 GROUP BY bucket_id, 2
             """), {
@@ -206,41 +226,105 @@ async def _build_rollup() -> dict:
     return data
 
 
-async def _totals_rollup(*, allow_stale: bool = True):
-    """Serve the rollup, stale-while-revalidate: a fresh copy returns as-is; a
-    stale copy is returned immediately while a background task rebuilds; only
-    the very first call (no copy at all) builds inline."""
+# The same rollup over the claimable-FRESH pool, which is what the assign
+# panel's REMAINING column counts. Serving those counts as arithmetic is what
+# keeps the panel alive when the visibility map drifts: the equivalent live
+# query is an index-only scan over ~1.5M fresh contacts, and every heap page
+# that is not all-visible turns into a random read. On 2026-09-02 the map sat
+# at 91% all-visible, which put a 42-country Europe filter at ~160k random
+# reads — 450s+ at prod's measured 250-350 reads/s, i.e. a hard 500 at the
+# 120s statement cap. The rollup's chunked build cannot hit that cap, and the
+# country arithmetic on top of it costs nothing.
+# Shorter TTL than the totals rollup: REMAINING moves on every assign, and the
+# operator watches it drop. Claims mark it stale immediately (see
+# touch_fresh_rollup) so the background rebuild lands well inside the 60s
+# _ELIGIBLE_CACHE window that the claim exact-patches.
+_FRESH_ROLLUP: dict = {"ts": 0.0, "data": None, "building": None, "dirty": False}
+_FRESH_ROLLUP_TTL = 60.0
+
+
+def _schedule_rollup_rebuild(slot: dict, *, fresh_only: bool):
+    """Start a background rebuild of `slot` unless one is already running.
+    Returns the in-flight task, or None when there is no running loop to attach
+    to (scripts importing this module)."""
     import asyncio as _a
     import time as _t
 
-    fresh = _TOTALS_ROLLUP["data"] is not None and (
-        _t.monotonic() - _TOTALS_ROLLUP["ts"]) < _TOTALS_ROLLUP_TTL
-    if fresh:
-        return _TOTALS_ROLLUP["data"]
+    if slot["building"] is not None:
+        # A rebuild started BEFORE this change and would stamp a pre-change
+        # snapshot as fresh, hiding the change for a whole TTL. Flag it so the
+        # running task builds once more instead.
+        slot["dirty"] = True
+        return slot["building"]
+    try:
+        _a.get_running_loop()
+    except RuntimeError:
+        # Imported by a script, not serving a request — nothing to attach to.
+        # (Checked BEFORE building the coroutine, so none is left un-awaited.)
+        return None
 
     async def _rebuild():
         try:
-            built = await _build_rollup()
-            _TOTALS_ROLLUP["data"] = built
-            _TOTALS_ROLLUP["ts"] = _t.monotonic()
+            while True:
+                slot["dirty"] = False
+                built = await _build_rollup(fresh_only=fresh_only)
+                slot["data"] = built
+                slot["ts"] = _t.monotonic()
+                if not slot["dirty"]:
+                    break
         finally:
-            _TOTALS_ROLLUP["building"] = None
+            slot["building"] = None
 
-    if _TOTALS_ROLLUP["data"] is not None and allow_stale:
-        if _TOTALS_ROLLUP["building"] is None:
-            _TOTALS_ROLLUP["building"] = _a.create_task(_rebuild())
-        return _TOTALS_ROLLUP["data"]
+    slot["building"] = _a.create_task(_rebuild())
+    return slot["building"]
+
+
+async def _serve_rollup(slot: dict, ttl: float, *, fresh_only: bool, allow_stale: bool = True):
+    """Serve a rollup slot, stale-while-revalidate: a fresh copy returns as-is; a
+    stale copy is returned immediately while a background task rebuilds; only
+    the very first call (no copy at all) builds inline."""
+    import time as _t
+
+    if slot["data"] is not None and (_t.monotonic() - slot["ts"]) < ttl:
+        return slot["data"]
+    building = _schedule_rollup_rebuild(slot, fresh_only=fresh_only)
+    if slot["data"] is not None and allow_stale:
+        return slot["data"]
     # first-ever build (or stale disallowed): build inline, dedup with any
     # in-flight rebuild
-    if _TOTALS_ROLLUP["building"] is None:
-        _TOTALS_ROLLUP["building"] = _a.create_task(_rebuild())
-    await _TOTALS_ROLLUP["building"]
-    return _TOTALS_ROLLUP["data"]
+    if building is not None:
+        await building
+    return slot["data"]
+
+
+async def _totals_rollup(*, allow_stale: bool = True):
+    return await _serve_rollup(
+        _TOTALS_ROLLUP, _TOTALS_ROLLUP_TTL, fresh_only=False, allow_stale=allow_stale)
+
+
+async def _fresh_rollup(*, allow_stale: bool = True):
+    return await _serve_rollup(
+        _FRESH_ROLLUP, _FRESH_ROLLUP_TTL, fresh_only=True, allow_stale=allow_stale)
+
+
+def touch_fresh_rollup() -> None:
+    """Something moved contacts in or out of the claimable pool (a claim, a
+    release): mark the fresh rollup stale AND start the rebuild now, rather than
+    waiting for the next read to notice. Readers in the meantime get the old copy
+    — the claim's own filter combo is served exact from the patched
+    _ELIGIBLE_CACHE entry, and the rebuild lands well inside that entry's 60s
+    life, so the operator never sees remaining bounce back up."""
+    _FRESH_ROLLUP["ts"] = 0.0
+    _schedule_rollup_rebuild(_FRESH_ROLLUP, fresh_only=True)
 
 
 def _totals_from_rollup(data, include=None, exclude=None) -> dict:
-    """Per-bucket totals for a country set from the rollup. include: sum of
-    matching locations; exclude: bucket total − matching sum."""
+    """Per-bucket counts for a country set from a rollup. include: sum of
+    matching locations; exclude: bucket total − matching sum; NEITHER: the
+    bucket's whole rolled-up count (the no-country-filter case, which the fresh
+    rollup uses to serve plain remaining). Serves both rollups — against the
+    totals rollup it yields all-statuses totals, against the fresh rollup the
+    claimable remaining."""
     sel = set(include or exclude or [])
     out: dict = {}
     for bid, locs in data.items():
@@ -373,18 +457,30 @@ async def bucket_eligible_counts(
             res = await s.execute(stmt)
             return {row[0]: int(row[1] or 0) for row in res}
 
-    counts_stmt = (
-        select(Contact.bucket_id, sa_func.count())
-        .where(*conds)
-        .group_by(Contact.bucket_id)
+    # Fresh-only (the panel's default "never" cutoff) with no employee filter is
+    # exactly the population the fresh rollup holds, so REMAINING is arithmetic
+    # over it — no scan at all, for any country set. Both-sides filtering is left
+    # to the live query: the rollup arithmetic applies one side only.
+    # (reuse_only is meaningless without a cutoff and is already ignored above;
+    # the member-overlap subtraction is provably zero in fresh-only mode.)
+    use_fresh_rollup = (
+        cutoff_ts is None and not emp_conds and not (country and country_exclude)
     )
+
+    counts_stmt = None
     counts_minus_stmt = None
-    if pure_exclude:
-        counts_minus_stmt = (
+    if not use_fresh_rollup:
+        counts_stmt = (
             select(Contact.bucket_id, sa_func.count())
-            .where(*conds, *minus_country_conds)
+            .where(*conds)
             .group_by(Contact.bucket_id)
         )
+        if pure_exclude:
+            counts_minus_stmt = (
+                select(Contact.bucket_id, sa_func.count())
+                .where(*conds, *minus_country_conds)
+                .group_by(Contact.bucket_id)
+            )
 
     # Contacts already members of the target webinar. Driven from the SMALL
     # membership side (one PK probe per member — zero/tiny for a freshly created
@@ -455,7 +551,7 @@ async def bucket_eligible_counts(
                 .group_by(Contact.bucket_id)
             )
 
-    tasks = [_grouped(counts_stmt)]
+    tasks = [] if counts_stmt is None else [_grouped(counts_stmt)]
     if counts_minus_stmt is not None:
         tasks.append(_grouped(counts_minus_stmt))
     if overlap_stmt is not None:
@@ -464,14 +560,20 @@ async def bucket_eligible_counts(
         tasks.append(_grouped(totals_stmt))
     if totals_minus_stmt is not None:
         tasks.append(_grouped(totals_minus_stmt))
-    results = await _gather_or_abandon(request, tasks)
+    results = await _gather_or_abandon(request, tasks) if tasks else []
     if results is None:
         # Client aborted (superseded filter change): the queries are cancelled and
         # there is nobody left to answer. 499 = client closed request.
         return Response(status_code=499)
 
-    counts = results[0]
-    idx = 1
+    if use_fresh_rollup:
+        counts = _totals_from_rollup(
+            await _fresh_rollup(), include=country, exclude=country_exclude,
+        )
+        idx = 0
+    else:
+        counts = results[0]
+        idx = 1
     if counts_minus_stmt is not None:
         for _bid, _cnt in results[idx].items():
             if _bid in counts:

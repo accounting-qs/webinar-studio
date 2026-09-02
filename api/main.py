@@ -16,15 +16,18 @@ async def lifespan(app: FastAPI):
     logger.info("Webinar Studio starting up")
     # Tables are managed by Alembic migrations — do not create_all here
 
-    # Pre-warm the (bucket × location) totals rollup in the background so the
-    # first country-filtered eligible request never pays the chunked build.
+    # Pre-warm the (bucket × location) rollups in the background so the first
+    # country-filtered eligible request never pays the chunked build. Both are
+    # needed: the totals rollup backs the assign panel's TOTAL column, the fresh
+    # rollup its REMAINING column.
     try:
         import asyncio as _a
 
-        from api.routers.outreach.buckets import _totals_rollup
+        from api.routers.outreach.buckets import _fresh_rollup, _totals_rollup
         app.state._rollup_prewarm = _a.create_task(_totals_rollup())
+        app.state._fresh_rollup_prewarm = _a.create_task(_fresh_rollup())
     except Exception:
-        logger.exception("totals-rollup prewarm failed to start (non-fatal)")
+        logger.exception("rollup prewarm failed to start (non-fatal)")
 
     # Resume in-flight imports orphaned by a backend restart. Each import worker
     # writes processed_rows to its upload row every batch, so we can skip the
