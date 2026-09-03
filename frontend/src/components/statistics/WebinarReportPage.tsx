@@ -136,8 +136,12 @@ const TD = "px-2.5 py-1.5 text-[13px] text-zinc-800 dark:text-zinc-200 border-b 
 
 /* ── payload constants ───────────────────────────────────────────────────── */
 
-const SCORECARD_ROWS: { label: string; key: string; fmt: Fmt }[] = [
-  { label: "Invited", key: "invited", fmt: "int" },
+const SCORECARD_ROWS: { label: string; key: string; fmt: Fmt; fallbackKey?: string }[] = [
+  // fallbackKey keeps reports frozen before the planned/actual split readable:
+  // their `invited` was the planned volume, and only the current column
+  // carried an `actuallyUsed`.
+  { label: "Planned invites", key: "plannedInvited", fmt: "int", fallbackKey: "invited" },
+  { label: "Actually invited", key: "actuallyInvited", fmt: "int", fallbackKey: "actuallyUsed" },
   { label: "Net-new registrations", key: "netNewRegs", fmt: "int" },
   { label: "Net-new reg rate", key: "regRate", fmt: "pct" },
   { label: "Non-joiner registrations", key: "nonjoinerRegs", fmt: "int" },
@@ -157,6 +161,15 @@ const FUNNEL_DIMS: { dim: string; title: string }[] = [
   { dim: "geography", title: "Geography" },
   { dim: "employeeSize", title: "Employee size" },
 ];
+
+function scoreVal(
+  side: Record<string, number | null> | null | undefined,
+  row: { key: string; fallbackKey?: string },
+): number | null {
+  const v = side?.[row.key];
+  if (v != null) return v;
+  return (row.fallbackKey ? side?.[row.fallbackKey] : null) ?? null;
+}
 
 type ReportPayload = NonNullable<ApiWebinarReport["payload"]>;
 
@@ -610,7 +623,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
           cur={cur.netNewRegs}
           all={all?.netNewRegs}
           w4={w4?.netNewRegs}
-          sub={`${fmtPct(cur.regRate)} of ${fmtInt(cur.invited)} invited`}
+          sub={`${fmtPct(cur.regRate)} of ${fmtInt(cur.invited)} actually invited`}
         />
         <HeroTile
           allLabel={`last-${all?.webinarCount ?? 10} avg`}
@@ -628,7 +641,7 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
           cur={cur.totalAttended}
           all={all?.totalAttended}
           w4={w4?.totalAttended}
-          sub={`${fmtPct(cur.attendRateOfRegs)} of regs · ${fmtR1(cur.attendPer10kInvited)} per 10k invited`}
+          sub={`${fmtPct(cur.attendRateOfRegs)} of regs · ${fmtR1(cur.attendPer10kInvited)} per 10k actually invited`}
         />
         <HeroTile
           allLabel={`last-${all?.webinarCount ?? 10} avg`}
@@ -664,9 +677,9 @@ function V2Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
             </thead>
             <tbody>
               {SCORECARD_ROWS.map((row, i) => {
-                const c = cur[row.key] ?? null;
-                const a = all?.[row.key] ?? null;
-                const b = w4?.[row.key] ?? null;
+                const c = scoreVal(cur, row);
+                const a = scoreVal(all, row);
+                const b = scoreVal(w4, row);
                 const zebra = i % 2 ? "bg-zinc-50/70 dark:bg-zinc-800/20" : "";
                 return (
                   <tr key={row.key} className={zebra}>
@@ -799,7 +812,7 @@ function V2FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
       <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-2.5">{title}</div>
       <div className="grid grid-cols-[minmax(160px,1.6fr)_repeat(5,minmax(78px,1fr))] gap-x-4 items-center">
         <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5">
-          {title} · invited
+          {title} · actually invited
         </div>
         <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1.5 text-right">
           Reg rate
@@ -831,7 +844,12 @@ function V2FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
               <div className="py-1.5 border-t border-zinc-100 dark:border-zinc-800 min-w-0">
                 <div className="flex justify-between gap-2">
                   <span className="text-[13px] text-zinc-800 dark:text-zinc-200 truncate">{cell.key}</span>
-                  <span className="text-[12px] text-zinc-400 tabular-nums shrink-0">{fmtInt(c.invited)}</span>
+                  <span
+                    title={`${fmtInt(c.actuallyInvited ?? c.invited)} actually invited of ${fmtInt(c.plannedInvited)} planned`}
+                    className="text-[12px] text-zinc-400 tabular-nums shrink-0"
+                  >
+                    {fmtInt(c.invited)}
+                  </span>
                 </div>
                 <div className="h-1 mt-1 bg-zinc-100 dark:bg-zinc-800 rounded-full">
                   <div className="h-1 bg-violet-500 rounded-full" style={{ width: `${pct}%` }} />
@@ -1035,9 +1053,9 @@ function V1Body({ payload, report }: { payload: ReportPayload; report: ApiWebina
             </thead>
             <tbody>
               {SCORECARD_ROWS.map((row) => {
-                const cur = payload.scorecard.current?.[row.key] ?? null;
-                const all = payload.scorecard.baselineAll?.[row.key] ?? null;
-                const w4 = payload.scorecard.baseline4w?.[row.key] ?? null;
+                const cur = scoreVal(payload.scorecard.current, row);
+                const all = scoreVal(payload.scorecard.baselineAll, row);
+                const w4 = scoreVal(payload.scorecard.baseline4w, row);
                 return (
                   <tr key={row.key}>
                     <td className={`${TD} text-zinc-500`}>{row.label}</td>
@@ -1141,7 +1159,10 @@ function V1FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
           <thead>
             <tr>
               <th className={TH}>{title}</th>
-              <th className={TH}>Invited</th>
+              <th className={TH} title="Contacts actually marked sent — the denominator for every rate in this row">
+                Invited (actual)
+              </th>
+              <th className={TH}>Planned</th>
               <th className={TH}>Reg rate</th>
               <th className={TH}>Att % of regs</th>
               <th className={TH}>Att / 10k inv</th>
@@ -1163,6 +1184,7 @@ function V1FunnelCard({ title, cells }: { title: string; cells: WebinarReportFun
                     </div>
                   </td>
                   <td className={TD}>{fmtInt(c.invited)}</td>
+                  <td className={`${TD} text-zinc-500`}>{fmtInt(c.plannedInvited)}</td>
                   <td className={TD}>
                     {fmtPct(c.regRate)} <Delta cur={c.regRate} base={b.regRate} fmt="pct" />
                   </td>

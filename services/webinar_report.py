@@ -268,7 +268,8 @@ async def resolve_latest_passed_webinar_id() -> str | None:
 # ---------------------------------------------------------------------------
 
 _SCORECARD_SUM_KEYS = (
-    "invited", "totalRegs", "netNewRegs", "nonjoinerRegs", "noListDataRegs",
+    "invited", "plannedInvited", "actuallyInvited",
+    "totalRegs", "netNewRegs", "nonjoinerRegs", "noListDataRegs",
     "yesMarked", "maybeMarked", "totalAttended", "total10MinPlus",
     "uniqueBookers",
 )
@@ -288,8 +289,18 @@ def _snapshot_counts(payload: dict[str, Any]) -> dict[str, float]:
         elif kind == "no_list_data":
             nld += int(metrics.get("totalRegs") or 0)
     total = int(summary.get("totalRegs") or 0)
+    planned = int(summary.get("invited") or 0)
+    actual = int(summary.get("actuallyUsed") or 0)
     return {
-        "invited": int(summary.get("invited") or 0),
+        # Planned = the volume the lists were built for; actual = contacts
+        # really marked sent (released ones excluded).
+        "plannedInvited": planned,
+        "actuallyInvited": actual,
+        # Every rate in this report divides by `invited` = the actually-sent
+        # volume, falling back to planned when nothing was ever marked used
+        # (legacy webinars) — same rule as the Statistics page, see
+        # services.statistics.compute_derived_metrics.
+        "invited": actual or planned,
         "totalRegs": total,
         "netNewRegs": max(total - nj - nld, 0),
         "nonjoinerRegs": nj,
@@ -367,7 +378,8 @@ _DIM_ORDER = ("employeeSize", "industry", "geography", "segments")
 async def _funnel_scope(wids: list[str]) -> dict[str, dict[str, dict[str, int]]]:
     """One scope (current webinar OR pooled baseline): invited + WG funnel per
     dimension value, all four dimensions in one GROUPING SETS pass per stage.
-    Returns {dimension: {label: {invited, regs, attended, att10}}}."""
+    Returns {dimension: {label: {invited, plannedInvited, actuallyInvited,
+    regs, attended, att10}}}."""
     from sqlalchemy import text as sa_text
     from db.session import AsyncSessionLocal
 
@@ -389,20 +401,47 @@ async def _funnel_scope(wids: list[str]) -> dict[str, dict[str, dict[str, int]]]
                     slot[key] = slot.get(key, 0) + int(m[col] or 0)
                 break
 
-    # Stage 1: invited (the heavy membership scan).
+    # Stage 1: invited (the heavy membership scan). Counted twice: the planned
+    # membership volume, and the volume actually sent (status='used'). Webinars
+    # that never marked anything used (legacy / imported) have no actual signal,
+    # so their whole membership counts as sent — the per-webinar equivalent of
+    # the scorecard's planned fallback. Without that, pooling a mix of marked
+    # and unmarked baseline webinars would silently zero the unmarked ones.
+    async with AsyncSessionLocal() as db:
+        await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
+        marked = {str(r[0]).lower() for r in (await db.execute(sa_text("""
+            SELECT DISTINCT webinar_id FROM webinar_contact_memberships
+            WHERE webinar_id = ANY(CAST(:wids AS uuid[])) AND status = 'used'
+        """).bindparams(wids=wids))).all()}
+    legacy = [w for w in wids if str(w).lower() not in marked]
+    # Bind :legacy only when non-empty — an empty array literal has no type
+    # for the driver to infer.
+    legacy_clause = " OR m.webinar_id = ANY(CAST(:legacy AS uuid[]))" if legacy else ""
+
     async with AsyncSessionLocal() as db:
         await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
         await db.execute(sa_text("SET LOCAL random_page_cost = 8"))
         await db.execute(sa_text("SET LOCAL work_mem = '256MB'"))
         r = await db.execute(sa_text(f"""
-            SELECT {dim_cols}, COUNT(DISTINCT LOWER(c.email)) AS invited
+            SELECT {dim_cols},
+                COUNT(DISTINCT LOWER(c.email)) AS planned_invited,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (
+                    WHERE m.status = 'used'
+                ) AS actually_invited,
+                COUNT(DISTINCT LOWER(c.email)) FILTER (
+                    WHERE m.status = 'used'{legacy_clause}
+                ) AS effective_invited
             FROM contacts c
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             WHERE m.webinar_id = ANY(CAST(:wids AS uuid[])) AND {_COLD}
             GROUP BY GROUPING SETS ({sets})
-        """).bindparams(wids=wids))
-        _absorb(r.all(), {"invited": "invited"})
+        """).bindparams(wids=wids, **({"legacy": legacy} if legacy else {})))
+        _absorb(r.all(), {
+            "planned_invited": "plannedInvited",
+            "actually_invited": "actuallyInvited",
+            "effective_invited": "invited",
+        })
 
     # Stage 2: WebinarGeek regs / attendance (small inner join — fast).
     async with AsyncSessionLocal() as db:
@@ -515,6 +554,8 @@ def _funnel_cells(
     """Merge current + baseline per label into report cells."""
     def shape(m: dict[str, int], divisor: int = 1) -> dict[str, Any]:
         inv = m.get("invited", 0)
+        planned_inv = m.get("plannedInvited", 0)
+        actual_inv = m.get("actuallyInvited", 0)
         regs = m.get("regs", 0)
         att = m.get("attended", 0)
         books = m.get("bookings", 0)
@@ -523,6 +564,8 @@ def _funnel_cells(
         qualified = m.get("qualified", 0)
         return {
             "invited": round(inv / divisor, 1) if divisor > 1 else inv,
+            "plannedInvited": round(planned_inv / divisor, 1) if divisor > 1 else planned_inv,
+            "actuallyInvited": round(actual_inv / divisor, 1) if divisor > 1 else actual_inv,
             "regs": round(regs / divisor, 1) if divisor > 1 else regs,
             "regRate": _rate(regs, inv),
             "attPctOfRegs": _rate(att, regs),
@@ -759,11 +802,27 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
 
     total_regs = len(regs) or my_counts["totalRegs"]
     total_att = sum(c["attended"] for c in cohort_counts.values()) or my_counts["totalAttended"]
+    # Rate denominator = what we actually sent, not what we planned to.
     invited = my_counts["invited"]
+    planned_invited = my_counts["plannedInvited"]
+    actual_invited = my_counts["actuallyInvited"]
+    if not actual_invited and planned_invited:
+        caveats.append(
+            "No contacts are marked sent for this webinar — every rate below "
+            f"divides by the planned volume ({planned_invited:,}) instead."
+        )
+    elif actual_invited and planned_invited > actual_invited * 1.05:
+        caveats.append(
+            f"{planned_invited - actual_invited:,} of {planned_invited:,} planned "
+            f"invites were never sent ({(planned_invited - actual_invited) / planned_invited:.0%} "
+            f"released or unused); rates divide by the {actual_invited:,} actually invited."
+        )
 
     current_scorecard: dict[str, Any] = {
+        "plannedInvited": planned_invited,
+        "actuallyInvited": actual_invited,
+        # Kept as the denominator every rate in this payload was built from.
         "invited": invited,
-        "actuallyUsed": summary.get("actuallyUsed"),
         "totalRegs": total_regs,
         "netNewRegs": cohort_counts["netNew"]["regs"] or my_counts["netNewRegs"],
         "nonjoinerRegs": cohort_counts["nonjoiner"]["regs"] or my_counts["nonjoinerRegs"],
@@ -884,6 +943,7 @@ async def build_report_payload(webinar_id: str) -> dict[str, Any]:
 
     # -- Standing caveats --------------------------------------------------
     caveats.extend([
+        "Planned invites = the volume the webinar's lists were built for; actually invited = contacts marked sent (released or unused ones excluded). Every rate here divides by actually invited, falling back to planned only when a webinar has nothing marked sent.",
         "Bookings = unique booked contacts from the booking-attribution layer (a rebooked contact counts once); the stats page's Sales columns use GHL opportunity counting and can differ.",
         f"Non-joiners = registrants of the last {NONJOINER_WINDOW} aired webinars whose most recent registration in that window was a no-show (live, replay or any viewing minutes count as joining). Re-registering restarts the {NONJOINER_WINDOW}-invite budget; blocklisted, unsubscribed, already-planned and converted contacts (booked / won / disqualified) are removed permanently.",
         "Registration/attendance counted as distinct emails per broadcast; WebinarGeek parent totals can differ by ~1–3%.",
@@ -927,6 +987,10 @@ Write the insights section of the report. Rules:
 - 4 to 7 insight groups, 1–3 bullets each. Plain factual language.
 - Every bullet must cite at least one concrete number from the data.
 - Compare against the averages, not just directionally: say by how much.
+- Invite volume has two numbers: plannedInvited and actuallyInvited. Every
+  rate is already computed against actuallyInvited — cite that one when you
+  quote a denominator, and mention the planned figure only when the gap
+  between the two is itself the story.
 - Distinguish mix shifts from rate shifts when the funnels support it.
 - Flag small samples explicitly (e.g. "only N rated calls") instead of
   drawing confident conclusions from them.

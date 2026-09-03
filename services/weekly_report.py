@@ -1211,8 +1211,12 @@ def _report_scorecard_card(payload: dict[str, Any]) -> str:
     ball = sc.get("baselineAll") or {}
     b4w = sc.get("baseline4w") or {}
 
+    # Third element of the tuple is a fallback key for reports frozen before
+    # the planned/actual split: their `invited` was the planned volume, and
+    # only the current column carried an `actuallyUsed`.
     rows_spec = [
-        ("Invited", "invited", "int"),
+        ("Planned invites", "plannedInvited", "int", "invited"),
+        ("Actually invited", "actuallyInvited", "int", "actuallyUsed"),
         ("Net-new registrations", "netNewRegs", "int"),
         ("Net-new reg rate", "regRate", "pct"),
         ("Non-joiner registrations", "nonjoinerRegs", "int"),
@@ -1225,16 +1229,23 @@ def _report_scorecard_card(payload: dict[str, Any]) -> str:
         ("Attendees / 10k invited", "attendPer10kInvited", "ratio"),
         ("Booked contacts", "uniqueBookers", "int"),
     ]
+    def pick(side: dict[str, Any], key: str, fallback: str | None) -> Any:
+        v = side.get(key)
+        return side.get(fallback) if v is None and fallback else v
+
     rows = []
-    for label, key, fmt in rows_spec:
-        c = cur.get(key)
+    for label, key, fmt, *rest in rows_spec:
+        fallback = rest[0] if rest else None
+        c = pick(cur, key, fallback)
+        a = pick(ball, key, fallback)
+        b = pick(b4w, key, fallback)
         rows.append([
             label,
             f"<b>{_fmt(c, fmt)}</b>",
-            _fmt(ball.get(key), fmt),
-            _fmt_delta(c, ball.get(key), fmt, key),
-            _fmt(b4w.get(key), fmt),
-            _fmt_delta(c, b4w.get(key), fmt, key),
+            _fmt(a, fmt),
+            _fmt_delta(c, a, fmt, key),
+            _fmt(b, fmt),
+            _fmt_delta(c, b, fmt, key),
         ])
     n_all = ball.get("webinarCount") or 0
     n_4w = b4w.get("webinarCount") or 0
@@ -1266,6 +1277,7 @@ def _report_funnel_cards(payload: dict[str, Any]) -> str:
             rows.append([
                 _esc(str(cell.get("key"))[:38]),
                 _int(c.get("invited")),
+                _int(c.get("plannedInvited")),
                 f"{_pct(c.get('regRate'))} {_fmt_delta(c.get('regRate'), b.get('regRate'), 'pct')}",
                 f"{_pct(c.get('attPctOfRegs'))} {_fmt_delta(c.get('attPctOfRegs'), b.get('attPctOfRegs'), 'pct')}",
                 f"{_r1(c.get('attendeesPer10kInv'))} {_fmt_delta(c.get('attendeesPer10kInv'), b.get('attendeesPer10kInv'), 'ratio')}",
@@ -1274,7 +1286,7 @@ def _report_funnel_cards(payload: dict[str, Any]) -> str:
             _eyebrow(titles[dim], _BLUE)
             + f"<div style='font-size:11px;color:{_MUTED};margin:-6px 0 10px 0'>Δ vs the last-{block.get('baselineWebinarCount') or 0}-webinar average</div>"
             + _scroll(_table(
-                [titles[dim], "Invited", "Reg rate", "Att % of regs", "Att / 10k inv"],
+                [titles[dim], "Invited", "Planned", "Reg rate", "Att % of regs", "Att / 10k inv"],
                 rows,
             ))
         ))

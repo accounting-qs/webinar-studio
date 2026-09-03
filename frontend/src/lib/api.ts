@@ -1776,7 +1776,14 @@ export async function fetchStatisticsWebinar(
 /* ── Per-webinar report (frozen artifact + AI insights) ──────────────────── */
 
 export interface WebinarReportFunnelCellSide {
+  /** Rate denominator: contacts actually marked sent, falling back to the
+   * planned volume for webinars that never marked anything used. */
   invited: number | null;
+  /** Planned membership volume (absent on reports generated before the
+   * planned/actual split shipped — render as "—"). */
+  plannedInvited?: number | null;
+  /** Contacts marked sent. */
+  actuallyInvited?: number | null;
   regs: number | null;
   regRate: number | null;
   attPctOfRegs: number | null;
