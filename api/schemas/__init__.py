@@ -157,6 +157,11 @@ class AssignRequest(BaseModel):
     # With a cutoff: claim ONLY previously-invited contacts past the cutoff,
     # excluding fresh (never-invited) ones. Ignored for "never"/fresh-only.
     reuse_only: bool = False
+    # Invite cap ("Invited less than X" on the Planning assign panel): only
+    # contacts invited FEWER than `max_invited` times are eligible — exclusive,
+    # so 3 means at most 2 prior invites. None = no cap. Ignored without a reuse
+    # cutoff (fresh contacts have 0 invites, so the cap can't bite there).
+    max_invited: int | None = Field(None, ge=1)
 
 class AssignmentUpdate(BaseModel):
     title_copy_id: str | None = None

@@ -998,6 +998,12 @@ export function PlanningPage() {
   // With a cutoff: claim ONLY previously-invited contacts (exclude fresh).
   // Meaningless for "never" (would be empty), so the checkbox is hidden there.
   const [assignReuseOnly, setAssignReuseOnly] = useState(false);
+  // Invite cap: only contacts invited FEWER than this many times are eligible
+  // (exclusive — "3x" = at most 2 prior invites). "" = no cap; "custom" swaps in
+  // the number input beside it. Meaningless for "never" (fresh contacts have 0
+  // invites), so the whole control is hidden there — same rule as reuse_only.
+  const [assignMaxInvited, setAssignMaxInvited] = useState<string>("");
+  const [assignMaxInvitedCustom, setAssignMaxInvitedCustom] = useState<number | "">("");
   // null = no eligible map loaded for the current filter (falls back to the
   // stored fresh baseline). When loaded, buckets ABSENT from the map have zero
   // eligible contacts and must show 0 — not their fresh baseline.
@@ -1019,6 +1025,22 @@ export function PlanningPage() {
     const t = setTimeout(() => { setDebEmpMin(assignFilterEmpMin); setDebEmpMax(assignFilterEmpMax); }, 400);
     return () => clearTimeout(t);
   }, [assignFilterEmpMin, assignFilterEmpMax]);
+
+  // The invite cap actually sent: undefined (no cap) unless a reuse cutoff is
+  // open — the backend ignores it for fresh-only, and sending it anyway would
+  // fragment its 60s per-filter-combo cache for no change in the numbers.
+  const assignMaxInvitedValue = useMemo<number | undefined>(() => {
+    if (assignReuseCutoff === "never" || !assignMaxInvited) return undefined;
+    const n = assignMaxInvited === "custom" ? assignMaxInvitedCustom : parseInt(assignMaxInvited);
+    return typeof n === "number" && n >= 1 ? n : undefined;
+  }, [assignReuseCutoff, assignMaxInvited, assignMaxInvitedCustom]);
+  // Debounced mirror, for the same reason as the employee inputs: typing "10"
+  // into the custom box would otherwise fire a count fetch for 1 and then 10.
+  const [debMaxInvited, setDebMaxInvited] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    const t = setTimeout(() => setDebMaxInvited(assignMaxInvitedValue), 400);
+    return () => clearTimeout(t);
+  }, [assignMaxInvitedValue]);
   // Bumped after an assign so the reuse-aware remaining refetches.
   const [eligibleRefresh, setEligibleRefresh] = useState(0);
   const [assignAccounts, setAssignAccounts] = useState(0);
@@ -1081,11 +1103,12 @@ export function PlanningPage() {
       country_exclude: assignCountryMode === "exclude" && assignFilterCountries.length ? assignFilterCountries : undefined,
       emp_min: debEmpMin === "" ? undefined : debEmpMin,
       emp_max: debEmpMax === "" ? undefined : debEmpMax,
+      max_invited: debMaxInvited,
     }, ctrl.signal)
       .then((m) => { if (!cancelled) { setAssignEligible(m.remaining); setAssignEligibleTotals(m.totals); setAssignEligibleLoading(false); } })
       .catch(() => { if (!cancelled) { setAssignEligible(null); setAssignEligibleTotals(null); setAssignEligibleLoading(false); } });
     return () => { cancelled = true; ctrl.abort(); };
-  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignCountryMode, debEmpMin, debEmpMax, eligibleRefresh]);
+  }, [activeAssignWebinarId, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignFilterCountries, assignCountryMode, debEmpMin, debEmpMax, debMaxInvited, eligibleRefresh]);
 
   // Reuse-aware remaining for a bucket. When the eligible map is loaded, a
   // bucket ABSENT from it has zero eligible contacts under the current filter —
@@ -1212,7 +1235,7 @@ export function PlanningPage() {
   const volumeTouchedRef = useRef(false);
   useEffect(() => {
     volumeTouchedRef.current = false;
-  }, [assignBucket, assignSender, assignSendPerAcct, assignDays, assignFilterEmpMin, assignFilterEmpMax, assignFilterCountries, assignCountryMode, activeAssignWebinarId]);
+  }, [assignBucket, assignSender, assignSendPerAcct, assignDays, assignFilterEmpMin, assignFilterEmpMax, assignFilterCountries, assignCountryMode, assignMaxInvitedValue, activeAssignWebinarId]);
 
   // Keep the CONTACTS (volume) in sync with the selected bucket's FILTERED
   // remaining — capped by the chosen sender's capacity — whenever the filters or
@@ -1261,6 +1284,8 @@ export function PlanningPage() {
       setAssignReuseCutoff("never");
       setAssignReuseBefore("");
       setAssignReuseOnly(false);
+      setAssignMaxInvited("");
+      setAssignMaxInvitedCustom("");
       setAssignEligible(null);
       setAssignFilterCountries([]);
       setAssignCountryMode("include");
@@ -1600,6 +1625,7 @@ export function PlanningPage() {
         reuse_cutoff: assignReuseCutoff === "custom" ? undefined : assignReuseCutoff,
         reuse_before: assignReuseCutoff === "custom" ? (assignReuseBefore || undefined) : undefined,
         reuse_only: assignReuseCutoff !== "never" && assignReuseOnly,
+        max_invited: assignMaxInvitedValue,
       };
     }
 
@@ -1654,7 +1680,7 @@ export function PlanningPage() {
       assignInFlightRef.current = null;
       setAssignInFlight(null);
     }
-  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, assignAccounts, assignSendPerAcct, assignDays, buckets, senders, assignReuseCutoff, assignReuseBefore, assignReuseOnly, bucketRemaining]);
+  }, [assignBucket, assignCustomList, assignTab, assignSender, assignVolume, assigningWebinarId, assignCountries, assignEmpRange, assignFilterCountries, assignFilterEmpMin, assignFilterEmpMax, assignAccounts, assignSendPerAcct, assignDays, buckets, senders, assignReuseCutoff, assignReuseBefore, assignReuseOnly, assignMaxInvitedValue, bucketRemaining]);
 
   const handleToggleSetup = useCallback(async (listId: string, webinarId: string, currentValue: boolean) => {
     const newValue = !currentValue;
@@ -2568,7 +2594,10 @@ export function PlanningPage() {
                               default, or also those last invited before the cutoff.
                               Bucket TOTAL is unchanged; only "remaining" reflects this. */}
                           {assignTab === "buckets" && (
-                            <div className="flex items-end gap-3 mb-2">
+                            // flex-wrap: the row can now carry cutoff + date + invite
+                            // cap + custom count + checkbox, which overflows a narrow
+                            // window on one line.
+                            <div className="flex items-end gap-3 mb-2 flex-wrap">
                               <div className="w-72">
                                 <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Contacts to include</label>
                                 <Dropdown
@@ -2597,6 +2626,41 @@ export function PlanningPage() {
                                   />
                                 </div>
                               )}
+                              {/* Invite cap — how many times a contact may already
+                                  have been invited. Hidden for "Fresh only" for the
+                                  same reason as the checkbox below: every fresh
+                                  contact has 0 invites, so no cap can bite there. */}
+                              {assignReuseCutoff !== "never" && (
+                                <div className="w-40">
+                                  <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Invited less than</label>
+                                  <Dropdown
+                                    value={assignMaxInvited}
+                                    onChange={setAssignMaxInvited}
+                                    options={[
+                                      { value: "", label: "No limit" },
+                                      { value: "1", label: "1x" },
+                                      { value: "2", label: "2x" },
+                                      { value: "3", label: "3x" },
+                                      { value: "5", label: "5x" },
+                                      { value: "10", label: "10x" },
+                                      { value: "custom", label: "Custom…" },
+                                    ]}
+                                  />
+                                </div>
+                              )}
+                              {assignReuseCutoff !== "never" && assignMaxInvited === "custom" && (
+                                <div className="w-24">
+                                  <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Times</label>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    placeholder="e.g. 4"
+                                    value={assignMaxInvitedCustom}
+                                    onChange={(e) => setAssignMaxInvitedCustom(e.target.value === "" ? "" : Math.max(1, parseInt(e.target.value) || 1))}
+                                    className="w-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-md px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 font-mono focus:outline-none focus:ring-1 focus:ring-violet-500"
+                                  />
+                                </div>
+                              )}
                               {assignReuseCutoff !== "never" && (
                                 <label className="flex items-center gap-1.5 mb-1.5 cursor-pointer select-none">
                                   <input
@@ -2614,6 +2678,17 @@ export function PlanningPage() {
                                   : assignReuseOnly
                                     ? "Only contacts invited past the cutoff — fresh excluded"
                                     : "Fresh + previously-invited contacts past the cutoff"}
+                                {assignMaxInvitedValue !== undefined && (
+                                  assignMaxInvitedValue === 1
+                                    // "Previously invited only" + "fewer than 1 invite" is
+                                    // the empty set by definition — say so rather than
+                                    // letting the operator wonder why remaining is 0.
+                                    ? (assignReuseOnly
+                                        ? " · previously-invited only with 0 prior invites — no contacts will match"
+                                        : " · capped to contacts never invited")
+                                    : ` · capped to ${assignMaxInvitedValue - 1} prior invite${assignMaxInvitedValue === 2 ? "" : "s"} or fewer`
+                                )}
+                                {assignReuseCutoff !== "never" && assignMaxInvited === "custom" && assignMaxInvitedCustom === "" && " · enter a number to apply the cap"}
                               </span>
                             </div>
                           )}

@@ -20,7 +20,8 @@ from api.routers.outreach._helpers import (
     LLOYD_USER_ID, assignment_dict, claimable_conditions,
     compute_blocklist_counts_per_assignment, compute_blocklist_counts_per_bucket,
     copy_dict, country_filter_conditions, employee_count_filter,
-    recompute_contact_caches, reconcile_legacy_slots, reuse_cutoff_to_ts, webinar_dict,
+    invite_count_filter, recompute_contact_caches, reconcile_legacy_slots,
+    reuse_cutoff_to_ts, webinar_dict,
 )
 from api.schemas import WebinarCreate, WebinarUpdate, AssignRequest, AssignmentUpdate
 from db.models import (
@@ -416,6 +417,13 @@ async def assign_bucket(
         getattr(body, "emp_min", None), getattr(body, "emp_max", None)
     )
 
+    # Invite cap ("invited less than X times") — only contacts with fewer than
+    # `max_invited` prior invites are eligible. Applied identically to the
+    # availability counts and the claim (and to /buckets/eligible), so the
+    # remaining the panel showed is what actually gets claimed. Inert without a
+    # reuse cutoff: fresh contacts have times_invited = 0 by construction.
+    invite_filter = invite_count_filter(getattr(body, "max_invited", None), cutoff_ts)
+
     if is_custom_list:
         # Validate custom list upload
         from db.models import UploadHistory
@@ -441,6 +449,7 @@ async def assign_bucket(
             *claimable_count_conds,
             *country_filter,
             *emp_filter,
+            *invite_filter,
         )
         available_count = await _available_count(*_src_conds)
         desc_str = upload.custom_list_name or upload.file_name
@@ -492,6 +501,7 @@ async def assign_bucket(
             *claimable_count_conds,
             *country_filter,
             *emp_filter,
+            *invite_filter,
         )
         available_count = await _available_count(*_src_conds)
 
@@ -539,6 +549,8 @@ async def assign_bucket(
         else:
             _rlabel = body.reuse_cutoff or "reuse"
         _fbits.append(f"reused-only {_rlabel}" if getattr(body, "reuse_only", False) else f"reuse {_rlabel}")
+    if invite_filter:
+        _fbits.append(f"<{body.max_invited}x invited")
     if _fbits:
         desc_str = f"{desc_str} · " + " · ".join(_fbits)
 
@@ -603,6 +615,7 @@ async def assign_bucket(
             not_blocklisted,
             *country_filter,
             *emp_filter,
+            *invite_filter,
         )
     else:
         base_claim_where = (
@@ -611,6 +624,7 @@ async def assign_bucket(
             not_blocklisted,
             *country_filter,
             *emp_filter,
+            *invite_filter,
         )
 
     membership_source_bucket = body.bucket_id if not is_custom_list else None
@@ -912,6 +926,7 @@ async def assign_bucket(
         country_exclude=getattr(body, "filter_countries_exclude", None),
         emp_min=getattr(body, "emp_min", None),
         emp_max=getattr(body, "emp_max", None),
+        max_invited=getattr(body, "max_invited", None),
     )
     return resp
 

@@ -19,7 +19,7 @@ from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, NO_LOCATION_SENTINEL, bucket_dict, claimable_conditions,
     compute_blocklist_counts_per_bucket, copy_dict, country_filter_conditions,
-    employee_count_filter, reuse_cutoff_to_ts,
+    employee_count_filter, invite_count_filter, reuse_cutoff_to_ts,
 )
 from api.schemas import (
     BucketCreate, BucketMergeRequest, BucketUpdate, CopyBulkGenerateRequest,
@@ -122,7 +122,7 @@ def invalidate_eligible_cache() -> None:
 
 def patch_eligible_cache_after_claim(
     bucket_id, claimed: int, *, reuse_cutoff, reuse_before, reuse_only,
-    webinar_id, country, country_exclude, emp_min, emp_max,
+    webinar_id, country, country_exclude, emp_min, emp_max, max_invited,
 ) -> None:
     """Exact-patch instead of a blanket clear after an assign: every claimed
     contact matched the claim's own filter combo, so under THAT combo the
@@ -134,7 +134,7 @@ def patch_eligible_cache_after_claim(
         reuse_cutoff, reuse_before, reuse_only, webinar_id,
         tuple(sorted(country)) if country else None,
         tuple(sorted(country_exclude)) if country_exclude else None,
-        emp_min, emp_max,
+        emp_min, emp_max, max_invited,
     )
     # The claim moved contacts OUT of the claimable pool — the fresh rollup that
     # serves the fresh-only counts no longer reflects it. Marking it stale here
@@ -395,6 +395,7 @@ async def bucket_eligible_counts(
     country_exclude: list[str] | None = Query(None),
     emp_min: int | None = Query(None),
     emp_max: int | None = Query(None),
+    max_invited: int | None = Query(None, ge=1),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(require_auth),
 ):
@@ -404,8 +405,9 @@ async def bucket_eligible_counts(
     bucket TOTAL is unchanged, but REMAINING reflects the reuse cutoff. Uses the
     exact same predicate the claim uses (via `claimable_conditions`) so the number
     ties out to what an assign would actually grab. Blocklisted contacts are
-    excluded; `country` and `emp_min`/`emp_max` mirror the assign-form country and
-    employee-count filters so the shown remaining matches what a claim would grab.
+    excluded; `country`, `emp_min`/`emp_max` and `max_invited` mirror the assign-form
+    country, employee-count and invite-cap filters so the shown remaining matches
+    what a claim would grab.
     """
     from datetime import date as _date
 
@@ -425,7 +427,7 @@ async def bucket_eligible_counts(
         reuse_cutoff, reuse_before, reuse_only, webinar_id,
         tuple(sorted(country)) if country else None,
         tuple(sorted(country_exclude)) if country_exclude else None,
-        emp_min, emp_max,
+        emp_min, emp_max, max_invited,
     )
     hit = _ELIGIBLE_CACHE.get(cache_key)
     if hit and (_time.monotonic() - hit[0]) < _ELIGIBLE_TTL:
@@ -457,6 +459,11 @@ async def bucket_eligible_counts(
         minus_country_conds = None
         overlap_country_conds = country_conds
     emp_conds = employee_count_filter(emp_min, emp_max)
+    # Invite cap ("invited less than X times"). Empty without a reuse cutoff —
+    # the fresh-only pool is times_invited = 0 by construction, so the cap can
+    # only bite once previously-invited contacts are let back in. That is what
+    # keeps the fresh-rollup fast path below valid with a cap set.
+    invite_conds = invite_count_filter(max_invited, cutoff_ts)
 
     conds = [
         Contact.user_id == LLOYD_USER_ID,
@@ -468,6 +475,7 @@ async def bucket_eligible_counts(
     ]
     conds.extend(country_conds)
     conds.extend(emp_conds)
+    conds.extend(invite_conds)
 
     # The 1-3 aggregates below are independent — run them CONCURRENTLY on their
     # own pooled connections (they ran sequentially before; with filters active
@@ -532,6 +540,7 @@ async def bucket_eligible_counts(
         ]
         overlap_conds.extend(overlap_country_conds)
         overlap_conds.extend(emp_conds)
+        overlap_conds.extend(invite_conds)
         overlap_stmt = (
             select(Contact.bucket_id, sa_func.count())
             .select_from(WebinarContactMembership)

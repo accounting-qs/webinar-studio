@@ -226,6 +226,33 @@ def employee_count_filter(emp_min=None, emp_max=None):
     return conds
 
 
+def invite_count_filter(max_invited=None, cutoff_ts=None):
+    """WHERE predicates (list) for the "invited fewer than X times" cap.
+
+    `max_invited` is exclusive — the Planning control reads "Invited less than
+    3x", so a contact qualifies while `times_invited < 3` (i.e. at most 2 prior
+    invites). `times_invited` is the denormalized count of 'used' memberships
+    maintained by `recompute_contact_caches`, so this is a per-contact lifetime
+    invite count, not a per-webinar one.
+
+    INERT without a reuse cutoff (`cutoff_ts is None`), and deliberately so: the
+    fresh-only pool is `last_invited_at IS NULL`, which is exactly
+    `times_invited = 0`, so any cap ≥ 1 matches every row in it. Skipping the
+    predicate there keeps fresh-only counts on their rollup/index-only fast paths
+    and keeps the eligible count and the claim byte-identical to the pre-cap
+    behavior. The Planning UI hides the control for "Fresh only" to match.
+
+    Applied identically to /buckets/eligible and the claim so the shown remaining
+    ties out to what an assign actually grabs. `times_invited` rides in
+    ix_contacts_claim_cover's INCLUDE payload (migration 078) so the candidate
+    scan stays index-only — without it every examined row costs a random heap
+    read (see migration 072).
+    """
+    if max_invited is None or cutoff_ts is None:
+        return []
+    return [Contact.times_invited < max_invited]
+
+
 async def reconcile_legacy_slots(db: AsyncSession, contact_ids: list[str]) -> None:
     """Reset the legacy single-slot columns to 'available' for contacts that no
     longer hold ANY membership (times_invited=0 and assigned_membership_count=0

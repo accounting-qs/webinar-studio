@@ -804,6 +804,7 @@ export async function assignBucketToWebinar(
     reuse_cutoff?: string;
     reuse_before?: string;
     reuse_only?: boolean;
+    max_invited?: number;
   }
 ): Promise<ApiAssignment> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}/assign`, {
@@ -850,7 +851,7 @@ export async function fetchAssignCountries(
  *  uses the static bucket.total_contacts). Both reflect the country/employee
  *  filters; remaining also reflects the reuse cutoff. */
 export async function fetchBucketEligible(
-  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[]; country_exclude?: string[]; emp_min?: number; emp_max?: number },
+  params: { reuse_cutoff?: string; reuse_before?: string; reuse_only?: boolean; webinar_id?: string; country?: string[]; country_exclude?: string[]; emp_min?: number; emp_max?: number; max_invited?: number },
   signal?: AbortSignal,
 ): Promise<{ remaining: Record<string, number>; totals: Record<string, number> }> {
   const qs = new URLSearchParams();
@@ -862,6 +863,7 @@ export async function fetchBucketEligible(
   for (const c of params.country_exclude ?? []) qs.append("country_exclude", c);
   if (params.emp_min != null) qs.set("emp_min", String(params.emp_min));
   if (params.emp_max != null) qs.set("emp_max", String(params.emp_max));
+  if (params.max_invited != null) qs.set("max_invited", String(params.max_invited));
   const res = await fetch(`${API_URL}/outreach/buckets/eligible?${qs.toString()}`, {
     headers: jsonHeaders(),
     signal,
