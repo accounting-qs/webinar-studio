@@ -26,18 +26,16 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, func as sa_func, insert, select, update
+from sqlalchemy import delete, insert, select, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
-    LLOYD_USER_ID, recompute_contact_caches, reconcile_bucket_remaining,
-    reconcile_legacy_slots,
+    LLOYD_USER_ID, reconcile_bucket_remaining, release_contact_slots,
 )
 from api.routers.outreach.webinars import _is_retryable_db_error
 from db.models import (
-    Contact, ContactReleaseLog, Webinar,
-    WebinarContactMembership, WebinarListAssignment,
+    Contact, ContactReleaseLog, Webinar, WebinarContactMembership,
 )
 from db.session import AsyncSessionLocal, get_db
 
@@ -94,11 +92,25 @@ def _chunked(seq: list, size: int):
 # frozen progress bar and "released 0".
 #
 # Emails per committed transaction inside the job. Each chunk is independently
-# committed, so a failure only costs the chunk in flight. Sized generously
-# because the per-chunk cost is dominated by fixed work (the bucket recount),
-# not by the emails themselves — the individual statements stay well under the
-# 120s cap either way.
-_RELEASE_JOB_CHUNK = 2000
+# committed, so a failure only costs the chunk in flight.
+#
+# Was 2000, sized on the assumption that fixed per-chunk work dominated. That is
+# no longer true: the bucket recount already ran once at the end, and the two
+# remaining fixed costs (the assignments SELECT, and the eligible-cache
+# invalidation that kicked a full rollup rebuild) have both been hoisted out. What
+# is left scales linearly with the chunk, so a smaller chunk costs nothing and
+# buys three things: the progress bar moves 4x more often (a 3.4k-email upload now
+# steps 7 times instead of twice, instead of sitting at 0% for minutes), row locks
+# are held ~4x more briefly, and a retryable failure redoes 500 rows instead of
+# 2000. Timeout headroom too — the merged UPDATE is ~5.5s at 500 against the 120s
+# cap. Don't go below 500: the fixed session/commit overhead starts to show.
+_RELEASE_JOB_CHUNK = 500
+
+# By-id selections at or under this size are released inline in the request, as
+# they always were; anything larger returns a job and runs in the background.
+# Mirrors _MARK_SYNC_LIMIT in webinars.py — the interactive path stays snappy and
+# unchanged for the ordinary case, and only a bulk selection pays for polling.
+_RELEASE_SYNC_LIMIT = 500
 
 # job_id → progress dict. In-memory on purpose: progress is ephemeral, the
 # membership deletes + contact_release_log rows are the durable state. Pruned
@@ -129,50 +141,54 @@ async def _release_emails_chunk(
     this chunk — a multi-chunk job runs it once at the end over the union
     instead of paying it per chunk.
     """
-    a_result = await db.execute(
-        select(WebinarListAssignment).where(
-            WebinarListAssignment.webinar_id == webinar_id,
-            WebinarListAssignment.user_id == LLOYD_USER_ID,
-        )
+    # Resolve every email in ONE pass: drive from the uploaded list, join the
+    # contact, then LEFT JOIN this webinar's membership. Rows with a membership
+    # are releasable; rows without one are contacts that exist but were already
+    # released (or never scheduled here); emails with no row at all are unknown.
+    # Replaces two separate scans (matched, then a second pass to classify the
+    # misses) that between them read the same contact pages twice.
+    #
+    # m.user_id belongs in the ON clause, NOT the WHERE — in WHERE it turns the
+    # LEFT JOIN back into an inner join and every already-released email would be
+    # misreported as not_found.
+    #
+    # lower(c.email) is deliberate: ix_contacts_lower_email is defined on
+    # lower(email), and while migration 069 added a lowercase CHECK it is still
+    # NOT VALID, so a legacy mixed-case row would silently fail to match a plain
+    # equality and never get released.
+    resolve_sql = sa_text(
+        "SELECT c.id AS contact_id, lower(c.email) AS email, "
+        "       c.assignment_id AS legacy_assignment_id, "
+        "       m.status AS m_status, m.assignment_id AS m_assignment_id, "
+        "       m.bucket_id AS m_bucket_id, m.used_at AS m_used_at "
+        "FROM unnest(CAST(:emails AS text[])) AS k(email) "
+        "JOIN contacts c "
+        "  ON c.user_id = CAST(:uid AS uuid) AND lower(c.email) = k.email "
+        "LEFT JOIN webinar_contact_memberships m "
+        "  ON m.contact_id = c.id "
+        " AND m.webinar_id = CAST(:wid AS uuid) "
+        " AND m.user_id    = CAST(:uid AS uuid)"
     )
-    assignments_by_id: dict[str, WebinarListAssignment] = {
-        a.id: a for a in a_result.scalars().all()
-    }
-    # NOTE: no early-return when the webinar has zero assignment rows — used
-    # memberships survive their list's deletion (assignment_id NULL) and must
-    # still be releasable. assignments_by_id is only needed for the `remaining`
-    # counter decrement below, which no-ops for NULL/missing assignments.
-
-    # Match against THIS webinar's membership rows (not the single legacy slot),
-    # so a reused contact can be released from this webinar even though its legacy
-    # slot points at an earlier one. UNIQUE(webinar_id, contact_id) ⇒ at most one
-    # membership per email here. Keyed by lowercased email.
+    # by_email: releasable (has a membership here). known: every email that
+    # resolved to a contact at all, membership or not — drives the
+    # already_available vs not_found split exactly as the old second pass did.
     by_email: dict[str, dict] = {}
+    known_emails: set[str] = set()
     for chunk in _chunked(emails, _DB_CHUNK_SIZE):
         c_result = await db.execute(
-            select(
-                WebinarContactMembership.contact_id,
-                sa_func.lower(Contact.email).label("email"),
-                WebinarContactMembership.status,
-                WebinarContactMembership.assignment_id,
-                WebinarContactMembership.bucket_id,
-                WebinarContactMembership.used_at,
-                Contact.assignment_id.label("legacy_assignment_id"),
-            )
-            .join(Contact, Contact.id == WebinarContactMembership.contact_id)
-            .where(
-                WebinarContactMembership.webinar_id == webinar_id,
-                WebinarContactMembership.user_id == LLOYD_USER_ID,
-                sa_func.lower(Contact.email).in_(chunk),
-            )
+            resolve_sql,
+            {"emails": chunk, "uid": LLOYD_USER_ID, "wid": webinar_id},
         )
         for row in c_result.all():
+            known_emails.add(row.email)
+            if row.m_status is None:
+                continue
             by_email[row.email] = {
                 "id": row.contact_id,
-                "status": row.status,
-                "assignment_id": row.assignment_id,
-                "bucket_id": row.bucket_id,
-                "used_at": row.used_at,
+                "status": row.m_status,
+                "assignment_id": row.m_assignment_id,
+                "bucket_id": row.m_bucket_id,
+                "used_at": row.m_used_at,
                 "legacy_assignment_id": row.legacy_assignment_id,
             }
 
@@ -183,21 +199,8 @@ async def _release_emails_chunk(
     log_rows: list[dict] = []
     contact_ids_to_release: list[str] = []
     legacy_reset_ids: list[str] = []
-
-    # Classify unmatched emails: a contact that EXISTS but has no membership in
-    # this webinar was already released (or never scheduled here) → mirror the
-    # legacy "already_available" bucket so the modal's tiles stay meaningful.
-    unmatched = [e for e in emails if e not in by_email]
-    known_emails: set[str] = set()
-    for chunk in _chunked(unmatched, _DB_CHUNK_SIZE):
-        k_result = await db.execute(
-            select(sa_func.lower(Contact.email))
-            .where(
-                Contact.user_id == LLOYD_USER_ID,
-                sa_func.lower(Contact.email).in_(chunk),
-            )
-        )
-        known_emails.update(k_result.scalars().all())
+    # assignment_id → how many 'assigned' memberships this chunk releases from it.
+    per_assignment: dict[str, int] = {}
 
     for email in emails:
         target = by_email.get(email)
@@ -234,22 +237,8 @@ async def _release_emails_chunk(
         # removes one from that pool. Releasing a `used` contact doesn't
         # touch it — it was already decremented at mark-used time.
         if target["status"] == "assigned" and target["assignment_id"]:
-            asn = assignments_by_id.get(target["assignment_id"])
-            if asn:
-                asn.remaining = max(0, (asn.remaining or 0) - 1)
-
-    # Legacy slot dual-write — only contacts whose slot represents this webinar.
-    for chunk in _chunked(legacy_reset_ids, _DB_CHUNK_SIZE):
-        await db.execute(
-            update(Contact)
-            .where(Contact.id.in_(chunk))
-            .values(
-                outreach_status="available",
-                assignment_id=None,
-                assigned_date=None,
-                used_at=None,
-            )
-        )
+            aid = target["assignment_id"]
+            per_assignment[aid] = per_assignment.get(aid, 0) + 1
 
     # Bulk INSERT audit-log rows. asyncpg's param cap is 32,767; each row has
     # 11 columns so ~2,900 rows per insert is the hard limit — we use 2,000.
@@ -267,8 +256,36 @@ async def _release_emails_chunk(
                 WebinarContactMembership.contact_id.in_(chunk),
             )
         )
-    await recompute_contact_caches(db, contact_ids_to_release)
-    await reconcile_legacy_slots(db, contact_ids_to_release)
+
+    # Decrement the assignments' `remaining` counters in one statement. A
+    # relative decrement rather than the absolute write an ORM instance would
+    # produce, so a mark-used job committing concurrently can't be clobbered by a
+    # value this transaction read before it started. The user_id/webinar_id
+    # predicates reproduce the old assignments_by_id.get() miss-is-a-no-op.
+    if per_assignment:
+        await db.execute(
+            sa_text(
+                "UPDATE webinar_list_assignments a "
+                "   SET remaining = GREATEST(0, a.remaining - v.n), "
+                "       updated_at = now() "
+                "  FROM unnest(CAST(:aids AS uuid[]), CAST(:ns AS int[])) AS v(aid, n) "
+                " WHERE a.id = v.aid "
+                "   AND a.user_id = CAST(:uid AS uuid) "
+                "   AND a.webinar_id = CAST(:wid AS uuid)"
+            ),
+            {
+                "aids": list(per_assignment.keys()),
+                "ns": list(per_assignment.values()),
+                "uid": LLOYD_USER_ID,
+                "wid": webinar_id,
+            },
+        )
+
+    # One statement for the legacy slot reset AND the cache re-derivation — must
+    # run after the DELETE above so it sees the memberships that survive. This
+    # used to be three separate UPDATEs over the same rows, i.e. three non-HOT
+    # rewrites of every contact index.
+    await release_contact_slots(db, contact_ids_to_release, legacy_reset_ids)
 
     # Reconcile bucket.remaining_contacts from the live fresh baseline (never
     # invited, not in-flight) — keeps the field self-healing if it ever drifts.
@@ -279,9 +296,14 @@ async def _release_emails_chunk(
 
     await db.flush()
 
-    # Remaining counts changed — drop the eligible-counts micro-cache.
-    from api.routers.outreach.buckets import invalidate_eligible_cache
-    invalidate_eligible_cache()
+    # NOTE: no invalidate_eligible_cache() here. It does not just clear a dict —
+    # it marks the fresh rollup stale and immediately starts a rebuild that walks
+    # the whole claimable pool, and the scheduler's dirty-flag loop makes a call
+    # arriving mid-rebuild queue up another one. Firing it per chunk therefore
+    # kept the rollup rebuilding continuously for the entire release, competing
+    # with the release itself for a 5+10 connection pool, and every rebuild but
+    # the last was stale on arrival anyway. The job invalidates once when it is
+    # done; the synchronous caller does its own.
     return {
         "released": len(contact_ids_to_release),
         "not_found": not_found,
@@ -352,8 +374,6 @@ async def _run_release_job(
                 async with AsyncSessionLocal() as db:
                     job["bucket_updates"] = await reconcile_bucket_remaining(db, touched)
                     await db.commit()
-                from api.routers.outreach.buckets import invalidate_eligible_cache
-                invalidate_eligible_cache()
                 break
             except Exception as exc:
                 if attempt < 2 and _is_retryable_db_error(exc):
@@ -365,6 +385,15 @@ async def _run_release_job(
                     job_id, len(touched),
                 )
                 break
+        # Unconditional, and OUTSIDE the loop above: the release moved contacts
+        # back into the claimable pool whether or not any bucket was recounted.
+        # `touched` is empty for custom_list memberships (their bucket_id is
+        # NULL) and the loop also exits early when every reconcile attempt fails
+        # — in both cases the eligible counts and the fresh rollup are still
+        # stale, so this has to run regardless. It used to sit inside the loop,
+        # where the per-chunk call masked the gap.
+        from api.routers.outreach.buckets import invalidate_eligible_cache
+        invalidate_eligible_cache()
         job["_ts"] = datetime.now(timezone.utc).timestamp()
         _active_release_tasks.pop(job_id, None)
 
@@ -389,6 +418,34 @@ def _spawn_release_job(
     _RELEASE_JOBS[job_id] = job
     _active_release_tasks[job_id] = asyncio.create_task(
         _run_release_job(job_id, webinar_id, emails, release_batch_id)
+    )
+    return job
+
+
+def _spawn_release_ids_job(
+    contact_ids: list[str],
+    scope_assignment_ids: set[str] | None,
+    release_batch_id: str,
+) -> dict:
+    """Same registry and same GET /release-jobs/{id} as the CSV path; the extra
+    `out_of_scope` list is the only shape difference."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for jid in [
+        jid for jid, j in _RELEASE_JOBS.items()
+        if j["status"] != "running" and j["_ts"] < now_ts - 3600
+    ]:
+        _RELEASE_JOBS.pop(jid, None)
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id, "status": "running", "total": len(contact_ids), "done": 0,
+        "release_batch_id": release_batch_id, "released": 0,
+        "not_found": [], "already_available": [], "out_of_scope": [],
+        "by_status": {"assigned": 0, "used": 0}, "bucket_updates": {},
+        "error": None, "_ts": now_ts,
+    }
+    _RELEASE_JOBS[job_id] = job
+    _active_release_tasks[job_id] = asyncio.create_task(
+        _run_release_ids_job(job_id, contact_ids, scope_assignment_ids, release_batch_id)
     )
     return job
 
@@ -508,29 +565,26 @@ async def list_releases(
     return {"batches": batches}
 
 
-@router.post("/contacts/releases", status_code=201)
-async def release_contacts_by_id(
-    body: ReleaseByIdRequest,
-    db: AsyncSession = Depends(get_db),
-    _: str = Depends(require_auth),
-):
-    """Release a set of contacts (by id) back to `available`.
+async def _release_ids_chunk(
+    db: AsyncSession,
+    contact_ids: list[str],
+    scope_assignment_ids: set[str] | None,
+    release_batch_id: str,
+    now: datetime,
+    *,
+    reconcile_buckets: bool = True,
+) -> dict:
+    """Release one chunk of (already deduped) contact ids. Flushes but does NOT
+    commit — the caller owns the transaction.
 
-    Used by the per-assignment / per-group contacts pages where the operator
-    selects rows directly. Same revert + audit-log + bucket-reconcile pipeline
-    as the email-based endpoint above. Contacts can span multiple webinars and
-    assignments — each contact is logged against its current webinar.
+    The by-id twin of `_release_emails_chunk`: same revert + audit-log pipeline,
+    but keyed on contact id and spanning webinars, since the operator's selection
+    can cross them. Idempotent for the same reason — a contact with no membership
+    in scope is reported, not re-released.
     """
-    # Dedup, preserve order
-    seen: set[str] = set()
-    contact_ids = [c for c in body.contact_ids if c and not (c in seen or seen.add(c))]
-    if not contact_ids:
-        raise HTTPException(400, "No contact_ids provided")
-
-    scope_assignment_ids: set[str] | None = (
-        set(body.assignment_ids) if body.assignment_ids else None
-    )
-
+    m = WebinarContactMembership
+    mem_by_contact: dict[str, dict] = {}
+    had_any_membership: set[str] = set()
     # Load the membership rows for these contacts (optionally restricted to the
     # assignment(s) the operator is viewing). The membership carries webinar_id
     # and the authoritative status — so a reused contact is released from the
@@ -540,14 +594,18 @@ async def release_contacts_by_id(
     # not_found. Without a scope, a multi-webinar contact's NEWEST membership is
     # released (created_at DESC) — deterministic, and matches the operator
     # intuition of undoing the most recent scheduling.
-    m = WebinarContactMembership
-    mem_by_contact: dict[str, dict] = {}
-    had_any_membership: set[str] = set()
+    #
+    # Kept as IN (...) deliberately. Rewriting it as = ANY(uuid[]) was considered
+    # and measured: cold, an IN-list and an array/unnest form of the same lookup
+    # read the same ~4k pages and run in the same ~2-3s, because resolution here
+    # is bound by random page reads, not by plan shape. Not worth the casting
+    # fragility of hand-building a uuid[] bind against an ORM column.
     for chunk in _chunked(contact_ids, _DB_CHUNK_SIZE):
         if scope_assignment_ids is not None:
             any_result = await db.execute(
                 select(m.contact_id).where(
-                    m.user_id == LLOYD_USER_ID, m.contact_id.in_(chunk)
+                    m.user_id == LLOYD_USER_ID,
+                    m.contact_id.in_(chunk),
                 )
             )
             had_any_membership.update(any_result.scalars().all())
@@ -557,7 +615,7 @@ async def release_contacts_by_id(
         c_result = await db.execute(
             select(
                 m.contact_id,
-                sa_func.lower(Contact.email).label("email"),
+                Contact.email.label("email"),
                 m.status, m.webinar_id, m.assignment_id, m.bucket_id, m.used_at,
                 Contact.assignment_id.label("legacy_assignment_id"),
             )
@@ -570,7 +628,7 @@ async def release_contacts_by_id(
             # an explicit scope narrows it to the viewed page's lists.
             mem_by_contact.setdefault(row.contact_id, {
                 "id": row.contact_id,
-                "email": row.email,
+                "email": row.email.lower() if row.email else None,
                 "status": row.status,
                 "webinar_id": row.webinar_id,
                 "assignment_id": row.assignment_id,
@@ -579,32 +637,14 @@ async def release_contacts_by_id(
                 "legacy_assignment_id": row.legacy_assignment_id,
             })
 
-    # Touched assignments — load once so we can decrement remaining counters.
-    touched_assignment_ids = [
-        r["assignment_id"] for r in mem_by_contact.values()
-        if r["assignment_id"] and r["status"] == "assigned"
-    ]
-    assignments_by_id: dict[str, WebinarListAssignment] = {}
-    if touched_assignment_ids:
-        a_result = await db.execute(
-            select(WebinarListAssignment).where(
-                WebinarListAssignment.id.in_(set(touched_assignment_ids)),
-                WebinarListAssignment.user_id == LLOYD_USER_ID,
-            )
-        )
-        assignments_by_id = {a.id: a for a in a_result.scalars().all()}
-
-    release_batch_id = body.release_batch_id or str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-
     not_found: list[str] = []
-    already_available: list[str] = []
     out_of_scope: list[str] = []
     by_status_count = {"assigned": 0, "used": 0}
     touched_bucket_ids: set[str] = set()
     log_rows: list[dict] = []
     contact_ids_to_release: list[str] = []
     legacy_reset_ids: list[str] = []
+    per_assignment: dict[str, int] = {}
 
     for cid in contact_ids:
         row = mem_by_contact.get(cid)
@@ -634,24 +674,9 @@ async def release_contacts_by_id(
             touched_bucket_ids.add(row["bucket_id"])
         if row["legacy_assignment_id"] and row["legacy_assignment_id"] == row["assignment_id"]:
             legacy_reset_ids.append(row["id"])
-
         if row["status"] == "assigned" and row["assignment_id"]:
-            asn = assignments_by_id.get(row["assignment_id"])
-            if asn:
-                asn.remaining = max(0, (asn.remaining or 0) - 1)
-
-    # Legacy slot reset — only where the slot represents the released membership.
-    for chunk in _chunked(legacy_reset_ids, _DB_CHUNK_SIZE):
-        await db.execute(
-            update(Contact)
-            .where(Contact.id.in_(chunk))
-            .values(
-                outreach_status="available",
-                assignment_id=None,
-                assigned_date=None,
-                used_at=None,
-            )
-        )
+            aid = row["assignment_id"]
+            per_assignment[aid] = per_assignment.get(aid, 0) + 1
 
     LOG_CHUNK = 2000
     for chunk in _chunked(log_rows, LOG_CHUNK):
@@ -659,8 +684,7 @@ async def release_contacts_by_id(
 
     # Remove the membership rows for exactly the (contact, webinar) pairs being
     # released (webinar_id came from each contact's viewed assignment), so a
-    # reused contact loses only the membership for THIS webinar. Then recompute
-    # the affected caches.
+    # reused contact loses only the membership for THIS webinar.
     release_by_webinar: dict[str, list[str]] = {}
     for lr in log_rows:
         release_by_webinar.setdefault(lr["webinar_id"], []).append(lr["contact_id"])
@@ -672,25 +696,174 @@ async def release_contacts_by_id(
                     WebinarContactMembership.contact_id.in_(chunk),
                 )
             )
-    await recompute_contact_caches(db, contact_ids_to_release)
-    await reconcile_legacy_slots(db, contact_ids_to_release)
+
+    # See _release_emails_chunk: relative decrement, one statement. No webinar
+    # predicate here — a by-id selection can span webinars, and the assignment id
+    # already identifies the row uniquely.
+    if per_assignment:
+        await db.execute(
+            sa_text(
+                "UPDATE webinar_list_assignments a "
+                "   SET remaining = GREATEST(0, a.remaining - v.n), "
+                "       updated_at = now() "
+                "  FROM unnest(CAST(:aids AS uuid[]), CAST(:ns AS int[])) AS v(aid, n) "
+                " WHERE a.id = v.aid AND a.user_id = CAST(:uid AS uuid)"
+            ),
+            {
+                "aids": list(per_assignment.keys()),
+                "ns": list(per_assignment.values()),
+                "uid": LLOYD_USER_ID,
+            },
+        )
+
+    # Legacy slot reset + cache re-derivation in one pass, after the DELETE.
+    await release_contact_slots(db, contact_ids_to_release, legacy_reset_ids)
 
     bucket_updates: dict[str, int] = {}
-    if touched_bucket_ids:
+    if touched_bucket_ids and reconcile_buckets:
         await db.flush()
         bucket_updates = await reconcile_bucket_remaining(db, touched_bucket_ids)
 
     await db.flush()
+    return {
+        "released": len(contact_ids_to_release),
+        "not_found": not_found,
+        "out_of_scope": out_of_scope,
+        "by_status": by_status_count,
+        "bucket_updates": bucket_updates,
+        "touched_bucket_ids": sorted(touched_bucket_ids),
+    }
+
+
+async def _run_release_ids_job(
+    job_id: str,
+    contact_ids: list[str],
+    scope_assignment_ids: set[str] | None,
+    release_batch_id: str,
+) -> None:
+    """Background worker for large by-id selections. Mirrors _run_release_job."""
+    job = _RELEASE_JOBS[job_id]
+    touched: set[str] = set()
+    try:
+        for i in range(0, len(contact_ids), _RELEASE_JOB_CHUNK):
+            chunk = contact_ids[i : i + _RELEASE_JOB_CHUNK]
+            for attempt in range(3):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        res = await _release_ids_chunk(
+                            db, chunk, scope_assignment_ids, release_batch_id,
+                            datetime.now(timezone.utc),
+                            reconcile_buckets=False,
+                        )
+                        await db.commit()
+                    job["released"] += res["released"]
+                    job["not_found"].extend(res["not_found"])
+                    job["out_of_scope"].extend(res["out_of_scope"])
+                    job["by_status"]["assigned"] += res["by_status"]["assigned"]
+                    job["by_status"]["used"] += res["by_status"]["used"]
+                    touched.update(res["touched_bucket_ids"])
+                    break
+                except Exception as exc:
+                    if attempt < 2 and _is_retryable_db_error(exc):
+                        await asyncio.sleep(1 + 2 * attempt)
+                        continue
+                    raise
+            job["done"] = min(i + len(chunk), job["total"])
+        job["status"] = "done"
+    except Exception as exc:
+        logger.exception(
+            "Release-by-id job %s failed at %s/%s", job_id, job["done"], job["total"]
+        )
+        job["status"] = "failed"
+        job["error"] = str(exc)[:300]
+    finally:
+        for attempt in range(3):
+            if not touched:
+                break
+            try:
+                async with AsyncSessionLocal() as db:
+                    job["bucket_updates"] = await reconcile_bucket_remaining(db, touched)
+                    await db.commit()
+                break
+            except Exception as exc:
+                if attempt < 2 and _is_retryable_db_error(exc):
+                    await asyncio.sleep(1 + 2 * attempt)
+                    continue
+                logger.exception(
+                    "Release-by-id job %s: bucket reconcile failed for %d bucket(s)",
+                    job_id, len(touched),
+                )
+                break
+        from api.routers.outreach.buckets import invalidate_eligible_cache
+        invalidate_eligible_cache()
+        job["_ts"] = datetime.now(timezone.utc).timestamp()
+        _active_release_tasks.pop(job_id, None)
+
+
+@router.post("/contacts/releases", status_code=201)
+async def release_contacts_by_id(
+    body: ReleaseByIdRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Release a set of contacts (by id) back to `available`.
+
+    Used by the per-assignment / per-group contacts pages where the operator
+    selects rows directly. Same revert + audit-log + bucket-reconcile pipeline
+    as the email-based endpoint above. Contacts can span multiple webinars and
+    assignments — each contact is logged against its current webinar.
+
+    Selections up to _RELEASE_SYNC_LIMIT are released inline, as before. Larger
+    ones return immediately with a job and are worked through in the background,
+    committing one chunk at a time — the same protection the CSV path already
+    had. Without it a big selection ran the whole pipeline, bucket recount
+    included, inside one request transaction: blowing the 120s statement cap
+    rolled the entire release back and the operator saw "released 0".
+    """
+    # Dedup, preserve order
+    seen: set[str] = set()
+    contact_ids = [c for c in body.contact_ids if c and not (c in seen or seen.add(c))]
+    if not contact_ids:
+        raise HTTPException(400, "No contact_ids provided")
+
+    scope_assignment_ids: set[str] | None = (
+        set(body.assignment_ids) if body.assignment_ids else None
+    )
+    release_batch_id = body.release_batch_id or str(uuid.uuid4())
+
+    if len(contact_ids) > _RELEASE_SYNC_LIMIT:
+        job = _spawn_release_ids_job(
+            contact_ids, scope_assignment_ids, release_batch_id
+        )
+        return {
+            "release_batch_id": release_batch_id,
+            "released": 0,
+            "not_found": [],
+            "already_available": [],
+            "out_of_scope": [],
+            "by_status": {"assigned": 0, "used": 0},
+            "bucket_updates": {},
+            "job": _release_job_public(job),
+        }
+
+    res = await _release_ids_chunk(
+        db, contact_ids, scope_assignment_ids, release_batch_id,
+        datetime.now(timezone.utc),
+    )
 
     # Remaining counts changed — drop the eligible-counts micro-cache.
     from api.routers.outreach.buckets import invalidate_eligible_cache
     invalidate_eligible_cache()
     return {
         "release_batch_id": release_batch_id,
-        "released": len(contact_ids_to_release),
-        "not_found": not_found,
-        "already_available": already_available,
-        "out_of_scope": out_of_scope,
-        "by_status": by_status_count,
-        "bucket_updates": bucket_updates,
+        "released": res["released"],
+        "not_found": res["not_found"],
+        # Always empty on this path — a contact id that resolves to no membership
+        # is either not_found or out_of_scope. Kept so the response shape matches
+        # the email endpoint's.
+        "already_available": [],
+        "out_of_scope": res["out_of_scope"],
+        "by_status": res["by_status"],
+        "bucket_updates": res["bucket_updates"],
+        "job": None,
     }

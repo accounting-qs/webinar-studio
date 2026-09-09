@@ -450,6 +450,8 @@ export interface ReleaseJob {
   released: number;
   not_found: string[];
   already_available: string[];
+  /** Only populated by the by-id release path. */
+  out_of_scope?: string[];
   by_status: { assigned: number; used: number };
   bucket_updates: Record<string, number>;
   error: string | null;
@@ -463,9 +465,10 @@ export interface ReleaseContactsResponse {
   out_of_scope?: string[];
   by_status: { assigned: number; used: number };
   bucket_updates: Record<string, number>;
-  /** Present (non-null) when the upload was too large to release inside the
-   * request. The release runs server-side; poll getReleaseJob until `status`
-   * leaves "running" and read the totals off the job, not off this response. */
+  /** Non-null when the release runs server-side rather than in the request: the
+   * CSV endpoint always does, the by-id endpoint does above 500 contacts. Poll
+   * getReleaseJob until `status` leaves "running" and read the totals off the
+   * job, not off this response. */
   job?: ReleaseJob | null;
 }
 

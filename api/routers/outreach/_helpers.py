@@ -314,6 +314,87 @@ async def recompute_contact_caches(db: AsyncSession, contact_ids: list[str]) -> 
         ), {"ids": chunk})
 
 
+async def release_contact_slots(
+    db: AsyncSession,
+    contact_ids: list[str],
+    legacy_reset_ids,
+    *,
+    user_id: str = LLOYD_USER_ID,
+) -> None:
+    """Everything a release owes the `contacts` row, in ONE statement.
+
+    Replaces the three separate passes a release used to make over the same rows
+    — the legacy-slot reset, `recompute_contact_caches`, then
+    `reconcile_legacy_slots`. Each pass is a non-HOT UPDATE that rewrites every
+    index on `contacts` (~11ms/row on prod, 11 indexes incl. a 1GB trgm GIN), so
+    three passes cost three times what one does. This is the release-side twin of
+    what `_mark_used_chunk` does for mark-used (webinars.py).
+
+    MUST be called AFTER the membership rows are deleted — the LATERAL re-derives
+    the cache columns from what memberships remain.
+
+    `legacy_reset_ids` = contacts whose legacy `contacts.assignment_id` pointed at
+    the membership being released (so the slot represented THIS webinar). Those
+    reset unconditionally; everything else resets only if the contact is left
+    holding no memberships at all, which is the condition `reconcile_legacy_slots`
+    used to test in its own statement.
+
+    The cache columns stay a FULL re-derivation rather than an incremental delta:
+    `last_invited_at` is a MAX and a release REMOVES rows, so the new value
+    depends on the memberships that survive. (mark-used can decrement-and-GREATEST
+    because it only ever adds a 'used' row — the max is monotone there, not here.)
+    The re-derivation is cheap next to the write it rides along with: measured
+    250ms per 2000 contacts, since the aggregate and both counts come off one
+    ix_wcm_contact probe. Keeping it also keeps the self-healing property that
+    claimable_conditions depends on. Idempotent; does NOT commit.
+    """
+    ids = [c for c in dict.fromkeys(contact_ids) if c]
+    if not ids:
+        return
+    legacy = set(legacy_reset_ids or ())
+    flags = [cid in legacy for cid in ids]
+
+    # The reset test reads agg.*, NEVER c.assigned_membership_count /
+    # c.times_invited: every SET expression in one UPDATE sees the PRE-update row,
+    # so the columns still hold the counts from before the membership was deleted.
+    # Reading them would silently skip the reset for exactly the contacts that
+    # need it (their last membership just went away) and strand them outside the
+    # claimable pool forever, with no error. This is why the old code needed
+    # reconcile_legacy_slots to be a separate statement.
+    reset = ("(COALESCE(k.legacy, false) "
+             " OR (COALESCE(agg.a, 0) = 0 AND COALESCE(agg.u, 0) = 0))")
+    sql = sa_text(
+        "UPDATE contacts c SET "
+        "  assigned_membership_count = COALESCE(agg.a, 0), "
+        "  times_invited             = COALESCE(agg.u, 0), "
+        "  last_invited_at           = agg.mx, "
+        f" outreach_status = CASE WHEN {reset} THEN 'available' "
+        "                        ELSE c.outreach_status END, "
+        f" assignment_id   = CASE WHEN {reset} THEN NULL ELSE c.assignment_id END, "
+        f" assigned_date   = CASE WHEN {reset} THEN NULL ELSE c.assigned_date END, "
+        f" used_at         = CASE WHEN {reset} THEN NULL ELSE c.used_at END, "
+        "  updated_at      = now() "
+        "FROM unnest(CAST(:cids AS uuid[]), CAST(:legacy AS boolean[])) "
+        "     AS k(cid, legacy) "
+        "LEFT JOIN LATERAL ( "
+        "  SELECT count(*) FILTER (WHERE m.status='assigned') AS a, "
+        "         count(*) FILTER (WHERE m.status='used') AS u, "
+        "         max(COALESCE(m.assigned_date::timestamptz, m.used_at)) "
+        "           FILTER (WHERE m.status='used') AS mx "
+        "  FROM webinar_contact_memberships m WHERE m.contact_id = k.cid "
+        ") agg ON true "
+        "WHERE c.id = k.cid AND c.user_id = CAST(:uid AS uuid)"
+    )
+    for i in range(0, len(ids), _CACHE_CHUNK_SIZE):
+        # Both arrays sliced identically — multi-arg unnest pads the shorter one
+        # with NULLs, which the COALESCE(k.legacy, false) above also guards.
+        await db.execute(sql, {
+            "uid": user_id,
+            "cids": ids[i : i + _CACHE_CHUNK_SIZE],
+            "legacy": flags[i : i + _CACHE_CHUNK_SIZE],
+        })
+
+
 async def reconcile_bucket_remaining(
     db: AsyncSession, bucket_ids, *, user_id: str = LLOYD_USER_ID
 ) -> dict[str, int]:

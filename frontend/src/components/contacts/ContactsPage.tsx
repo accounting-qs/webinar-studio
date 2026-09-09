@@ -7,6 +7,7 @@ import {
   fetchAssignmentGroupContacts,
   fetchMarkUsedJob,
   fetchWebinarNonjoiners,
+  getReleaseJob,
   markContactsUsed,
   markGroupContactsUsed,
   releaseContactsById,
@@ -71,6 +72,7 @@ export function ContactsPage(props: ContactsPageProps) {
   const [marking, setMarking] = useState(false);
   const [markProgress, setMarkProgress] = useState<{ done: number; total: number } | null>(null);
   const [releasing, setReleasing] = useState(false);
+  const [releaseProgress, setReleaseProgress] = useState<{ done: number; total: number } | null>(null);
 
   /* ── Fetch contacts ─────────────────────────────────────────────────── */
 
@@ -296,9 +298,30 @@ export function ContactsPage(props: ContactsPageProps) {
       const scopeAssignmentIds = isGroup
         ? (groupKey ? groupKey.split(",") : [])
         : [props.assignmentId!];
-      const result = await releaseContactsById(Array.from(selectedIds), scopeAssignmentIds);
+      let result = await releaseContactsById(Array.from(selectedIds), scopeAssignmentIds);
+      // Big selections come back as a job that keeps running server-side; poll it
+      // for progress and read the real totals off the finished job. Mirrors the
+      // mark-used loop above.
+      if (result.job) {
+        let job = result.job;
+        setReleaseProgress({ done: job.done, total: job.total });
+        while (job.status === "running") {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            job = await getReleaseJob(job.id);
+          } catch {
+            break; // server restarted mid-job → the reload below shows what landed
+          }
+          setReleaseProgress({ done: job.done, total: job.total });
+        }
+        if (job.status === "failed") {
+          alert(`Release stopped partway (${job.released.toLocaleString()} of ${job.total.toLocaleString()} released). Re-select the leftovers and try again.`);
+        }
+        result = { ...result, ...job };
+      }
       setSelectedIds(new Set());
       setSelectCount(0);
+      setReleaseProgress(null);
       await load(filter);
       const skippedNotFound = result.not_found.length;
       const skippedAvailable = result.already_available.length;
@@ -318,6 +341,7 @@ export function ContactsPage(props: ContactsPageProps) {
       alert(err instanceof Error ? err.message : "Failed to release contacts");
     } finally {
       setReleasing(false);
+      setReleaseProgress(null);
     }
   }, [selectedIds, releasing, filter, load, isGroup, groupKey, props.assignmentId]);
 
@@ -544,7 +568,9 @@ export function ContactsPage(props: ContactsPageProps) {
               {releasing && (
                 <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
               )}
-              Release
+              {releaseProgress
+                ? `Releasing… ${releaseProgress.done.toLocaleString()}/${releaseProgress.total.toLocaleString()}`
+                : "Release"}
             </button>
           )}
         </div>
