@@ -10,6 +10,7 @@ import {
   fetchWebinars,
   pauseCalendarImport,
   presignCalendarUpload,
+  recountCalendarUpload,
   resumeCalendarImport,
   startCalendarImport,
   uploadToStorage,
@@ -79,9 +80,12 @@ export function CalendarUploadsTab() {
     loadAll();
   }, [loadAll]);
 
-  // Poll while anything is in-flight
+  // Poll while anything is in-flight, or while a Non-joiners count is still
+  // resolving — that runs after the upload already reads 'complete'.
   useEffect(() => {
-    const inFlight = uploads.some((u) => !TERMINAL_STATUSES.has(u.status));
+    const inFlight = uploads.some(
+      (u) => !TERMINAL_STATUSES.has(u.status) || u.counts_running,
+    );
     if (!inFlight) return;
     const t = setInterval(() => {
       fetchCalendarUploads().then((r) => setUploads(r.uploads)).catch(() => {});
@@ -161,6 +165,10 @@ function UploadsTable({
     setBusyId(id);
     try { await cancelCalendarImport(id); onChanged(); } finally { setBusyId(null); }
   };
+  const handleRecount = async (id: string) => {
+    setBusyId(id);
+    try { await recountCalendarUpload(id); onChanged(); } finally { setBusyId(null); }
+  };
   const handleDelete = async (id: string) => {
     if (!confirm("Delete this upload and any imported rows? This cannot be undone.")) return;
     setBusyId(id);
@@ -188,6 +196,12 @@ function UploadsTable({
           {uploads.map((u) => {
             const badge = statusBadge(u.status);
             const inFlight = !TERMINAL_STATUSES.has(u.status);
+            // A Non-joiners count that never resolved must not render as a real
+            // 0 — the rows imported fine, only the group lookup didn't run.
+            const countsUnknown = u.counts_pending;
+            const countsTitle = u.counts_running
+              ? "Counting against this webinar's Non-joiners group…"
+              : "The Non-joiners group lookup didn't finish, so these counts are unknown (the rows imported fine). Use Recount.";
             const dateLabel = u.created_at ? new Date(u.created_at).toLocaleString() : "—";
             return (
               <tr key={u.id} className="bg-white dark:bg-zinc-950 hover:bg-zinc-50 dark:hover:bg-zinc-900/60">
@@ -206,17 +220,21 @@ function UploadsTable({
                 <td className="px-3 py-2 text-zinc-600 dark:text-zinc-400">{dateLabel}</td>
                 <td className="px-3 py-2 text-right font-mono">{u.total_rows.toLocaleString()}</td>
                 <td
-                  className="px-3 py-2 text-right font-mono text-emerald-500"
-                  title={u.kind === "nonjoiner"
-                    ? "Uploaded Yes/Maybe emails that are in this webinar's Non-joiners group."
-                    : undefined}
-                >{u.matched_count.toLocaleString()}</td>
+                  className={`px-3 py-2 text-right font-mono ${countsUnknown ? "text-zinc-500" : "text-emerald-500"}`}
+                  title={countsUnknown
+                    ? countsTitle
+                    : u.kind === "nonjoiner"
+                      ? "Uploaded Yes/Maybe emails that are in this webinar's Non-joiners group."
+                      : undefined}
+                >{countsUnknown ? "—" : u.matched_count.toLocaleString()}</td>
                 <td
-                  className="px-3 py-2 text-right font-mono text-amber-500"
-                  title={u.kind === "nonjoiner"
-                    ? "Uploaded emails no longer in the Non-joiners group — booked, blocklisted, or aged out of the 6-webinar window."
-                    : undefined}
-                >{u.unmatched_count.toLocaleString()}</td>
+                  className={`px-3 py-2 text-right font-mono ${countsUnknown ? "text-zinc-500" : "text-amber-500"}`}
+                  title={countsUnknown
+                    ? countsTitle
+                    : u.kind === "nonjoiner"
+                      ? "Uploaded emails no longer in the Non-joiners group — booked, blocklisted, or aged out of the 6-webinar window."
+                      : undefined}
+                >{countsUnknown ? "—" : u.unmatched_count.toLocaleString()}</td>
                 <td className="px-3 py-2 text-center">
                   {u.has_responses ? <span className="text-emerald-500">✓</span> : <span className="text-zinc-500">—</span>}
                 </td>
@@ -270,6 +288,19 @@ function UploadsTable({
                         className="px-2 py-0.5 text-[10px] rounded bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50"
                       >
                         Cancel
+                      </button>
+                    )}
+                    {/* The rows are already in — this only re-runs the
+                        Non-joiners group intersection that produces the two
+                        count columns. */}
+                    {countsUnknown && (
+                      <button
+                        onClick={() => handleRecount(u.id)}
+                        disabled={busyId === u.id || u.counts_running}
+                        title={countsTitle}
+                        className="px-2 py-0.5 text-[10px] rounded bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 disabled:opacity-50"
+                      >
+                        {u.counts_running ? "Counting…" : "Recount"}
                       </button>
                     )}
                     {/* Always available so a stuck pending/uploading (or a dead

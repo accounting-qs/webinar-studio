@@ -65,7 +65,7 @@ async def main(dry_run: bool, only_webinar: int | None) -> None:
             async with AsyncSessionLocal() as db:
                 await db.execute(sa_text(
                     "UPDATE webinar_calendar_uploads "
-                    "SET matched_count = :m, unmatched_count = :u "
+                    "SET matched_count = :m, unmatched_count = :u, counts_pending = false "
                     "WHERE id = CAST(:uid AS uuid)"
                 ), {"m": matched, "u": unmatched, "uid": str(u["id"])})
                 await db.commit()

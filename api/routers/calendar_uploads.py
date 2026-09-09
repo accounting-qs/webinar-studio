@@ -58,6 +58,7 @@ if "postgresql+asyncpg://" not in _BG_DATABASE_URL:
 _bg_engine = create_async_engine(_BG_DATABASE_URL, poolclass=pool.NullPool) if _BG_DATABASE_URL else None
 
 _active_import_tasks: dict[str, asyncio.Task] = {}
+_active_recount_tasks: dict[str, asyncio.Task] = {}  # non-joiner count retries
 _import_pause_events: dict[str, asyncio.Event] = {}   # set = running, clear = paused
 _import_cancel_flags: dict[str, bool] = {}
 
@@ -68,6 +69,11 @@ BATCH_SIZE = 2000  # ~10 cols per row → ~20k params, well under asyncpg's 3276
 # request path runs under a 120s cap; this one walks six webinars of
 # WebinarGeek registrations off the request path, so it gets more room.
 NJ_POOL_TIMEOUT_S = 600
+# Backoff between non-joiner count attempts. The lookup fails for one reason in
+# practice — the pool query is expensive and the DB is busy: E156 hit the 600s
+# cap while three big calendar imports were still running, and the same query
+# takes ~17s once they drain. So wait them out instead of reporting a 0.
+NJ_COUNT_RETRY_DELAYS_S = (120, 300, 600)
 
 
 def _is_transient_db_error(e: BaseException) -> bool:
@@ -179,6 +185,48 @@ async def _nonjoiner_match_counts(upload_id: str, webinar_id: str) -> tuple[int,
     return matched, len(emails) - matched
 
 
+async def _resolve_nonjoiner_counts(upload_id: str, webinar_id: str) -> tuple[int, int, bool]:
+    """(matched, unmatched, resolved) — retries the group lookup before giving up.
+
+    A failed lookup used to leave both counters at 0, which reads in the UI as
+    "nothing matched" when in fact the rows landed fine and the count never ran.
+    """
+    last: Exception | None = None
+    for attempt, delay in enumerate((0, *NJ_COUNT_RETRY_DELAYS_S)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            matched, unmatched = await _nonjoiner_match_counts(upload_id, webinar_id)
+            return matched, unmatched, True
+        except Exception as exc:
+            last = exc
+            print(f"[CAL_IMPORT] Non-joiner count attempt {attempt + 1} failed: "
+                  f"{type(exc).__name__} {exc}")
+    print(f"[CAL_IMPORT] Non-joiner counts unresolved for {upload_id} ({last}) "
+          f"— flagged for recount")
+    return 0, 0, False
+
+
+async def _persist_nonjoiner_counts(upload_id: str, webinar_id: str) -> tuple[int, int, bool]:
+    """Resolve the counts and write them. Unresolved leaves the counters alone
+    and flags the row so the UI shows "—" + Recount rather than a false 0."""
+    matched, unmatched, resolved = await _resolve_nonjoiner_counts(upload_id, webinar_id)
+    values: dict = {"counts_pending": not resolved}
+    if resolved:
+        values["matched_count"] = matched
+        values["unmatched_count"] = unmatched
+    if not _bg_engine:
+        print("[CAL_IMPORT] No DATABASE_URL configured — counts not persisted")
+        return matched, unmatched, False
+    async with _bg_engine.begin() as conn:
+        await conn.execute(
+            update(WebinarCalendarUpload.__table__)
+            .where(WebinarCalendarUpload.__table__.c.id == upload_id)
+            .values(**values)
+        )
+    return matched, unmatched, resolved
+
+
 def _parse_invited_date(value: str) -> datetime | None:
     """Accept both '2026-05-08 14:07' and '5/6/2026'. Returns timezone-aware
     UTC datetimes (the CSV doesn't carry a TZ, so we treat values as UTC)."""
@@ -246,6 +294,10 @@ def _upload_dict(
         "processed_rows": u.processed_rows,
         "matched_count": u.matched_count,
         "unmatched_count": u.unmatched_count,
+        "counts_pending": u.counts_pending,
+        # The import task resolves the counts itself after marking the upload
+        # complete, so a live import counts as "still counting" too.
+        "counts_running": u.id in _active_recount_tasks or u.id in _active_import_tasks,
         "error_message": u.error_message,
         "created_at": u.created_at.isoformat() if u.created_at else None,
         "completed_at": u.completed_at.isoformat() if u.completed_at else None,
@@ -1017,6 +1069,40 @@ async def cancel_calendar_import(
     return {"id": upload_id, "status": "cancelled"}
 
 
+@router.post("/{upload_id}/recount", status_code=202)
+async def recount_nonjoiner_upload(
+    upload_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Re-resolve a Non-joiners upload's Matched/No-List-Data counts.
+
+    The rows are already in; only the group intersection is re-run. Spawned as a
+    task because the pool query can take minutes when the DB is busy.
+    """
+    result = await db.execute(
+        select(WebinarCalendarUpload).where(
+            WebinarCalendarUpload.id == upload_id,
+            WebinarCalendarUpload.user_id == LLOYD_USER_ID,
+        )
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    if upload.kind != "nonjoiner":
+        raise HTTPException(400, "Only Non-joiners uploads carry a derived count")
+    if upload.status != "complete":
+        raise HTTPException(409, f"Cannot recount: status is '{upload.status}', expected 'complete'")
+    if upload_id in _active_recount_tasks or upload_id in _active_import_tasks:
+        return {"id": upload_id, "status": "counting"}
+
+    webinar_id = upload.webinar_id
+    task = asyncio.create_task(_persist_nonjoiner_counts(upload_id, webinar_id))
+    _active_recount_tasks[upload_id] = task
+    task.add_done_callback(lambda _t: _active_recount_tasks.pop(upload_id, None))
+    return {"id": upload_id, "status": "counting"}
+
+
 @router.delete("/{upload_id}", status_code=200)
 async def delete_calendar_upload(
     upload_id: str,
@@ -1499,15 +1585,9 @@ async def _process_calendar_csv(
         csv_file.close()
 
         # Non-joiner uploads carry no per-list matching, so their counts are the
-        # intersection with the derived non-joiner group, resolved now that every
-        # row is in. A failure here leaves the counts at 0 rather than failing an
-        # otherwise-successful import.
-        if kind == "nonjoiner":
-            try:
-                matched, unmatched = await _nonjoiner_match_counts(upload_id, webinar_id)
-            except Exception as exc:
-                print(f"[CAL_IMPORT] Non-joiner group lookup failed ({exc}) — counts left at 0")
-
+        # intersection with the derived non-joiner group, resolved once every row
+        # is in. That lookup can take minutes on a busy DB, so the import is
+        # marked complete first and the counts land afterwards (below).
         async with engine.begin() as conn:
             await conn.execute(
                 update(WebinarCalendarUpload.__table__)
@@ -1518,6 +1598,7 @@ async def _process_calendar_csv(
                     processed_rows=processed,
                     matched_count=matched,
                     unmatched_count=unmatched,
+                    counts_pending=(kind == "nonjoiner"),
                     completed_at=datetime.now(tz=timezone.utc),
                 )
             )
@@ -1572,6 +1653,12 @@ async def _process_calendar_csv(
             schedule_recompute_for_webinar(webinar_id)
         except Exception as exc:
             print(f"[CAL_IMPORT] recompute schedule failed: {exc}")
+
+        if kind == "nonjoiner":
+            matched, unmatched, resolved = await _persist_nonjoiner_counts(upload_id, webinar_id)
+            print(f"[CAL_IMPORT] Non-joiner counts for {upload_id}: "
+                  + (f"{matched} matched, {unmatched} not in group" if resolved
+                     else "unresolved — Recount available in the Calendar Uploads tab"))
 
     except Exception as e:
         # Bare TimeoutError/CancelledError stringify to "", which renders as a

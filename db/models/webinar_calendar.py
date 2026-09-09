@@ -44,6 +44,10 @@ class WebinarCalendarUpload(Base):
     processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     matched_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     unmatched_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Non-joiner uploads only: the counts above are a set intersection with the
+    # derived non-joiner group, resolved after the rows are in. True = that
+    # lookup never succeeded, so the two counters are unknown rather than 0.
+    counts_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
     progress: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")

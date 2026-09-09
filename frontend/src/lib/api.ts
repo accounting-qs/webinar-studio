@@ -3018,6 +3018,10 @@ export interface ApiCalendarUpload {
   processed_rows: number;
   matched_count: number;
   unmatched_count: number;
+  // Non-joiners only: the counts are a derived-group intersection resolved
+  // after the rows land. Pending = it hasn't resolved, so 0 is not a real 0.
+  counts_pending: boolean;
+  counts_running: boolean;
   error_message: string | null;
   created_at: string | null;
   completed_at: string | null;
@@ -3119,6 +3123,15 @@ export async function cancelCalendarImport(uploadId: string): Promise<{ id: stri
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to cancel calendar import");
+  return res.json();
+}
+
+export async function recountCalendarUpload(uploadId: string): Promise<{ id: string; status: string }> {
+  const res = await fetch(`${API_URL}/calendar-uploads/${uploadId}/recount`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start recount"));
   return res.json();
 }
 
