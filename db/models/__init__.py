@@ -43,6 +43,7 @@ from db.models.statistics_snapshot import StatisticsSnapshot  # noqa: F401
 from db.models.reports import ReportSettings  # noqa: F401
 from db.models.webinar_report import WebinarReport  # noqa: F401
 from db.models.webinar_report_request import WebinarReportRequest  # noqa: F401
+from db.models.mcp import McpConnector  # noqa: F401
 
 # Re-export Base so `from db.models import Base` keeps working
 from db.base import Base  # noqa: F401

@@ -125,7 +125,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# MCP: the /mcp preflight is answered before the app-wide CORS middleware can
+# reject it against its two-origin allowlist — MCP clients come from anywhere.
+from api.mcp_server import mcp_preflight_middleware
+app.middleware("http")(mcp_preflight_middleware)
+
 from api.routers import webhook, competitors, ads, generation, outreach, statistics, connectors, ghl_sync, blocklist, chat, calendar_uploads, public_stats, sop_videos, reports
+from api.mcp_server import admin_router as mcp_admin_router, router as mcp_router
 from api.routers.costs import router as costs_router
 
 app.include_router(webhook.router, prefix="/webhook", tags=["webhook"])
@@ -143,6 +149,8 @@ app.include_router(calendar_uploads.router, prefix="/calendar-uploads", tags=["c
 app.include_router(public_stats.router, prefix="/public", tags=["public"])
 app.include_router(sop_videos.router, prefix="/sop-videos", tags=["sop-videos"])
 app.include_router(reports.router, prefix="/reports", tags=["reports"])
+app.include_router(mcp_router, tags=["mcp"])
+app.include_router(mcp_admin_router, prefix="/connectors/mcp", tags=["mcp"])
 
 # Phase 1b — uncomment as built:
 # from api.routers import outputs, brain, monitoring

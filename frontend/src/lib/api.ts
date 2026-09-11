@@ -3460,3 +3460,83 @@ export async function fetchContactDetail(contactId: string): Promise<ApiContactD
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to fetch contact"));
   return res.json();
 }
+
+/* ── Connectors: MCP (remote agent access) ─────────────────────────────── */
+
+export interface McpConnectorRow {
+  id: string;
+  name: string;
+  token_prefix: string;
+  enabled: boolean;
+  allow_writes: boolean;
+  last_used_at: string | null;
+  call_count: number;
+  created_at: string | null;
+}
+
+export interface McpConnectorList {
+  configured: boolean;
+  endpoint_path: string;
+  tool_count: number;
+  connectors: McpConnectorRow[];
+}
+
+export interface McpConnectorCreated {
+  connector: McpConnectorRow;
+  /** Returned once, at generation. Nothing can read it back afterwards. */
+  token: string;
+}
+
+/** Public URL an MCP client connects to. */
+export function mcpEndpointUrl(): string {
+  return `${API_URL}/mcp`;
+}
+
+export async function fetchMcpConnectors(): Promise<McpConnectorList> {
+  const res = await fetch(`${API_URL}/connectors/mcp`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to load MCP connectors"));
+  return res.json();
+}
+
+export async function createMcpConnector(
+  name: string,
+  allow_writes: boolean,
+): Promise<McpConnectorCreated> {
+  const res = await fetch(`${API_URL}/connectors/mcp`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ name, allow_writes }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to create MCP connector"));
+  return res.json();
+}
+
+export async function updateMcpConnector(
+  id: string,
+  data: Partial<{ name: string; enabled: boolean; allow_writes: boolean }>,
+): Promise<McpConnectorRow> {
+  const res = await fetch(`${API_URL}/connectors/mcp/${id}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to update MCP connector"));
+  return res.json();
+}
+
+export async function rotateMcpConnector(id: string): Promise<McpConnectorCreated> {
+  const res = await fetch(`${API_URL}/connectors/mcp/${id}/rotate`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to rotate token"));
+  return res.json();
+}
+
+export async function deleteMcpConnector(id: string): Promise<void> {
+  const res = await fetch(`${API_URL}/connectors/mcp/${id}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to revoke MCP connector"));
+}
