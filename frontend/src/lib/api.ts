@@ -890,7 +890,12 @@ export async function fetchGoodAvailable(refresh = false): Promise<GoodAvailable
   const res = await fetch(`${API_URL}/outreach/buckets/good-available${qs}`, { headers: authHeaders() });
   // Throw rather than return zeros: a failed count and a genuine zero look the
   // same in the header, and the caller renders "—" for the unknown case.
-  if (!res.ok) throw new Error("Failed to fetch good-available inventory");
+  // Carry the server's reason through — a forced recount that failed says so,
+  // and the header shows that instead of passing off the old numbers as new.
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to fetch good-available inventory");
+  }
   return res.json();
 }
 

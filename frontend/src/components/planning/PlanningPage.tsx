@@ -721,6 +721,10 @@ function apiWebinarToRow(w: ApiWebinar): Webinar {
 export function PlanningPage() {
   const [buckets, setBuckets] = useState<AvailableBucket[]>([]);
   const [goodAvail, setGoodAvail] = useState<GoodAvailable | null>(null);
+  /* Set when a forced recount failed. The last good numbers stay on screen —
+   * they're still the best estimate — but the pills are visibly marked so a
+   * failed recount never reads as "refreshed, nothing changed". */
+  const [goodAvailError, setGoodAvailError] = useState<string | null>(null);
   const [senders, setSenders] = useState<Sender[]>([]);
   const [editingSenders, setEditingSenders] = useState(false);
   const [webinars, setWebinars] = useState<Webinar[]>([]);
@@ -820,7 +824,7 @@ export function PlanningPage() {
       .finally(() => { if (!cancelled) setLoadingSenders(false); });
 
     fetchGoodAvailable()
-      .then((fresh) => { if (!cancelled) setGoodAvail(fresh); })
+      .then((fresh) => { if (!cancelled) { setGoodAvail(fresh); setGoodAvailError(null); } })
       .catch((err) => console.error("Failed to load good-available:", err))
       .finally(() => { if (!cancelled) setLoadingGoodAvail(false); });
 
@@ -885,8 +889,11 @@ export function PlanningPage() {
     // The forced recount scans the whole fresh pool and takes tens of seconds —
     // it spins its own pills and never blocks the others.
     const goodDone = fetchGoodAvailable(true)
-      .then(setGoodAvail)
-      .catch((err) => console.error("Failed to refresh good-available:", err))
+      .then((fresh) => { setGoodAvail(fresh); setGoodAvailError(null); })
+      .catch((err) => {
+        console.error("Failed to refresh good-available:", err);
+        setGoodAvailError(err instanceof Error ? err.message : "Recount failed");
+      })
       .finally(() => setLoadingGoodAvail(false));
 
     const metaDone = fetchWebinars()
@@ -2309,6 +2316,10 @@ export function PlanningPage() {
 
   const selectedCount = selectedIds.size;
 
+  // A failed recount leaves the last good numbers on screen, greyed rather than
+  // teal so they don't read as freshly counted.
+  const goodColor = goodAvailError ? "text-zinc-400 dark:text-zinc-500" : "text-teal-400";
+
   /* ── Render ────────────────────────────────────────────────────────── */
 
   return (
@@ -2320,23 +2331,33 @@ export function PlanningPage() {
             <h1 className="text-lg font-bold text-zinc-900 dark:text-zinc-100 tracking-tight">Campaign Planning</h1>
             <div className="flex gap-2">
               {[
-                { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200", loading: loadingWebinars },
-                { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400", loading: loadingWebinars },
-                { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400", loading: loadingBuckets },
-                { label: "Good Avail", value: goodAvail ? goodAvail.total.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
-                { label: "Good US+CA", value: goodAvail ? goodAvail.us_ca.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
-                { label: "Good EU", value: goodAvail ? goodAvail.europe.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
-                { label: "Good No-loc", value: goodAvail ? goodAvail.no_location.toLocaleString() : "—", color: "text-teal-400", loading: loadingGoodAvail },
-                { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400", loading: loadingWebinars },
+                { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200", loading: loadingWebinars, warn: null },
+                { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400", loading: loadingWebinars, warn: null },
+                { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400", loading: loadingBuckets, warn: null },
+                { label: "Good Avail", value: goodAvail ? goodAvail.total.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Good US+CA", value: goodAvail ? goodAvail.us_ca.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Good EU", value: goodAvail ? goodAvail.europe.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Good No-loc", value: goodAvail ? goodAvail.no_location.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400", loading: loadingWebinars, warn: null },
               ].map((s) => (
-                <div key={s.label} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40">
+                <div key={s.label}
+                  title={s.warn ? `${s.warn} — these are the numbers from before the refresh, not a fresh count.` : undefined}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border ${s.warn ? "border-red-500/40" : "border-zinc-200 dark:border-zinc-800/40"}`}>
                   {s.loading ? (
                     <span
                       title={`Loading ${s.label}…`}
                       className="w-3 h-3 my-0.5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin inline-block"
                     />
                   ) : (
-                    <span className={`text-sm font-bold font-mono ${s.color}`}>{s.value}</span>
+                    <>
+                      {s.warn && (
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                          strokeLinecap="round" strokeLinejoin="round" className="text-red-500 shrink-0" aria-label="Recount failed">
+                          <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+                        </svg>
+                      )}
+                      <span className={`text-sm font-bold font-mono ${s.color}`}>{s.value}</span>
+                    </>
                   )}
                   <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{s.label}</span>
                 </div>

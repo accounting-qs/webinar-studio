@@ -687,12 +687,23 @@ async def good_available_counts(
         # Planning's header refresh button: the operator is explicitly asking for
         # current numbers, so the cached copy is exactly what they don't want.
         # Drop the TTL and any rebuild backoff and wait for a real rebuild.
+        import time as _t
+        started = _t.monotonic()
         _GOOD_AVAIL["ts"] = 0.0
         _GOOD_AVAIL["retry_after"] = 0.0
         _GOOD_AVAIL["dirty"] = True
         data = await _good_available_rollup(allow_stale=False)
-    else:
-        data = await _good_available_rollup()
+        # _serve_rollup falls back to the last good copy when the rebuild throws
+        # (a statement timeout under load is the usual cause). Handing that back
+        # here would be indistinguishable from a successful recount that found
+        # nothing changed — precisely the lie this button exists to prevent — so
+        # only a copy stamped AFTER the click counts as a recount.
+        if data is None or _GOOD_AVAIL["ts"] < started:
+            raise HTTPException(
+                503, "Recount failed — the inventory numbers are still the previous ones")
+        return data
+
+    data = await _good_available_rollup()
     if data is None:
         # Never built, or backing off from a failed rebuild. The caller renders
         # "—" for an unknown value, which beats a 500.
