@@ -883,8 +883,11 @@ export interface GoodAvailable { total: number; us_ca: number; europe: number; n
  *  each bucket's saved Segments employee range applied where set. Returns the
  *  total plus geo splits (US+Canada, Europe, no-location); the splits are subsets
  *  of the total. */
-export async function fetchGoodAvailable(): Promise<GoodAvailable> {
-  const res = await fetch(`${API_URL}/outreach/buckets/good-available`, { headers: authHeaders() });
+/** `refresh` bypasses the server's 5-minute rollup cache and waits for a real
+ * recount — slow, so only the header's explicit Refresh button passes it. */
+export async function fetchGoodAvailable(refresh = false): Promise<GoodAvailable> {
+  const qs = refresh ? "?refresh=true" : "";
+  const res = await fetch(`${API_URL}/outreach/buckets/good-available${qs}`, { headers: authHeaders() });
   // Throw rather than return zeros: a failed count and a genuine zero look the
   // same in the header, and the caller renders "—" for the unknown case.
   if (!res.ok) throw new Error("Failed to fetch good-available inventory");

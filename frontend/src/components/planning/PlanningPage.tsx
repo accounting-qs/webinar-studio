@@ -687,6 +687,35 @@ function MultiCountryDropdown({
   );
 }
 
+/** Build a campaign row from the lightweight webinars-metadata payload.
+ * Lists are hydrated separately (lazily), so a row starts empty. Used both on
+ * first load and by the header's Refresh button. */
+function apiWebinarToRow(w: ApiWebinar): Webinar {
+  const d = new Date(w.date + "T00:00:00");
+  const dateStr = d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+  return {
+    id: w.id,
+    number: w.number,
+    date: dateStr,
+    isoDate: w.date,
+    status: w.status.charAt(0).toUpperCase() + w.status.slice(1),
+    broadcastId: w.broadcast_id || "—",
+    mainTitle: w.main_title || "",
+    registrationLink: w.registration_link || "",
+    unsubscribeLink: w.unsubscribe_link || "",
+    lists: [],
+    listsLoaded: false,
+    metaVolume: w.total_volume,
+    metaRemaining: w.total_remaining,
+    metaAccounts: w.total_accounts,
+    metaAssignmentCount: w.assignment_count,
+    expanded: w.status === "planning",
+    variantLabel: w.variant_label,
+    webinargeekCredentialId: w.webinargeek_credential_id,
+    nonjoinerSourceWebinarId: w.nonjoiner_source_webinar_id,
+  };
+}
+
 /* ─── Main Component ───────────────────────────────────────────────────── */
 
 export function PlanningPage() {
@@ -801,31 +830,7 @@ export function PlanningPage() {
         if (cancelled) return;
 
         // Build campaign rows from metadata only — lists are hydrated lazily.
-        const webinarList: Webinar[] = webinarsRes.webinars.map((w) => {
-          const d = new Date(w.date + "T00:00:00");
-          const dateStr = d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
-          return {
-            id: w.id,
-            number: w.number,
-            date: dateStr,
-            isoDate: w.date,
-            status: w.status.charAt(0).toUpperCase() + w.status.slice(1),
-            broadcastId: w.broadcast_id || "—",
-            mainTitle: w.main_title || "",
-            registrationLink: w.registration_link || "",
-            unsubscribeLink: w.unsubscribe_link || "",
-            lists: [],
-            listsLoaded: false,
-            metaVolume: w.total_volume,
-            metaRemaining: w.total_remaining,
-            metaAccounts: w.total_accounts,
-            metaAssignmentCount: w.assignment_count,
-            expanded: w.status === "planning",
-            variantLabel: w.variant_label,
-            webinargeekCredentialId: w.webinargeek_credential_id,
-            nonjoinerSourceWebinarId: w.nonjoiner_source_webinar_id,
-          };
-        });
+        const webinarList: Webinar[] = webinarsRes.webinars.map(apiWebinarToRow);
         setWebinars(webinarList);
 
         // Newest-first frontier for lazy hydration.
@@ -856,6 +861,68 @@ export function PlanningPage() {
     }
     loadCampaigns();
     return () => { cancelled = true; };
+  }, [hydrateWebinars]);
+
+  /* ── Header refresh ───────────────────────────────────────────────────
+   * Every header pill is a snapshot: /buckets serves stored counters, the
+   * Good-* inventory is a 5-minute server-side rollup, and the campaign totals
+   * come from the metadata fetched on mount. After an import, a claim, or a
+   * Segments edit they read stale, and the only cure used to be a full page
+   * reload. This re-pulls all three sources — forcing a real recount of the
+   * Good-* inventory rather than accepting the cached copy — while leaving the
+   * campaigns already hydrated (and their expanded state) untouched. */
+  const [refreshingStats, setRefreshingStats] = useState(false);
+  const handleRefreshStats = useCallback(async () => {
+    setRefreshingStats(true);
+    setLoadingBuckets(true);
+    setLoadingGoodAvail(true);
+
+    const bucketsDone = fetchBuckets()
+      .then(({ buckets: fresh }) => setBuckets(fresh))
+      .catch((err) => console.error("Failed to refresh buckets:", err))
+      .finally(() => setLoadingBuckets(false));
+
+    // The forced recount scans the whole fresh pool and takes tens of seconds —
+    // it spins its own pills and never blocks the others.
+    const goodDone = fetchGoodAvailable(true)
+      .then(setGoodAvail)
+      .catch((err) => console.error("Failed to refresh good-available:", err))
+      .finally(() => setLoadingGoodAvail(false));
+
+    const metaDone = fetchWebinars()
+      .then(({ webinars: fresh }) => {
+        setWebinars((prev) => {
+          const byId = new Map(prev.map((w) => [w.id, w]));
+          return fresh.map((w) => {
+            const row = apiWebinarToRow(w);
+            const existing = byId.get(w.id);
+            // Keep whatever this session already loaded or opened; take the
+            // metadata (and edits made elsewhere) from the server.
+            return existing
+              ? { ...row, lists: existing.lists, listsLoaded: existing.listsLoaded, expanded: existing.expanded }
+              : row;
+          });
+        });
+        const recency = [...fresh].sort((a, b) => b.date.localeCompare(a.date)).map((w) => w.id);
+        recencyOrderRef.current = recency;
+        // A webinar deleted elsewhere must not stay in the hydrated set, or
+        // Load-more would skip its replacement in the frontier.
+        const live = new Set(recency);
+        loadedWebinarIdsRef.current.forEach((id) => { if (!live.has(id)) loadedWebinarIdsRef.current.delete(id); });
+        setLoadedCount((c) => Math.min(c, recency.length));
+        // A campaign created elsewhere since this page loaded arrives with no
+        // lists; hydrate the newest ones so a planning row (which renders
+        // expanded) doesn't sit on "Loading lists…". Already-loaded ids are
+        // skipped inside hydrateWebinars, so this costs nothing otherwise.
+        return hydrateWebinars(recency.slice(0, INITIAL_LOAD));
+      })
+      .catch((err) => console.error("Failed to refresh campaigns:", err));
+
+    try {
+      await Promise.all([bucketsDone, goodDone, metaDone]);
+    } finally {
+      setRefreshingStats(false);
+    }
   }, [hydrateWebinars]);
 
   /** Load the rest of the campaigns' lists, newest-first, in small parallel
@@ -2274,6 +2341,18 @@ export function PlanningPage() {
                   <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{s.label}</span>
                 </div>
               ))}
+              <button
+                onClick={handleRefreshStats}
+                disabled={refreshingStats}
+                title={refreshingStats ? "Refreshing inventory…" : "Recount inventory (Good Available takes a while)"}
+                className="flex items-center justify-center px-2 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40 text-zinc-500 hover:text-violet-500 hover:border-violet-500/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                  className={refreshingStats ? "animate-spin" : ""}>
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+                  <path d="M21 3v6h-6"/>
+                </svg>
+              </button>
             </div>
           </div>
           <div className="flex items-center gap-3">

@@ -666,6 +666,7 @@ def _norm_location(s: str | None) -> str:
 
 @router.get("/buckets/good-available")
 async def good_available_counts(
+    refresh: bool = Query(False),
     _: str = Depends(require_auth),
 ):
     """Fresh 'ideal' inventory for the Planning header.
@@ -682,7 +683,16 @@ async def good_available_counts(
     splits are subsets of the total — the rest of the world (APAC/LATAM/etc.) is
     in the total but in none of the three splits.
     """
-    data = await _good_available_rollup()
+    if refresh:
+        # Planning's header refresh button: the operator is explicitly asking for
+        # current numbers, so the cached copy is exactly what they don't want.
+        # Drop the TTL and any rebuild backoff and wait for a real rebuild.
+        _GOOD_AVAIL["ts"] = 0.0
+        _GOOD_AVAIL["retry_after"] = 0.0
+        _GOOD_AVAIL["dirty"] = True
+        data = await _good_available_rollup(allow_stale=False)
+    else:
+        data = await _good_available_rollup()
     if data is None:
         # Never built, or backing off from a failed rebuild. The caller renders
         # "—" for an unknown value, which beats a 500.
