@@ -7,6 +7,7 @@ const TABS: { href: string; label: string }[] = [
   { href: "/statistics/home", label: "Home" },
   { href: "/statistics", label: "Statistics" },
   { href: "/statistics/segments", label: "Segments" },
+  { href: "/statistics/segments-v2", label: "Segments v2" },
   { href: "/statistics/by-list-source", label: "By List Source" },
   { href: "/statistics/employee-count", label: "Employee count" },
   { href: "/statistics/account-health", label: "Account Health" },

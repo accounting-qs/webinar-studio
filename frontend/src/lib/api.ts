@@ -1970,6 +1970,70 @@ export interface SegmentFunnelResponse {
 
 /** By-bucket funnel rollup across the selected webinars. Pass webinar UUIDs to
  * scope; omit for all passed webinars (the default). */
+export interface SegmentsV2Webinar {
+  webinarId: string;
+  number?: number | null;
+  variantLabel?: string | null;
+  date?: string | null;
+  title?: string | null;
+  label?: string | null;
+}
+
+export interface SegmentsV2Segment {
+  bucketId: string;
+  name: string;
+  /** The operator's manual good/medium/bad label on the bucket, shown next to
+   * the computed grade. null when never marked. */
+  quality?: string | null;
+  statEmpMin?: number | null;
+  statEmpMax?: number | null;
+}
+
+/** The segment × country × size cube behind the Segments v2 tab.
+ *
+ * Cells are packed positionally to keep the per-webinar grain small on the wire:
+ * `cells` rows are [segment, region, band, ...counts] and `webinarCells` rows
+ * are [webinar, segment, region, band, ...counts]. The count order is given by
+ * `metricKeys`; the index order by `segments` / `regions` / `bands` /
+ * `includedWebinars`. Percentages and grades are derived from these counts — the
+ * same rule as the Segments tab, never averaging per-webinar rates. */
+export interface SegmentsV2Response {
+  metricKeys: string[];
+  regions: string[];
+  bands: string[];
+  /** Bands holding a misparsed date rather than a headcount — greyed out and
+   * excluded from size grading. */
+  corruptBands: string[];
+  noSizeBand: string;
+  segments: SegmentsV2Segment[];
+  /** All passed webinars — the filter options. */
+  webinars: SegmentsV2Webinar[];
+  /** Index order for `webinarCells`. */
+  includedWebinars: SegmentsV2Webinar[];
+  includedWebinarIds: string[];
+  /** Selected webinars with no cube yet (excluded until a recompute builds
+   * them). Non-empty → prompt a recompute. */
+  pendingWebinarIds: string[];
+  cells: number[][];
+  webinarCells: number[][];
+  meta: StatisticsMeta;
+}
+
+/** Segments v2 cube across the selected webinars. Pass webinar UUIDs to scope;
+ * omit for all passed webinars (the default). */
+export async function fetchStatisticsSegmentsV2(
+  webinarIds?: string[] | null,
+  source: "auto" | "ghl" | "workbook" = "auto",
+): Promise<SegmentsV2Response> {
+  const qs = new URLSearchParams({ source });
+  if (webinarIds && webinarIds.length > 0) qs.set("webinars", webinarIds.join(","));
+  const res = await fetch(`${API_URL}/statistics/segments-v2?${qs.toString()}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to fetch the segments v2 cube");
+  return res.json();
+}
+
 export async function fetchStatisticsSegments(
   webinarIds?: string[] | null,
   source: "auto" | "ghl" | "workbook" = "auto",

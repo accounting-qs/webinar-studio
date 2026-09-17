@@ -879,6 +879,67 @@ class SegmentEmployeeResponse(BaseModel):
     bands: list[SegmentEmployeeBand]
 
 
+class SegmentsV2Webinar(BaseModel):
+    webinarId: str
+    number: int | None = None
+    variantLabel: str | None = None
+    date: str | None = None
+    title: str | None = None
+    label: str | None = None
+
+
+class SegmentsV2Segment(BaseModel):
+    bucketId: str
+    name: str
+    # The operator's manual good/medium/bad label on the bucket, shown alongside
+    # the computed grade. None when never marked.
+    quality: str | None = None
+    statEmpMin: int | None = None
+    statEmpMax: int | None = None
+
+
+class SegmentsV2Response(BaseModel):
+    """The segment × country × size cube. Cells are packed positionally to keep
+    the per-webinar grain (a few thousand rows) small on the wire:
+    `cells` rows are [segment, region, band, ...counts] and `webinarCells` rows
+    are [webinar, segment, region, band, ...counts], where the count order is
+    given by `metricKeys` and the index order by `segments` / `regions` /
+    `bands` / `includedWebinars`."""
+    metricKeys: list[str]
+    regions: list[str]
+    bands: list[str]
+    # Bands holding a misparsed date rather than a headcount — greyed out and
+    # excluded from size grading by the client.
+    corruptBands: list[str]
+    noSizeBand: str
+    segments: list[SegmentsV2Segment]
+    webinars: list[SegmentsV2Webinar]          # all passed webinars (filter options)
+    includedWebinars: list[SegmentsV2Webinar]  # index order for webinarCells
+    includedWebinarIds: list[str]
+    # Selected webinars with no cube yet — excluded from the totals until a
+    # recompute builds them (mirrors /segments).
+    pendingWebinarIds: list[str] = []
+    cells: list[list[int]]
+    webinarCells: list[list[int]]
+    meta: StatisticsMetaResponse
+
+
+@router.get("/segments-v2", response_model=SegmentsV2Response)
+async def get_statistics_segments_v2(source: str = "auto", webinars: str | None = None):
+    """Segments v2 — one payload behind all three reports on the tab: the graded
+    segment ranking, the segment → country → size breakdown, and the per-webinar
+    composition. `webinars` is a comma-separated list of Webinar UUIDs; omit to
+    include every passed webinar.
+
+    Reads the precomputed snapshots only (POST /statistics/recompute builds
+    them); webinars whose snapshot predates the cross come back as pending."""
+    ids = [x.strip() for x in webinars.split(",")] if webinars else []
+    ids = [x for x in ids if x]
+    data = await stats_svc.get_statistics_segments_v2(source=source, webinar_ids=ids or None)
+    meta = await _resolve_meta(source)
+    return {**data, "meta": meta}
+
+
 @router.get("/segments/{bucket_id}/by-employee", response_model=SegmentEmployeeResponse)
 async def get_statistics_segment_by_employee(
     bucket_id: str, source: str = "auto", webinars: str | None = None

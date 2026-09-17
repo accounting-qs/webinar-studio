@@ -216,6 +216,47 @@ def _webinar_series_regex(webinar_number: int) -> str:
 # ---------------------------------------------------------------------------
 # Lead-source parsing (for the "By List Source" statistics tab)
 # ---------------------------------------------------------------------------
+# Region bucket for a contact, derived from free-text country.
+#
+# contacts.country is operator/vendor free text and is frequently a stringified
+# Python list ("['London', 'England', 'United Kingdom']", "'Germany']"), so the
+# country name is taken as the last comma-separated element with brackets and
+# quotes stripped, falling back to company_country. Anything unrecognised lands
+# in 'Other'; a missing value in '(unknown)' — real volume we invited without a
+# country, not an error.
+_REGION_RAW = (
+    "COALESCE(NULLIF(btrim(c.country), ''), NULLIF(btrim(c.company_country), ''))"
+)
+_REGION_NORM = (
+    f"NULLIF(btrim(split_part({_REGION_RAW}, ',', "
+    f"GREATEST(1, array_length(string_to_array({_REGION_RAW}, ','), 1))), ' []''\"'), '')"
+)
+_REGION_US = ("'United States', 'US', 'USA', 'U.S.', 'U.S.A.', "
+              "'United States of America'")
+_REGION_CA = "'Canada', 'CA'"
+_REGION_EU = (
+    "'United Kingdom', 'UK', 'England', 'Scotland', 'Wales', 'Northern Ireland', "
+    "'Ireland', 'Germany', 'France', 'Netherlands', 'Italy', 'Spain', 'Switzerland', "
+    "'Poland', 'Sweden', 'Belgium', 'Portugal', 'Denmark', 'Finland', 'Austria', "
+    "'Norway', 'Romania', 'Hungary', 'Greece', 'Czech Republic', 'Czechia', "
+    "'Estonia', 'Slovakia', 'Serbia', 'Luxembourg', 'Cyprus', 'Lithuania', "
+    "'Slovenia', 'Malta', 'Bulgaria', 'Ukraine', 'Croatia', 'Latvia', 'Iceland', "
+    "'Monaco', 'Andorra', 'Moldova', 'Liechtenstein', 'Bosnia and Herzegovina', "
+    "'North Macedonia', 'Albania', 'Montenegro', 'San Marino', 'Belarus', 'Kosovo', "
+    "'Faroe Islands', 'Gibraltar', 'Jersey', 'Guernsey', 'Isle of Man'"
+)
+REGION_EXPR = f"""CASE
+            WHEN {_REGION_NORM} IS NULL THEN '(unknown)'
+            WHEN {_REGION_NORM} IN ({_REGION_US}) THEN 'United States'
+            WHEN {_REGION_NORM} IN ({_REGION_CA}) THEN 'Canada'
+            WHEN {_REGION_NORM} IN ({_REGION_EU}) THEN 'Europe'
+            ELSE 'Other'
+          END"""
+# The canonical region labels, in display order.
+REGION_LABELS = ("United States", "Canada", "Europe", "Other", "(unknown)")
+
+
+# ---------------------------------------------------------------------------
 # Raw metric keys summed per (source, vintage) cell. Kept identical to the
 # Segments tab's _FUNNEL_RAW_KEYS so the aggregate + frontend reuse the same
 # funnel-derivation logic (percentages derived from these sums, never averaged).
@@ -808,21 +849,33 @@ class GoHighLevelStatisticsSource:
             # drill-down, both out of the same scan (see split_by_bucket).
             employee_rows: list[dict[str, Any]] = []
             segment_employee_rows: dict[str, list[dict[str, Any]]] = {}
+            segment_geo_rows: list[dict[str, Any]] = []
             try:
-                emp_cells = await self._compute_per_employee_cells(db, w, split_by_bucket=True)
+                emp_cells = await self._compute_per_employee_cells(
+                    db, w, split_by_bucket=True, split_by_region=True
+                )
                 for cell in emp_cells:
                     seg = cell.get("bucketId")
+                    region = cell.get("region")
                     if seg is None:
                         employee_rows.append(cell)
-                    else:
+                    elif region is None:
                         segment_employee_rows.setdefault(seg, []).append(
                             {"bucket": cell["bucket"], "metrics": cell["metrics"]}
                         )
+                    else:
+                        segment_geo_rows.append({
+                            "bucketId": seg,
+                            "region": region,
+                            "bucket": cell["bucket"],
+                            "metrics": cell["metrics"],
+                        })
             except Exception:
                 logger.exception("per-employee cells failed for webinar %s — continuing without", w.number)
                 await db.rollback()
                 employee_rows = []
                 segment_employee_rows = {}
+                segment_geo_rows = []
 
         return {
             "number": w.number,
@@ -839,6 +892,12 @@ class GoHighLevelStatisticsSource:
             # statistics_snapshot.read_all_payloads); the drill-down selects
             # just the one segment's key out of JSONB.
             "segmentEmployeeRows": segment_employee_rows,
+            # [{bucketId, region, bucket: size label, metrics}] — the segment x
+            # country x size cube behind the Segments v2 tab. Kept per webinar so
+            # the same key serves both the cross-webinar rollup and the
+            # per-webinar composition view. Stripped from the bulk snapshot
+            # reads (see statistics_snapshot.read_all_payloads).
+            "segmentGeoRows": segment_geo_rows,
             "summary": summary,
             "status": w.status,
             # Operators read this on the stats page to know whether
@@ -2070,6 +2129,7 @@ class GoHighLevelStatisticsSource:
 
     async def _compute_per_employee_cells(
         self, db: AsyncSession, w: Webinar, split_by_bucket: bool = False,
+        split_by_region: bool = False,
     ) -> list[dict[str, Any]]:
         """Per company-size funnel cells for a webinar's cold lists — the data
         behind the "Employee count" tab.
@@ -2136,13 +2196,28 @@ class GoHighLevelStatisticsSource:
         # with it, GROUPING SETS adds the segment × size cross in the same scan.
         # GROUPING(seg) separates the rollup row from a genuine NULL bucket_id
         # (an assignment with no segment attached).
+        # `split_by_region` adds a THIRD grouping set — segment × region × size —
+        # in the same scan. The first two sets are untouched, so the
+        # webinar-wide and segment × size rows stay byte-identical; the new rows
+        # are told apart by GROUPING(region) = 0 and routed to their own payload
+        # key. Region cells are what the Segments v2 tab grades on.
         seg_select = "t.seg, GROUPING(t.seg) AS is_rollup, "
+        region_select = "NULL::text AS region, 1 AS no_region, "
         group_by = (
             "GROUP BY GROUPING SETS ((t.bucket), (t.bucket, t.seg))"
             if split_by_bucket else "GROUP BY t.bucket"
         )
         if not split_by_bucket:
             seg_select = "NULL::text AS seg, 1 AS is_rollup, "
+            split_by_region = False
+        if split_by_region:
+            region_select = "t.region, GROUPING(t.region) AS no_region, "
+            group_by = ("GROUP BY GROUPING SETS "
+                        "((t.bucket), (t.bucket, t.seg), (t.bucket, t.seg, t.region))")
+        seg_select = seg_select + region_select
+        # Region is only projected into the inner scan when it is grouped on.
+        region_inner = (f"{REGION_EXPR} AS region," if split_by_region
+                        else "NULL::text AS region,")
 
         # Chunked probes + small-side joins want nested loops (see
         # _compute_per_source_cells).
@@ -2150,13 +2225,15 @@ class GoHighLevelStatisticsSource:
 
         # {(bucketId|None, size bucket): {raw metric: count}} — merged across the
         # batches. bucketId None = the webinar-wide rollup row.
-        raw: dict[tuple[str | None, str], dict[str, int]] = {}
+        raw: dict[tuple[str | None, str | None, str], dict[str, int]] = {}
 
         def _slot(row) -> dict[str, int]:
             seg = None if int(row["is_rollup"] or 0) == 1 else (
                 str(row["seg"]) if row["seg"] is not None else "__none__"
             )
-            return raw.setdefault((seg, row["bucket"]), {})
+            # region None = a row from one of the two coarser grouping sets.
+            region = None if int(row["no_region"] or 0) == 1 else str(row["region"])
+            return raw.setdefault((seg, region, row["bucket"]), {})
 
         # invited: distinct cold contacts per size bucket — chunked per
         # assignment like per-source (exact under summation).
@@ -2166,6 +2243,7 @@ class GoHighLevelStatisticsSource:
             FROM (
                 SELECT {bucket_expr} AS bucket,
                     CAST(wla.bucket_id AS text) AS seg,
+                    {region_inner}
                     LOWER(c.email) AS email
                 FROM contacts c
                 JOIN webinar_contact_memberships m ON m.contact_id = c.id
@@ -2196,6 +2274,7 @@ class GoHighLevelStatisticsSource:
                 FROM (
                     SELECT {bucket_expr} AS bucket,
                         CAST(wla.bucket_id AS text) AS seg,
+                        {region_inner}
                         LOWER(c.email) AS email,
                         (wgs.watched_live = TRUE OR wgs.minutes_viewing > 0) AS attended,
                         COALESCE(wgs.minutes_viewing, 0) AS minutes_viewing
@@ -2237,6 +2316,7 @@ class GoHighLevelStatisticsSource:
             FROM (
                 SELECT {bucket_expr} AS bucket,
                     CAST(wla.bucket_id AS text) AS seg,
+                    {region_inner}
                     o.ghl_opportunity_id AS opp_id,
                     g.ghl_contact_id AS ghl_contact_id,
                     LOWER(COALESCE(o.call1_appointment_status, '')) AS appt_status,
@@ -2281,7 +2361,7 @@ class GoHighLevelStatisticsSource:
         # segment are dropped from the split ("__none__") — the drill-down is
         # per named segment.
         cells: list[dict[str, Any]] = []
-        for (seg, bucket), metrics in raw.items():
+        for (seg, region, bucket), metrics in raw.items():
             if seg == "__none__":
                 continue
             cell: dict[str, Any] = {
@@ -2290,6 +2370,8 @@ class GoHighLevelStatisticsSource:
             }
             if seg is not None:
                 cell["bucketId"] = seg
+            if region is not None:
+                cell["region"] = region
             cells.append(cell)
         return cells
 

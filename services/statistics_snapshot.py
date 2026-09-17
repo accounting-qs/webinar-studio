@@ -35,6 +35,11 @@ def _snap_source(source: str) -> str:
 # cross (written by the recompute, read by the Segments-tab drill-down).
 _SEGMENT_EMPLOYEE_KEY = "segmentEmployeeRows"
 
+# Payload key holding the [{bucketId, region, bucket, metrics}] segment x country
+# x size cube (written by the recompute, read by the Segments v2 tab). Like the
+# key above it is stripped from bulk reads and selected out of JSONB on demand.
+_SEGMENT_GEO_KEY = "segmentGeoRows"
+
 
 # ---------------------------------------------------------------------------
 # Read helpers
@@ -59,11 +64,12 @@ async def read_all_payloads(source: str) -> dict[str, dict[str, Any]]:
     """Every snapshot payload for a source, keyed by webinar_id. One query —
     powers the Segments rollup without N per-webinar reads.
 
-    `segmentEmployeeRows` is stripped server-side: it is the drill-down's
-    per-segment × company-size cross (one row per segment per size band), which
-    no bulk consumer reads and which would otherwise multiply the bytes this
-    pulls over the wire on every tab load. read_segment_employee_cells() selects
-    the one segment's slice straight out of JSONB instead."""
+    `segmentEmployeeRows` and `segmentGeoRows` are stripped server-side: they are
+    the drill-down crosses (one row per segment per size band, and per segment
+    per country per size band), which no bulk consumer reads and which would
+    otherwise multiply the bytes this pulls over the wire on every tab load.
+    read_segment_employee_cells() and read_segment_geo_rows() select them
+    straight out of JSONB instead."""
     from sqlalchemy import cast, literal, select, Text
     from sqlalchemy.dialects.postgresql import JSONB
     from db.models import StatisticsSnapshot
@@ -71,6 +77,8 @@ async def read_all_payloads(source: str) -> dict[str, dict[str, Any]]:
 
     payload_lite = StatisticsSnapshot.payload.op("-", return_type=JSONB)(
         cast(literal(_SEGMENT_EMPLOYEE_KEY), Text)
+    ).op("-", return_type=JSONB)(
+        cast(literal(_SEGMENT_GEO_KEY), Text)
     ).label("payload")
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
@@ -100,6 +108,34 @@ async def read_segment_employee_cells(
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
             select(StatisticsSnapshot.webinar_id, seg_col, has_key).where(
+                StatisticsSnapshot.source == _snap_source(source)
+            )
+        )).all()
+    cells = {wid: c for wid, c, _hk in rows if c}
+    computed = {wid for wid, _c, hk in rows if hk}
+    return cells, computed
+
+
+async def read_segment_geo_rows(
+    source: str,
+) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+    """The segment × country × size cube per webinar, straight out of JSONB.
+
+    Returns ({webinar_id: cells}, {webinar_ids whose snapshot carries the key}).
+    A webinar in the second set but not the first has no cold-list contacts at
+    all; one in neither predates the key and needs a recompute before its
+    numbers can be included. Powers all three Segments v2 reports: summing the
+    cells across webinars gives the segment and segment × country × size
+    rollups, and keeping them per webinar gives the composition view."""
+    from sqlalchemy import select
+    from db.models import StatisticsSnapshot
+    from db.session import AsyncSessionLocal
+
+    geo_col = StatisticsSnapshot.payload[_SEGMENT_GEO_KEY].label("cells")
+    has_key = StatisticsSnapshot.payload.has_key(_SEGMENT_GEO_KEY).label("has_key")
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(StatisticsSnapshot.webinar_id, geo_col, has_key).where(
                 StatisticsSnapshot.source == _snap_source(source)
             )
         )).all()

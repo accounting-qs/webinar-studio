@@ -1253,3 +1253,169 @@ async def get_statistics_by_employee(
         "perWebinar": per_webinar,
         "totals": totals,
     }
+
+
+# ---------------------------------------------------------------------------
+# Segments v2 — the segment × country × size cube
+# ---------------------------------------------------------------------------
+
+# Metric order of every packed cell in the Segments v2 payload. Emitted in the
+# response as `metricKeys` so the client indexes by name and can never drift
+# out of step with this order.
+_V2_METRICS: tuple[tuple[str, str], ...] = (
+    ("invites", "invited"),
+    ("regs", "totalRegs"),
+    ("attended", "totalAttended"),
+    ("attendees10m", "total10MinPlus"),
+    ("bookings", "totalBookings"),
+    ("callsPassed", "totalCallsDatePassed"),
+    ("shows", "shows"),
+    ("won", "won"),
+    ("qualified", "qualified"),
+)
+
+# Size bands whose contents are not a real headcount: 99.5% of the contacts in
+# them carry a misparsed date (2042025 / 1520 / 1019) from one lead import. The
+# client greys them out and excludes them from size grading; they still count in
+# every segment and country total, so the arithmetic reconciles.
+_V2_CORRUPT_BANDS: tuple[str, ...] = ("1001 - 2000", "10000+")
+
+_V2_NO_SIZE = "(no size)"
+
+
+async def get_statistics_segments_v2(
+    source: str = "auto",
+    webinar_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """The segment × country × size cube behind the Segments v2 tab.
+
+    One read of the precomputed `segmentGeoRows` cross (written per webinar by
+    the recompute — see _compute_per_employee_cells's split_by_region) serves all
+    three reports: `cells` sums the cube across the selected webinars for the
+    segment ranking and the country/size breakdown, and `webinarCells` keeps it
+    per webinar for the composition view. Cells are packed positionally
+    ([segment, region, band, ...counts]) because the per-webinar grain runs to a
+    few thousand rows and the object-per-cell form roughly quadruples the bytes.
+
+    Percentages and grades are derived client-side from these counts, never
+    averaged across webinars — same rule as /segments.
+    """
+    from services.ghl_statistics_source import REGION_LABELS
+    from services import statistics_snapshot as snap
+
+    summaries = await get_statistics_webinar_list(source=source)
+    passed = [s for s in summaries if _is_passed_webinar(s.get("date"), s.get("status"))]
+    passed.sort(key=lambda s: (s.get("date") or "", s.get("variantLabel") or ""), reverse=True)
+
+    webinar_options = [
+        {
+            "webinarId": s.get("webinarId"),
+            "number": s.get("number"),
+            "variantLabel": s.get("variantLabel"),
+            "date": s.get("date"),
+            "title": s.get("title"),
+            "label": _segment_webinar_label(s),
+        }
+        for s in passed
+        if s.get("webinarId")
+    ]
+    all_ids = [o["webinarId"] for o in webinar_options]
+    if webinar_ids:
+        wanted = set(webinar_ids)
+        target_ids = [i for i in all_ids if i in wanted]
+    else:
+        target_ids = list(all_ids)
+
+    try:
+        geo_by_webinar, computed = await snap.read_segment_geo_rows(source)
+    except Exception:
+        logger.exception("segments v2: reading the geo cross failed")
+        geo_by_webinar, computed = {}, set()
+
+    # A webinar with a snapshot but no cells is legitimately empty; one without
+    # the key predates the cross and needs a recompute before it can be counted.
+    pending_ids = [wid for wid in target_ids if wid not in computed]
+    included_ids = [wid for wid in target_ids if wid in computed]
+
+    bands = [b for b, _lo, _hi in _EMPLOYEE_BANDS] + [_V2_NO_SIZE]
+    band_index = {b: i for i, b in enumerate(bands)}
+    region_index = {r: i for i, r in enumerate(REGION_LABELS)}
+
+    seg_index: dict[str, int] = {}
+    web_index: dict[str, int] = {}
+    # (segment, region, band) -> summed counts, and the same keyed per webinar.
+    agg: dict[tuple[int, int, int], list[int]] = {}
+    per_webinar: dict[tuple[int, int, int, int], list[int]] = {}
+
+    for wid in included_ids:
+        cells = geo_by_webinar.get(wid) or []
+        if not cells:
+            continue
+        wi = web_index.setdefault(wid, len(web_index))
+        for cell in cells:
+            bucket_id = cell.get("bucketId")
+            region = cell.get("region")
+            band = cell.get("bucket")
+            if not bucket_id or region not in region_index or band not in band_index:
+                continue
+            si = seg_index.setdefault(bucket_id, len(seg_index))
+            key = (si, region_index[region], band_index[band])
+            metrics = cell.get("metrics") or {}
+            vals = [int(metrics.get(raw) or 0) for _name, raw in _V2_METRICS]
+            slot = agg.get(key)
+            if slot is None:
+                agg[key] = list(vals)
+            else:
+                for i, v in enumerate(vals):
+                    slot[i] += v
+            wkey = (wi, *key)
+            wslot = per_webinar.get(wkey)
+            if wslot is None:
+                per_webinar[wkey] = list(vals)
+            else:
+                for i, v in enumerate(vals):
+                    wslot[i] += v
+
+    # Names + the operator's manual quality label for every segment present.
+    segments: list[dict[str, Any]] = [{} for _ in seg_index]
+    if seg_index:
+        from sqlalchemy import select
+        from db.session import AsyncSessionLocal
+        from db.models import OutreachBucket
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(
+                    OutreachBucket.id, OutreachBucket.name, OutreachBucket.quality,
+                    OutreachBucket.stat_emp_min, OutreachBucket.stat_emp_max,
+                ).where(OutreachBucket.id.in_(list(seg_index.keys())))
+            )
+            rows = {r[0]: r for r in res.all()}
+        for bucket_id, si in seg_index.items():
+            r = rows.get(bucket_id)
+            segments[si] = {
+                "bucketId": bucket_id,
+                "name": (r[1] if r else None) or "(deleted segment)",
+                "quality": r[2] if r else None,
+                "statEmpMin": r[3] if r else None,
+                "statEmpMax": r[4] if r else None,
+            }
+
+    by_id = {o["webinarId"]: o for o in webinar_options}
+    included = [{} for _ in web_index]
+    for wid, wi in web_index.items():
+        included[wi] = by_id.get(wid) or {"webinarId": wid}
+
+    return {
+        "metricKeys": [name for name, _raw in _V2_METRICS],
+        "regions": list(REGION_LABELS),
+        "bands": bands,
+        "corruptBands": list(_V2_CORRUPT_BANDS),
+        "noSizeBand": _V2_NO_SIZE,
+        "segments": segments,
+        "webinars": webinar_options,
+        "includedWebinars": included,
+        "includedWebinarIds": included_ids,
+        "pendingWebinarIds": pending_ids,
+        "cells": [[*k, *v] for k, v in agg.items()],
+        "webinarCells": [[*k, *v] for k, v in per_webinar.items()],
+    }
