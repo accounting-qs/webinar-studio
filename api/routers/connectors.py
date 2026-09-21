@@ -1,5 +1,10 @@
 """
-Connectors router — WebinarGeek integration.
+Connectors router — webinar platform integrations (WebinarGeek + Zoom) and the
+other third-party credentials.
+
+Both webinar platforms cache into the same shared tables (webinar_broadcasts /
+webinar_registrants, discriminated by `provider`), so every WebinarGeek-facing
+query here must stay provider-scoped or it will start picking up Zoom rows.
 
 Endpoints:
   Credentials:
@@ -16,6 +21,17 @@ Endpoints:
   Subscribers (cached):
     GET    /connectors/webinargeek/subscribers?broadcast_id=&q=&limit=&offset=
     GET    /connectors/webinargeek/subscribers/export?broadcast_id=   (CSV)
+
+  Zoom (Server-to-Server OAuth, single account):
+    GET    /connectors/zoom                            (status + required scopes)
+    PUT    /connectors/zoom                            (verifies before saving)
+    DELETE /connectors/zoom
+    GET    /connectors/zoom/webinars?limit=&offset=&q=
+    POST   /connectors/zoom/webinars/refresh
+    POST   /connectors/zoom/webinars/sync-all
+    POST   /connectors/zoom/webinars/{broadcast_id}/sync
+    GET    /connectors/zoom/registrants?broadcast_id=&q=&limit=&offset=
+    GET    /connectors/zoom/registrants/export?broadcast_id=          (CSV)
 """
 from __future__ import annotations
 
@@ -35,13 +51,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
 from db.models import (
-    ConnectorCredential, GHLSyncRun, WebinarGeekWebinar, WebinarGeekSubscriber,
+    ConnectorCredential, GHLSyncRun, WebinarBroadcast, WebinarRegistrant,
 )
 from db.session import AsyncSessionLocal, get_db
 from integrations import webinargeek_client as wg
 from integrations import openai_client as oai
 from integrations import ghl_client as ghl
-from services import wg_sync
+from integrations import zoom_client as zc
+from services import wg_sync, zoom_sync
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +67,7 @@ router = APIRouter(dependencies=[Depends(require_auth)])
 PROVIDER = "webinargeek"
 OPENAI_PROVIDER = "openai"
 GHL_PROVIDER = "ghl"
+ZOOM_PROVIDER = "zoom"
 ANTHROPIC_PROVIDER = "anthropic"
 RESEND_PROVIDER = "resend"
 
@@ -145,6 +163,47 @@ class SubscriberOut(BaseModel):
 class SubscriberListResponse(BaseModel):
     subscribers: list[SubscriberOut]
     total: int
+
+
+# The scopes the Zoom Server-to-Server OAuth app needs. Surfaced by the status
+# endpoint so the Connectors page can show them verbatim — a missing scope is
+# the most common setup failure, and Zoom's console offers no hint about which
+# ones an integration actually requires.
+ZOOM_SCOPES: list[dict[str, str]] = [
+    {"scope": "webinar:read:list_webinars:admin", "classic": "webinar:read:admin",
+     "why": "List the account's webinars for the picker"},
+    {"scope": "webinar:read:webinar:admin", "classic": "webinar:read:admin",
+     "why": "Webinar title, start time, duration and occurrences"},
+    {"scope": "webinar:read:list_registrants:admin", "classic": "webinar:read:admin",
+     "why": "Who registered, plus their company and job title"},
+    {"scope": "webinar:read:list_past_instances:admin", "classic": "webinar:read:admin",
+     "why": "Resolve which past session a recurring occurrence was"},
+    {"scope": "webinar:read:list_absentees:admin", "classic": "webinar:read:admin",
+     "why": "No-show cross-check — not called by the sync today, add it so it is there if needed"},
+    {"scope": "report:read:list_webinar_participants:admin", "classic": "report:read:admin",
+     "why": "Attendance and watch duration — the 10 and 30 minute metrics"},
+    {"scope": "report:read:webinar:admin", "classic": "report:read:admin",
+     "why": "Webinar-level totals — not called by the sync today, comes with report:read:admin anyway"},
+    {"scope": "user:read:list_users:admin", "classic": "user:read:admin",
+     "why": "Find every host on the account, not just the app owner"},
+]
+
+
+class ZoomCredentialStatus(BaseModel):
+    configured: bool
+    account_id: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret_masked: Optional[str] = None
+    # Which Zoom account the credentials actually resolve to, so the page can
+    # show more than "connected".
+    account_email: Optional[str] = None
+    scopes: list[dict[str, str]] = []
+
+
+class SetZoomCredentialRequest(BaseModel):
+    account_id: str
+    client_id: str
+    client_secret: str
 
 
 # ---------------------------------------------------------------------------
@@ -632,34 +691,39 @@ async def list_broadcasts(
     credential_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    base = select(WebinarGeekWebinar)
-    count_base = select(func.count()).select_from(WebinarGeekWebinar)
+    # webinar_broadcasts is shared with Zoom — scope every WebinarGeek-facing
+    # read to this provider or the picker starts offering Zoom broadcasts.
+    base = select(WebinarBroadcast).where(WebinarBroadcast.provider == PROVIDER)
+    count_base = (
+        select(func.count()).select_from(WebinarBroadcast)
+        .where(WebinarBroadcast.provider == PROVIDER)
+    )
     if q:
         like = f"%{q}%"
         base = base.where(or_(
-            WebinarGeekWebinar.name.ilike(like),
-            WebinarGeekWebinar.internal_title.ilike(like),
-            WebinarGeekWebinar.broadcast_id.ilike(like),
+            WebinarBroadcast.name.ilike(like),
+            WebinarBroadcast.internal_title.ilike(like),
+            WebinarBroadcast.broadcast_id.ilike(like),
         ))
         count_base = count_base.where(or_(
-            WebinarGeekWebinar.name.ilike(like),
-            WebinarGeekWebinar.internal_title.ilike(like),
-            WebinarGeekWebinar.broadcast_id.ilike(like),
+            WebinarBroadcast.name.ilike(like),
+            WebinarBroadcast.internal_title.ilike(like),
+            WebinarBroadcast.broadcast_id.ilike(like),
         ))
     if credential_id:
-        base = base.where(WebinarGeekWebinar.credential_id == credential_id)
-        count_base = count_base.where(WebinarGeekWebinar.credential_id == credential_id)
+        base = base.where(WebinarBroadcast.credential_id == credential_id)
+        count_base = count_base.where(WebinarBroadcast.credential_id == credential_id)
 
     total = (await db.execute(count_base)).scalar_one()
 
     rows = (await db.execute(
-        base.order_by(WebinarGeekWebinar.starts_at.desc().nullslast())
+        base.order_by(WebinarBroadcast.starts_at.desc().nullslast())
             .limit(limit).offset(offset)
     )).scalars().all()
 
     synced_counts = dict((await db.execute(
-        select(WebinarGeekSubscriber.broadcast_id, func.count())
-        .group_by(WebinarGeekSubscriber.broadcast_id)
+        select(WebinarRegistrant.broadcast_id, func.count())
+        .group_by(WebinarRegistrant.broadcast_id)
     )).all())
 
     cred_names = dict((await db.execute(
@@ -747,6 +811,7 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
         placeholder_name = f"Broadcast {broadcast_id}"
         values = {
             "broadcast_id": broadcast_id,
+            "provider": PROVIDER,
             "credential_id": cred_id,
             "webinar_id": str(m["webinar_id"]) if m["webinar_id"] is not None else None,
             "name": m["webinar_title"] or placeholder_name,
@@ -761,19 +826,19 @@ async def refresh_broadcasts(db: AsyncSession = Depends(get_db)):
             "raw": b,
             "updated_at": datetime.now(timezone.utc),
         }
-        stmt = pg_insert(WebinarGeekWebinar).values(**values)
+        stmt = pg_insert(WebinarBroadcast).values(**values)
         set_cols = {k: v for k, v in values.items() if k != "broadcast_id"}
         # A later refresh that loses the webinar link must not wipe values we
         # already captured: keep the prior internal_title / webinar_id, and the
         # prior name unless we now have a real (non-placeholder) title.
         set_cols["internal_title"] = func.coalesce(
-            stmt.excluded.internal_title, WebinarGeekWebinar.internal_title
+            stmt.excluded.internal_title, WebinarBroadcast.internal_title
         )
         set_cols["webinar_id"] = func.coalesce(
-            stmt.excluded.webinar_id, WebinarGeekWebinar.webinar_id
+            stmt.excluded.webinar_id, WebinarBroadcast.webinar_id
         )
         set_cols["name"] = func.coalesce(
-            func.nullif(stmt.excluded.name, placeholder_name), WebinarGeekWebinar.name
+            func.nullif(stmt.excluded.name, placeholder_name), WebinarBroadcast.name
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["broadcast_id"],
@@ -794,7 +859,7 @@ async def sync_broadcast_subscribers(broadcast_id: str, db: AsyncSession = Depen
     the user navigates away.
     """
     wb = (await db.execute(
-        select(WebinarGeekWebinar).where(WebinarGeekWebinar.broadcast_id == broadcast_id)
+        select(WebinarBroadcast).where(WebinarBroadcast.broadcast_id == broadcast_id)
     )).scalar_one_or_none()
     if not wb:
         raise HTTPException(status_code=404, detail="Broadcast not cached — refresh first")
@@ -830,7 +895,8 @@ async def sync_all_broadcasts(db: AsyncSession = Depends(get_db)):
     overall progress; each per-broadcast sync also gets its own row.
     """
     count = (await db.execute(
-        select(func.count()).select_from(WebinarGeekWebinar)
+        select(func.count()).select_from(WebinarBroadcast)
+        .where(WebinarBroadcast.provider == PROVIDER)
     )).scalar_one()
 
     task = asyncio.create_task(wg_sync.run_sync_all(trigger="manual"))
@@ -861,17 +927,17 @@ async def sync_all_broadcasts(db: AsyncSession = Depends(get_db)):
 # Subscribers
 # ---------------------------------------------------------------------------
 def _subscriber_query(broadcast_id: Optional[str], q: Optional[str]):
-    stmt = select(WebinarGeekSubscriber)
-    count_stmt = select(func.count()).select_from(WebinarGeekSubscriber)
+    stmt = select(WebinarRegistrant)
+    count_stmt = select(func.count()).select_from(WebinarRegistrant)
     if broadcast_id:
-        stmt = stmt.where(WebinarGeekSubscriber.broadcast_id == broadcast_id)
-        count_stmt = count_stmt.where(WebinarGeekSubscriber.broadcast_id == broadcast_id)
+        stmt = stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
+        count_stmt = count_stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
     if q:
         like = f"%{q}%"
         cond = or_(
-            WebinarGeekSubscriber.email.ilike(like),
-            WebinarGeekSubscriber.first_name.ilike(like),
-            WebinarGeekSubscriber.last_name.ilike(like),
+            WebinarRegistrant.email.ilike(like),
+            WebinarRegistrant.first_name.ilike(like),
+            WebinarRegistrant.last_name.ilike(like),
         )
         stmt = stmt.where(cond)
         count_stmt = count_stmt.where(cond)
@@ -889,7 +955,7 @@ async def list_subscribers(
     stmt, count_stmt = _subscriber_query(broadcast_id, q)
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(
-        stmt.order_by(WebinarGeekSubscriber.subscribed_at.desc().nullslast())
+        stmt.order_by(WebinarRegistrant.subscribed_at.desc().nullslast())
             .limit(limit).offset(offset)
     )).scalars().all()
     return SubscriberListResponse(
@@ -922,7 +988,7 @@ async def export_subscribers(
 ):
     stmt, _ = _subscriber_query(broadcast_id, q)
     rows = (await db.execute(
-        stmt.order_by(WebinarGeekSubscriber.subscribed_at.desc().nullslast())
+        stmt.order_by(WebinarRegistrant.subscribed_at.desc().nullslast())
     )).scalars().all()
 
     buf = io.StringIO()
@@ -945,7 +1011,368 @@ async def export_subscribers(
         ])
 
     buf.seek(0)
-    fn = f"webinargeek_subscribers_{broadcast_id or 'all'}.csv"
+    fn = f"webinar_registrants_{broadcast_id or 'all'}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fn}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Zoom
+# ---------------------------------------------------------------------------
+# Server-to-Server OAuth, one account (provider='zoom', name='default'). The
+# client secret lives in api_key so masking and deletion stay provider-agnostic;
+# account_id / client_id are the non-secret half and have their own columns.
+def _zoom_status(row: Optional[ConnectorCredential], account_email: Optional[str] = None) -> ZoomCredentialStatus:
+    if not row or not row.api_key or not row.account_id or not row.client_id:
+        return ZoomCredentialStatus(configured=False, scopes=ZOOM_SCOPES)
+    return ZoomCredentialStatus(
+        configured=True,
+        account_id=row.account_id,
+        client_id=row.client_id,
+        client_secret_masked=_mask(row.api_key),
+        account_email=account_email,
+        scopes=ZOOM_SCOPES,
+    )
+
+
+async def _zoom_credential(db: AsyncSession) -> Optional[ConnectorCredential]:
+    return (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.provider == ZOOM_PROVIDER,
+            ConnectorCredential.name == "default",
+        )
+    )).scalar_one_or_none()
+
+
+@router.get("/zoom", response_model=ZoomCredentialStatus)
+async def get_zoom_status(db: AsyncSession = Depends(get_db)):
+    """Current Zoom connection plus the scope list the setup page renders.
+
+    Deliberately does NOT call Zoom: this is polled by the page and a live
+    round-trip per poll would burn rate limit for nothing.
+    """
+    return _zoom_status(await _zoom_credential(db))
+
+
+@router.put("/zoom", response_model=ZoomCredentialStatus)
+async def set_zoom_credential(body: SetZoomCredentialRequest, db: AsyncSession = Depends(get_db)):
+    """Verify the credentials against Zoom, then store them.
+
+    Verifying first means a typo or an un-activated app is reported at the point
+    of entry rather than as a mysteriously empty webinar list later.
+    """
+    account_id = body.account_id.strip()
+    client_id = body.client_id.strip()
+    client_secret = body.client_secret.strip()
+    if not account_id or not client_id or not client_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="Account ID, Client ID and Client Secret are all required",
+        )
+
+    try:
+        me = await zc.verify_credentials(account_id, client_id, client_secret)
+    except zc.ZoomScopeError as e:
+        # Authenticated but missing a scope — name the call so the fix is obvious.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Connected, but Zoom denied {e.path}. Add the missing scope to the "
+                f"Server-to-Server OAuth app (see the scope list on this page), then "
+                f"re-activate the app and try again."
+            ),
+        ) from e
+    except zc.ZoomAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except zc.ZoomError as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach Zoom: {e}") from e
+
+    stmt = pg_insert(ConnectorCredential).values(
+        provider=ZOOM_PROVIDER,
+        name="default",
+        api_key=client_secret,
+        account_id=account_id,
+        client_id=client_id,
+    ).on_conflict_do_update(
+        index_elements=["provider", "name"],
+        set_={
+            "api_key": client_secret,
+            "account_id": account_id,
+            "client_id": client_id,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+    row = await _zoom_credential(db)
+    return _zoom_status(row, account_email=me.get("email"))
+
+
+@router.delete("/zoom")
+async def delete_zoom_credential(db: AsyncSession = Depends(get_db)):
+    row = await _zoom_credential(db)
+    if row:
+        # Drop any cached bearer token too, so a re-add cannot resurrect access
+        # through a token minted under the old secret.
+        if row.account_id and row.client_id:
+            zc.invalidate_token(row.account_id, row.client_id)
+        await db.execute(delete(ConnectorCredential).where(ConnectorCredential.id == row.id))
+        await db.commit()
+    return {"deleted": bool(row)}
+
+
+@router.get("/zoom/webinars", response_model=BroadcastListResponse)
+async def list_zoom_webinars(
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    q: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    base = select(WebinarBroadcast).where(WebinarBroadcast.provider == ZOOM_PROVIDER)
+    count_base = (
+        select(func.count()).select_from(WebinarBroadcast)
+        .where(WebinarBroadcast.provider == ZOOM_PROVIDER)
+    )
+    if q:
+        like = f"%{q}%"
+        cond = or_(
+            WebinarBroadcast.name.ilike(like),
+            WebinarBroadcast.internal_title.ilike(like),
+            WebinarBroadcast.broadcast_id.ilike(like),
+        )
+        base = base.where(cond)
+        count_base = count_base.where(cond)
+
+    total = (await db.execute(count_base)).scalar_one()
+    rows = (await db.execute(
+        base.order_by(WebinarBroadcast.starts_at.desc().nullslast()).limit(limit).offset(offset)
+    )).scalars().all()
+
+    synced_counts = dict((await db.execute(
+        select(WebinarRegistrant.broadcast_id, func.count())
+        .where(WebinarRegistrant.provider == ZOOM_PROVIDER)
+        .group_by(WebinarRegistrant.broadcast_id)
+    )).all())
+
+    return BroadcastListResponse(
+        broadcasts=[
+            BroadcastOut(
+                broadcast_id=r.broadcast_id,
+                name=r.name,
+                internal_title=r.internal_title,
+                starts_at=r.starts_at,
+                duration_seconds=r.duration_seconds,
+                subscriptions_count=r.subscriptions_count,
+                live_viewers_count=r.live_viewers_count,
+                # Zoom exposes no recording-view analytics, so replay is never
+                # counted rather than reported as a misleading zero.
+                replay_viewers_count=0,
+                has_ended=r.has_ended,
+                cancelled=r.cancelled,
+                last_synced_at=r.last_synced_at,
+                synced_subscriber_count=synced_counts.get(r.broadcast_id, 0),
+                credential_id=r.credential_id,
+                credential_name="Zoom" if r.credential_id else None,
+            )
+            for r in rows
+        ],
+        total=total,
+    )
+
+
+@router.post("/zoom/webinars/refresh", response_model=RefreshResponse)
+async def refresh_zoom_webinars(db: AsyncSession = Depends(get_db)):
+    """Pull the account's webinars into the broadcast cache.
+
+    Walks every active host (Server-to-Server OAuth has no "me" in the user
+    sense) and expands recurring webinars into one row per occurrence.
+    """
+    row = await _zoom_credential(db)
+    if not row:
+        raise HTTPException(status_code=400, detail="Zoom is not connected")
+    try:
+        count = await zoom_sync.refresh_webinars()
+    except zc.ZoomScopeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except zc.ZoomError as e:
+        raise HTTPException(status_code=502, detail=f"Zoom API error: {e}") from e
+    return RefreshResponse(count=count)
+
+
+@router.post("/zoom/webinars/{broadcast_id}/sync", response_model=SyncResponse, status_code=202)
+async def sync_zoom_webinar(broadcast_id: str, db: AsyncSession = Depends(get_db)):
+    """Queue a background registrant + attendance sync for one Zoom webinar.
+
+    The id is `zoom:<webinar_id>[:<occurrence_id>]` — colons are legal inside a
+    path segment, so the default matcher is enough once the caller encodes it.
+    """
+    bc = (await db.execute(
+        select(WebinarBroadcast).where(
+            WebinarBroadcast.broadcast_id == broadcast_id,
+            WebinarBroadcast.provider == ZOOM_PROVIDER,
+        )
+    )).scalar_one_or_none()
+    if not bc:
+        raise HTTPException(status_code=404, detail="Zoom webinar not cached — refresh first")
+
+    task = asyncio.create_task(zoom_sync.run_broadcast_sync(broadcast_id, trigger="manual"))
+    try:
+        await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        raise
+
+    async with AsyncSessionLocal() as session:
+        run = (await session.execute(
+            select(GHLSyncRun)
+            .where(GHLSyncRun.sync_type == zoom_sync._sync_type(broadcast_id))
+            .order_by(GHLSyncRun.started_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+    if run is None:
+        if task.done() and task.exception():
+            raise HTTPException(status_code=409, detail=str(task.exception()))
+        raise HTTPException(status_code=500, detail="Failed to start Zoom sync")
+
+    return SyncResponse(broadcast_id=broadcast_id, run_id=run.id, status=run.status)
+
+
+@router.post("/zoom/webinars/sync-all", response_model=SyncAllResponse, status_code=202)
+async def sync_all_zoom_webinars(db: AsyncSession = Depends(get_db)):
+    """Queue a sync of every cached Zoom webinar."""
+    count = (await db.execute(
+        select(func.count()).select_from(WebinarBroadcast)
+        .where(WebinarBroadcast.provider == ZOOM_PROVIDER)
+    )).scalar_one()
+
+    task = asyncio.create_task(zoom_sync.run_sync_all(trigger="manual"))
+    try:
+        await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        raise
+
+    async with AsyncSessionLocal() as session:
+        run = (await session.execute(
+            select(GHLSyncRun)
+            .where(GHLSyncRun.sync_type == "zoom:all")
+            .order_by(GHLSyncRun.started_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+    if run is None:
+        if task.done() and task.exception():
+            raise HTTPException(status_code=409, detail=str(task.exception()))
+        raise HTTPException(status_code=500, detail="Failed to start Zoom sync-all")
+
+    return SyncAllResponse(run_id=run.id, status=run.status, broadcasts_queued=count)
+
+
+@router.get("/zoom/registrants", response_model=SubscriberListResponse)
+async def list_zoom_registrants(
+    broadcast_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(WebinarRegistrant).where(WebinarRegistrant.provider == ZOOM_PROVIDER)
+    count_stmt = (
+        select(func.count()).select_from(WebinarRegistrant)
+        .where(WebinarRegistrant.provider == ZOOM_PROVIDER)
+    )
+    if broadcast_id:
+        stmt = stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
+        count_stmt = count_stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
+    if q:
+        like = f"%{q}%"
+        cond = or_(
+            WebinarRegistrant.email.ilike(like),
+            WebinarRegistrant.first_name.ilike(like),
+            WebinarRegistrant.last_name.ilike(like),
+        )
+        stmt = stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(
+        stmt.order_by(WebinarRegistrant.subscribed_at.desc().nullslast()).limit(limit).offset(offset)
+    )).scalars().all()
+
+    return SubscriberListResponse(
+        subscribers=[
+            SubscriberOut(
+                id=r.id,
+                broadcast_id=r.broadcast_id,
+                email=r.email,
+                first_name=r.first_name,
+                last_name=r.last_name,
+                registration_source=r.registration_source,
+                subscribed_at=r.subscribed_at,
+                watched_live=r.watched_live,
+                watched_replay=r.watched_replay,
+                minutes_viewing=r.minutes_viewing,
+                viewing_device=r.viewing_device,
+                viewing_country=r.viewing_country,
+            )
+            for r in rows
+        ],
+        total=total,
+    )
+
+
+@router.get("/zoom/registrants/export")
+async def export_zoom_registrants(
+    broadcast_id: Optional[str] = None,
+    q: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """CSV of synced Zoom registrants — the counterpart to the WebinarGeek export.
+
+    `watched_replay` is omitted rather than emitted as an empty column: Zoom has
+    no recording-view analytics, so the value is always unknown and a blank
+    column would read as "nobody watched the replay".
+    """
+    stmt = select(WebinarRegistrant).where(WebinarRegistrant.provider == ZOOM_PROVIDER)
+    if broadcast_id:
+        stmt = stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(or_(
+            WebinarRegistrant.email.ilike(like),
+            WebinarRegistrant.first_name.ilike(like),
+            WebinarRegistrant.last_name.ilike(like),
+        ))
+
+    rows = (await db.execute(
+        stmt.order_by(WebinarRegistrant.subscribed_at.desc().nullslast())
+    )).scalars().all()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "email", "first_name", "last_name", "broadcast_id",
+        "registered_at", "source", "attended", "minutes_viewing",
+        "joined_at", "left_at", "device", "country", "company", "job_title",
+    ])
+    for r in rows:
+        w.writerow([
+            r.email, r.first_name or "", r.last_name or "", r.broadcast_id,
+            r.subscribed_at.isoformat() if r.subscribed_at else "",
+            r.registration_source or "",
+            "" if r.watched_live is None else ("yes" if r.watched_live else "no"),
+            r.minutes_viewing if r.minutes_viewing is not None else "",
+            r.start_time.isoformat() if r.start_time else "",
+            r.end_time.isoformat() if r.end_time else "",
+            r.viewing_device or "", r.country or "",
+            r.company or "", r.job_title or "",
+        ])
+
+    buf.seek(0)
+    fn = f"zoom_registrants_{broadcast_id or 'all'}.csv"
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",

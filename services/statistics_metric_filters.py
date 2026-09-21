@@ -242,7 +242,7 @@ def build_contacts_query(
     joins = ["JOIN webinar_contact_memberships m ON m.contact_id = c.id",
              "JOIN ghl_contact g ON LOWER(g.email) = LOWER(c.email)"]
     if spec.needs_wg:
-        joins.append("LEFT JOIN webinargeek_subscribers wgs ON LOWER(wgs.email) = LOWER(c.email)")
+        joins.append("LEFT JOIN webinar_registrants wgs ON LOWER(wgs.email) = LOWER(c.email)")
     if spec.needs_opp:
         joins.append("JOIN ghl_opportunity o ON o.ghl_contact_id = g.ghl_contact_id")
         joins.append("LEFT JOIN ghl_calendar cal ON cal.calendar_id = o.call1_calendar_id")

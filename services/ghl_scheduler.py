@@ -41,11 +41,16 @@ REPORT_SWEEP_INTERVAL_MINUTES = 2
 # Cheap query (one indexed scan over status='running') so 2 minutes is fine.
 STALE_SWEEP_INTERVAL_MINUTES = 2
 
-# WebinarGeek broadcast auto-sync: scan for planned webinars whose linked
-# broadcast started >=2h ago and sync their subscribers once. Cheap partial-
-# index scan; 15 min keeps the fire reasonably close to the 2h mark.
-WG_AUTO_SYNC_JOB_ID = "wg_auto_sync"
-WG_AUTO_SYNC_INTERVAL_MINUTES = 15
+# Broadcast auto-sync: scan for planned webinars whose linked broadcast has
+# aired and sync their registrants once. Cheap partial-index scan; 15 min keeps
+# the fire close to each provider's due mark (WebinarGeek: 2h after start;
+# Zoom: 45 min after the session's estimated end, since its participant report
+# only exists once the session finishes).
+#
+# The id keeps its historical "wg_auto_sync" value: the jobstore is in-memory,
+# so it is rebuilt every boot, and churning it buys nothing.
+BROADCAST_AUTO_SYNC_JOB_ID = "wg_auto_sync"
+BROADCAST_AUTO_SYNC_INTERVAL_MINUTES = 15
 
 # Correctness backstop for the sync-scoped snapshot recompute. Syncs rebuild
 # only the webinars their rows attribute to (see
@@ -147,14 +152,28 @@ async def _weekly_report_prep_job() -> None:
         logger.error("Weekly report prep failed: %s", exc)
 
 
-async def _wg_auto_sync_job() -> None:
-    try:
-        from services import wg_sync
-        n = await wg_sync.run_due_broadcast_autosyncs()
-        if n:
-            logger.info("WG broadcast auto-sync: synced %d due broadcast(s)", n)
-    except Exception as exc:
-        logger.error("WG broadcast auto-sync failed: %s", exc)
+async def _broadcast_auto_sync_job() -> None:
+    """Auto-sync due broadcasts on every webinar platform.
+
+    One job rather than one per provider: they share a cadence, neither can
+    race the other (the due-sets are disjoint by provider), and _apply_settings
+    removes jobs from a hardcoded tuple — a second job id not added there would
+    leak a duplicate on every reload_schedules().
+
+    Independent try/excepts so a Zoom outage cannot stop WebinarGeek syncing.
+    """
+    from services import wg_sync, zoom_sync
+
+    for label, run in (
+        ("WG", wg_sync.run_due_broadcast_autosyncs),
+        ("Zoom", zoom_sync.run_due_broadcast_autosyncs),
+    ):
+        try:
+            n = await run()
+            if n:
+                logger.info("%s broadcast auto-sync: synced %d due broadcast(s)", label, n)
+        except Exception as exc:
+            logger.error("%s broadcast auto-sync failed: %s", label, exc)
 
 
 async def _report_sweep_job() -> None:
@@ -213,7 +232,7 @@ async def reload_schedules() -> None:
 
 async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
     """Remove existing GHL jobs and re-add based on current settings."""
-    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, WG_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID, SNAPSHOT_FULL_REBUILD_JOB_ID, REPORT_SWEEP_JOB_ID):
+    for job_id in (INCREMENTAL_JOB_ID, WEEKLY_JOB_ID, DAILY_SALES_JOB_ID, STALE_SWEEPER_JOB_ID, BROADCAST_AUTO_SYNC_JOB_ID, WEEKLY_REPORT_JOB_ID, WEEKLY_REPORT_PREP_JOB_ID, SNAPSHOT_FULL_REBUILD_JOB_ID, REPORT_SWEEP_JOB_ID):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
@@ -228,13 +247,13 @@ async def _apply_settings(scheduler: AsyncIOScheduler) -> None:
         replace_existing=True,
     )
 
-    # WebinarGeek broadcast auto-sync is unconditional too — it self-gates on
-    # broadcast start time + the one-shot stamp, so it's a no-op when nothing
-    # is due.
+    # Broadcast auto-sync (WebinarGeek + Zoom) is unconditional too — each
+    # provider self-gates on its own due-window + the one-shot stamp, so this
+    # is a no-op when nothing is due.
     scheduler.add_job(
-        _wg_auto_sync_job,
-        trigger=IntervalTrigger(minutes=WG_AUTO_SYNC_INTERVAL_MINUTES),
-        id=WG_AUTO_SYNC_JOB_ID,
+        _broadcast_auto_sync_job,
+        trigger=IntervalTrigger(minutes=BROADCAST_AUTO_SYNC_INTERVAL_MINUTES),
+        id=BROADCAST_AUTO_SYNC_JOB_ID,
         max_instances=1,
         misfire_grace_time=300,
         replace_existing=True,

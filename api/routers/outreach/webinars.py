@@ -1264,7 +1264,7 @@ async def get_webinar_nonjoiners(
     if not webinar:
         raise HTTPException(404, "Webinar not found")
 
-    # The heavy scan is over webinargeek_subscribers probing contacts by email —
+    # The heavy scan is over webinar_registrants probing contacts by email —
     # nested loops win, and this can outrun the default request-path timeout on
     # a full six-webinar window.
     await db.execute(sa_text("SET LOCAL statement_timeout = '280s'"))
@@ -1282,7 +1282,7 @@ async def get_webinar_nonjoiners(
             wg AS (
                 SELECT DISTINCT ON (LOWER(s.email))
                        LOWER(s.email) AS email, s.first_name, s.last_name, s.company
-                FROM webinargeek_subscribers s
+                FROM webinar_registrants s
                 JOIN pool p ON p.email = LOWER(s.email)
                 ORDER BY LOWER(s.email), s.subscribed_at DESC NULLS LAST
             )

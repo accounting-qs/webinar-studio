@@ -12,11 +12,12 @@ import {
   fetchCustomLists, fetchCustomListCopies, createCustomListCopy as apiCreateCustomListCopy,
   startWebinarListExport, fetchActiveWebinarListExports, fetchLatestWebinarListExport,
   downloadWebinarListExport,
-  fetchWgCredentials, fetchWgWebinars, refreshWgWebinars,
+  fetchWgCredentials, fetchWgWebinars, fetchZoomWebinars, refreshWgWebinars, refreshZoomWebinars,
   fetchAssignCountries,
   fetchBucketEligible,
   type ApiBucket, type ApiSender, type ApiWebinar, type ApiAssignment, type ApiCopy,
-  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential, type WgWebinar,
+  type ApiCustomList, type ApiWebinarListExportJob, type ApiWgCredential,
+  type WebinarPlatform, type WgWebinar,
   type AssignCountry,
 } from "@/lib/api";
 import { REGION_COUNTRIES, REGION_ORDER, normCountry, COUNTRIES, collapseCountriesForLabel } from "@/lib/locations";
@@ -1023,6 +1024,9 @@ export function PlanningPage() {
   const [wgCredentials, setWgCredentials] = useState<ApiWgCredential[]>([]);
   /** Selected WebinarGeek broadcast id for the new webinar. Empty → none. */
   const [newWebinarBroadcastId, setNewWebinarBroadcastId] = useState("");
+  // Which platform the new webinar runs on. UI-local: the persisted truth is
+  // the `zoom:` prefix on the broadcast id itself.
+  const [newWebinarPlatform, setNewWebinarPlatform] = useState<WebinarPlatform>("webinargeek");
   /** Broadcasts for the new-webinar dropdown, scoped to the selected
    * WebinarGeek account (mirrors the Edit modal's account filtering). */
   const [newWebinarBroadcasts, setNewWebinarBroadcasts] = useState<WgWebinar[]>([]);
@@ -2189,16 +2193,27 @@ export function PlanningPage() {
     setSelectedIds(new Set());
   };
 
-  /** Load broadcasts for the new-webinar dropdown, scoped to the selected
-   * WebinarGeek account (or the default credential when none is picked).
-   * Mirrors the Edit modal so each modal only shows its account's broadcasts. */
-  const loadNewWebinarBroadcasts = async (credId: string | undefined, refresh: boolean) => {
+  /** Load broadcasts for the new-webinar dropdown.
+   *
+   * On WebinarGeek this is scoped to the selected account (or the default
+   * credential); Zoom is a single account, so it has nothing to scope by.
+   * Mirrors the Edit modal. */
+  const loadNewWebinarBroadcasts = async (
+    plat: WebinarPlatform, credId: string | undefined, refresh: boolean,
+  ) => {
     setNewWebinarBcLoading(true);
     try {
       if (refresh) {
-        try { await refreshWgWebinars(); } catch (e) { console.error("WG refresh failed", e); }
+        try {
+          await (plat === "zoom" ? refreshZoomWebinars() : refreshWgWebinars());
+        } catch (e) {
+          // Not fatal — show whatever is already cached rather than nothing.
+          console.error(`${plat} refresh failed`, e);
+        }
       }
-      const { broadcasts } = await fetchWgWebinars({ credential_id: credId, limit: 500 });
+      const { broadcasts } = plat === "zoom"
+        ? await fetchZoomWebinars({ limit: 500 })
+        : await fetchWgWebinars({ credential_id: credId, limit: 500 });
       setNewWebinarBroadcasts(broadcasts);
     } catch (e) {
       console.error("Failed to load broadcasts", e);
@@ -2216,6 +2231,7 @@ export function PlanningPage() {
     setNewWebinarWgCredentialId("");
     setNewWebinarBroadcastId("");
     setNewWebinarBroadcasts([]);
+    setNewWebinarPlatform("webinargeek");
     setShowNewWebinarModal(true);
     // Lazy-fetch WG credentials, then load the default account's broadcasts so
     // both dropdowns are populated by the time the user reaches them.
@@ -2223,7 +2239,7 @@ export function PlanningPage() {
       .then((res) => {
         setWgCredentials(res.credentials);
         const defaultCredId = res.credentials.find((c) => c.name === "default")?.id;
-        loadNewWebinarBroadcasts(defaultCredId, true);
+        loadNewWebinarBroadcasts("webinargeek", defaultCredId, true);
       })
       .catch((err) => console.error("Failed to load WG credentials:", err));
   };
@@ -2251,7 +2267,10 @@ export function PlanningPage() {
         number: newWebinarNumber,
         date: newWebinarDate,
         variant_label: trimmedLabel || null,
-        webinargeek_credential_id: newWebinarWgCredentialId || null,
+        // A Zoom webinar resolves its credential from the broadcast row, so the
+        // WebinarGeek credential must stay null or it would be misleading.
+        webinargeek_credential_id:
+          newWebinarPlatform === "zoom" ? null : newWebinarWgCredentialId || null,
         broadcast_id: newWebinarBroadcastId || null,
       });
       const d = new Date(newWebinarDate + "T00:00:00");
@@ -4051,6 +4070,30 @@ export function PlanningPage() {
                 )}
               </div>
               <div>
+                <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">Platform</label>
+                <select
+                  value={newWebinarPlatform}
+                  onChange={(e) => {
+                    const next = e.target.value as WebinarPlatform;
+                    setNewWebinarPlatform(next);
+                    // Drop any pick from the other platform — its id would point
+                    // at a webinar this one cannot sync.
+                    setNewWebinarBroadcastId("");
+                    if (next === "zoom") setNewWebinarWgCredentialId("");
+                    loadNewWebinarBroadcasts(
+                      next,
+                      wgCredentials.find((c) => c.name === "default")?.id,
+                      false,
+                    );
+                  }}
+                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors"
+                >
+                  <option value="webinargeek">WebinarGeek</option>
+                  <option value="zoom">Zoom</option>
+                </select>
+              </div>
+              {newWebinarPlatform === "webinargeek" && (
+              <div>
                 <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5">WebinarGeek Account</label>
                 <select
                   value={newWebinarWgCredentialId}
@@ -4059,6 +4102,7 @@ export function PlanningPage() {
                     setNewWebinarWgCredentialId(credId);
                     setNewWebinarBroadcastId("");
                     loadNewWebinarBroadcasts(
+                      "webinargeek",
                       credId || wgCredentials.find((c) => c.name === "default")?.id,
                       false,
                     );
@@ -4077,9 +4121,10 @@ export function PlanningPage() {
                   Manage accounts in the Connectors page.
                 </div>
               </div>
+              )}
               <div>
                 <label className="text-[11px] text-zinc-500 uppercase tracking-wider font-medium block mb-1.5 flex items-center gap-2">
-                  WebinarGeek Broadcast
+                  {newWebinarPlatform === "zoom" ? "Zoom Webinar" : "WebinarGeek Broadcast"}
                   {newWebinarBcLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
                 </label>
                 <select
@@ -4101,7 +4146,9 @@ export function PlanningPage() {
                   ))}
                 </select>
                 <div className="mt-1.5 text-[10px] text-zinc-500">
-                  Only broadcasts from the selected account are shown. Picking one fills the date above (still editable).
+                  {newWebinarPlatform === "zoom"
+                    ? "Registrants and attendance sync automatically once the webinar has ended. Replay views are not tracked on Zoom. Picking one fills the date above (still editable)."
+                    : "Only broadcasts from the selected account are shown. Picking one fills the date above (still editable)."}
                 </div>
               </div>
               {/* Preview */}

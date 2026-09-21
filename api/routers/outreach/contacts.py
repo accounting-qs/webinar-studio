@@ -24,7 +24,7 @@ from db.models import (
     WebinarBookingAttribution,
     WebinarCalendarInvite,
     WebinarContactMembership,
-    WebinarGeekSubscriber,
+    WebinarRegistrant,
     WebinarListAssignment,
     WebinarNonjoinerInvite,
 )
@@ -195,7 +195,7 @@ class _Refinements:
     def engaged(self, engagement: str | None) -> None:
         """Attendance / booking as a refinement rather than a driver. Both
         probes are per-contact index hits on small tables (ix_wba_app_contact,
-        ix_wg_subs_email), so they are safe on top of any driver."""
+        ix_webinar_registrants_email), so they are safe on top of any driver."""
         if not engagement:
             return
         cid = self._col("id")
@@ -213,10 +213,10 @@ class _Refinements:
             "replay": " AND s.watched_replay",
             "registered": "",
         }[engagement]
-        # Compare against the raw column (both casings) so ix_wg_subs_email is
+        # Compare against the raw column (both casings) so ix_webinar_registrants_email is
         # usable; lower(s.email) would force a scan of every subscriber row.
         self.clauses.append(
-            "EXISTS (SELECT 1 FROM webinargeek_subscribers s "
+            "EXISTS (SELECT 1 FROM webinar_registrants s "
             f"WHERE (s.email = {email} OR s.email = lower({email})){watched})"
         )
 
@@ -593,7 +593,7 @@ async def _list_by_engagement(db: AsyncSession, *, engagement, search_fields, li
             )
         source = f"""
             SELECT DISTINCT lower(s.email) AS lemail
-            FROM webinargeek_subscribers s
+            FROM webinar_registrants s
             WHERE s.email IS NOT NULL{watched}{scope}
         """
         join = "JOIN driver d ON d.lemail = lower(c.email)"
@@ -863,7 +863,7 @@ async def contact_engagement(
     Deliberately a second request rather than extra columns on the listing: the
     rollups are four index-driven lookups per contact and the table should paint
     before they land. Every join is a per-contact index hit (ix_wcm_contact,
-    ix_wci_matched_contact_id, ix_wg_subs_email, ix_wba_app_contact), so the
+    ix_wci_matched_contact_id, ix_webinar_registrants_email, ix_wba_app_contact), so the
     cost is bounded by the page size, not the table size.
     """
     ids = []
@@ -883,7 +883,7 @@ async def contact_engagement(
             )
         )).all()
     ]
-    # ix_wg_subs_email is on the raw column, so probe both casings rather than
+    # ix_webinar_registrants_email is on the raw column, so probe both casings rather than
     # wrapping it in lower() and losing the index.
     email_variants = sorted({e for e in emails} | {e.lower() for e in emails})
 
@@ -931,7 +931,7 @@ async def contact_engagement(
                    count(*) FILTER (WHERE s.watched_live) AS live,
                    count(*) FILTER (WHERE s.watched_replay) AS replay,
                    coalesce(sum(s.minutes_viewing), 0) AS minutes
-            FROM webinargeek_subscribers s
+            FROM webinar_registrants s
             WHERE s.email = ANY(CAST(:emails AS text[]))
             GROUP BY 1
         ),
@@ -1088,14 +1088,14 @@ async def get_contact_detail(
         .where(WebinarBookingAttribution.contact_id == contact_id)
     )).all()
 
-    # WebinarGeek attendance: subscriber rows by email (ix_wg_subs_email), tied
+    # Webinar attendance: registrant rows by email (ix_webinar_registrants_email), tied
     # to webinars through webinars.broadcast_id. Exact-match on both the raw and
     # lowercased email so the index stays usable either way.
-    subs_by_broadcast: dict[str, WebinarGeekSubscriber] = {}
+    subs_by_broadcast: dict[str, WebinarRegistrant] = {}
     email_variants = {e for e in {contact.email, (contact.email or "").lower()} if e}
     if email_variants:
         for s in (await db.execute(
-            select(WebinarGeekSubscriber).where(WebinarGeekSubscriber.email.in_(email_variants))
+            select(WebinarRegistrant).where(WebinarRegistrant.email.in_(email_variants))
         )).scalars():
             subs_by_broadcast[s.broadcast_id] = s
 

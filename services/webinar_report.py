@@ -462,7 +462,7 @@ async def _funnel_scope(wids: list[str]) -> dict[str, dict[str, dict[str, int]]]
             JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
             JOIN webinars w2 ON w2.id = m.webinar_id
-            JOIN webinargeek_subscribers wgs
+            JOIN webinar_registrants wgs
                 ON LOWER(wgs.email) = LOWER(c.email)
                AND wgs.broadcast_id = w2.broadcast_id
             WHERE m.webinar_id = ANY(CAST(:wids AS uuid[])) AND {_COLD}
@@ -610,7 +610,7 @@ async def _fetch_regs(webinar_id: str, broadcast_id: str) -> list[dict[str, Any]
                 SELECT LOWER(email) AS email,
                        BOOL_OR(watched_live = TRUE OR minutes_viewing > 0) AS att,
                        BOOL_OR(minutes_viewing >= 10) AS att10
-                FROM webinargeek_subscribers
+                FROM webinar_registrants
                 WHERE broadcast_id = :bid AND email IS NOT NULL
                 GROUP BY 1
             )

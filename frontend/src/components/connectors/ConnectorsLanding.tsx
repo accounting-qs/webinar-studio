@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import {
   fetchWgStatus,
+  fetchZoomStatus,
   fetchOpenAiStatus,
   fetchAnthropicStatus,
   fetchGhlConnectorStatus,
@@ -21,6 +22,7 @@ type Status = "connected" | "not_connected" | "loading";
 
 export function ConnectorsLanding() {
   const [wg, setWg] = useState<Status>("loading");
+  const [zoom, setZoom] = useState<Status>("loading");
   const [openai, setOpenai] = useState<Status>("loading");
   const [anthropic, setAnthropic] = useState<Status>("loading");
   const [ghl, setGhl] = useState<Status>("loading");
@@ -31,6 +33,9 @@ export function ConnectorsLanding() {
     fetchWgStatus()
       .then((s: WgCredentialStatus) => setWg(s.configured ? "connected" : "not_connected"))
       .catch(() => setWg("not_connected"));
+    fetchZoomStatus()
+      .then((s) => setZoom(s.configured ? "connected" : "not_connected"))
+      .catch(() => setZoom("not_connected"));
     fetchOpenAiStatus()
       .then((s: OpenAiCredentialStatus) => setOpenai(s.configured ? "connected" : "not_connected"))
       .catch(() => setOpenai("not_connected"));
@@ -75,6 +80,17 @@ export function ConnectorsLanding() {
           icon={
             <svg className="w-5 h-5 text-violet-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <polygon points="5 3 19 12 5 21 5 3" />
+            </svg>
+          }
+        />
+        <ConnectorCard
+          href="/connectors/zoom"
+          name="Zoom"
+          description="Connect a Zoom account to pull webinar registrants and attendance."
+          status={zoom}
+          icon={
+            <svg className="w-5 h-5 text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
             </svg>
           }
         />

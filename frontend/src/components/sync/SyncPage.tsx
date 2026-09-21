@@ -67,6 +67,8 @@ function formatRelative(iso: string | null): string {
  *   "webinar:136"        -> "Webinar 136" (legacy)
  *   "wg:all"             -> "WG · All Broadcasts"
  *   "wg:<broadcast_id>"  -> "WG · Broadcast <id>"
+ *   "zoom:all"           -> "Zoom · All Webinars"
+ *   "zoom:<id>[:<occ>]"  -> "Zoom · Webinar <id>"
  */
 function formatSyncType(raw: string): string {
   if (raw.startsWith("webinar:")) {
@@ -81,6 +83,13 @@ function formatSyncType(raw: string): string {
     const id = raw.slice(3);
     if (id === "all") return "WG · All Broadcasts";
     return `WG · Broadcast ${id}`;
+  }
+  if (raw.startsWith("zoom:")) {
+    const id = raw.slice(5);
+    if (id === "all") return "Zoom · All Webinars";
+    // "<webinar_id>" or "<webinar_id>:<occurrence_id>" for a recurring session.
+    const [webinarId, occurrence] = id.split(":");
+    return occurrence ? `Zoom · Webinar ${webinarId} (occurrence)` : `Zoom · Webinar ${webinarId}`;
   }
   if (raw === "opportunities") return "Sales + Calls";
   return raw.charAt(0).toUpperCase() + raw.slice(1);
@@ -496,6 +505,8 @@ export function SyncPage() {
                       <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border whitespace-nowrap ${
                         r.sync_type.startsWith("wg:")
                           ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                          : r.sync_type.startsWith("zoom:")
+                          ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
                           : r.sync_type.startsWith("webinar:")
                           ? "bg-violet-500/15 text-violet-400 border-violet-500/30"
                           : r.sync_type === "full"

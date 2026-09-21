@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.auth import require_auth
 from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
-from db.models import BlocklistEntry, GHLContact, WebinarGeekSubscriber
+from db.models import BlocklistEntry, GHLContact, WebinarRegistrant
 from db.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -208,10 +208,10 @@ async def backfill_blocklist(
     # WebinarGeek unsubscribes
     wg_rows = (await db.execute(
         select(
-            WebinarGeekSubscriber.email,
-            WebinarGeekSubscriber.unsubscribe_source,
-            WebinarGeekSubscriber.subscriber_id,
-        ).where(WebinarGeekSubscriber.unsubscribed_at.isnot(None))
+            WebinarRegistrant.email,
+            WebinarRegistrant.unsubscribe_source,
+            WebinarRegistrant.subscriber_id,
+        ).where(WebinarRegistrant.unsubscribed_at.isnot(None))
     )).all()
     wg_payload: list[dict] = []
     seen_wg: set[str] = set()

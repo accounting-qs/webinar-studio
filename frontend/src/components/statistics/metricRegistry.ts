@@ -4,15 +4,15 @@ export type MetricGroup = "Base" | "Delivery" | "Yes" | "Maybe" | "Self Reg" | "
 export type FieldEntity =
   | "GHL Contact"
   | "GHL Opportunity"
-  | "WebinarGeek Subscriber"
+  | "Webinar Registrant"
   | "Planning Assignment"
   | "Webinar"
   | "Computed";
 
 /**
  * One underlying data field a metric reads from. Rendered as a row in the
- * info modal so operators can trace each number back to GHL / WebinarGeek
- * / the Planning DB.
+ * info modal so operators can trace each number back to GHL / the webinar
+ * platform (WebinarGeek or Zoom) / the Planning DB.
  */
 export interface FieldRef {
   entity: FieldEntity;
@@ -88,12 +88,12 @@ const F_CONTACT_SMS_TAG: FieldRef = {
 };
 
 const F_WG_BROADCAST: FieldRef = {
-  entity: "WebinarGeek Subscriber",
+  entity: "Webinar Registrant",
   field: "broadcast_id",
   filter: "= webinar.broadcast_id",
 };
 const F_WG_WATCHED: FieldRef = {
-  entity: "WebinarGeek Subscriber",
+  entity: "Webinar Registrant",
   field: "watched_live / minutes_viewing",
   filter: "watched_live = true OR minutes_viewing > 0",
 };
@@ -204,7 +204,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   },
   {
     key: "yesAttended", label: "Attended", group: "Yes", format: "number",
-    description: "Yes-responders who attended the webinar — joins GHL contacts to WebinarGeek subscribers by email.",
+    description: "Yes-responders who attended the webinar — joins GHL contacts to webinar registrants by email.",
     fieldsUsed: [
       { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Yes'" },
       F_WG_BROADCAST,
@@ -223,7 +223,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     fieldsUsed: [
       { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Yes'" },
       F_WG_BROADCAST,
-      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 10" },
+      { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 10" },
     ],
   },
   {
@@ -238,7 +238,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     fieldsUsed: [
       { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Yes'" },
       F_WG_BROADCAST,
-      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 30" },
+      { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 30" },
     ],
   },
   {
@@ -309,7 +309,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     fieldsUsed: [
       { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Maybe'" },
       F_WG_BROADCAST,
-      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 10" },
+      { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 10" },
     ],
   },
   {
@@ -324,7 +324,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     fieldsUsed: [
       { ...F_CONTACT_INVITE_RESP, filter: "contains 'e{N}-Maybe'" },
       F_WG_BROADCAST,
-      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 30" },
+      { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 30" },
     ],
   },
   {
@@ -395,7 +395,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
     fieldsUsed: [
       { ...F_CONTACT_REG_DATE, filter: "> prev_webinar_date AND <= current_webinar_date" },
       F_WG_BROADCAST,
-      { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 10" },
+      { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 10" },
     ],
   },
   {
@@ -422,7 +422,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   // ── Attendance ──
   {
     key: "totalRegs", label: "Total Regs", group: "Attendance", format: "number",
-    description: "All WebinarGeek registrations for this broadcast (ignoring response channel).",
+    description: "All registrations for this webinar, from whichever platform it ran on (ignoring response channel).",
     fieldsUsed: [F_WG_BROADCAST],
   },
   {
@@ -439,7 +439,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   },
   {
     key: "totalAttended", label: "Attended", group: "Attendance", format: "number",
-    description: "All WebinarGeek attendees (regardless of channel).",
+    description: "All attendees, from whichever platform the webinar ran on (regardless of channel).",
     fieldsUsed: [F_WG_BROADCAST, F_WG_WATCHED],
   },
   {
@@ -474,7 +474,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   {
     key: "total10MinPlus", label: "10m+", group: "Attendance", format: "number",
     description: "Attendees who watched ≥10 minutes of the live broadcast.",
-    fieldsUsed: [F_WG_BROADCAST, { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 10" }],
+    fieldsUsed: [F_WG_BROADCAST, { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 10" }],
   },
   {
     key: "total10MinPlusPer1kInv", label: "10m/1k", group: "Attendance", format: "per1k",
@@ -491,7 +491,7 @@ export const METRIC_COLUMNS: MetricColumn[] = [
   {
     key: "total30MinPlus", label: "30m+", group: "Attendance", format: "number",
     description: "Attendees who watched ≥30 minutes.",
-    fieldsUsed: [F_WG_BROADCAST, { entity: "WebinarGeek Subscriber", field: "minutes_viewing", filter: ">= 30" }],
+    fieldsUsed: [F_WG_BROADCAST, { entity: "Webinar Registrant", field: "minutes_viewing", filter: ">= 30" }],
   },
   {
     key: "total30MinPlusPer1kInv", label: "30m/1k", group: "Attendance", format: "per1k",

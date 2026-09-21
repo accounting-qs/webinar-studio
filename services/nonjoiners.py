@@ -234,7 +234,7 @@ async def nonjoiner_pool_emails(
             SELECT LOWER(s.email) AS email,
                    w.number,
                    bool_or({JOINED_SQL}) AS joined
-            FROM webinargeek_subscribers s
+            FROM webinar_registrants s
             JOIN win w ON w.broadcast_id = s.broadcast_id
             WHERE s.email IS NOT NULL
             GROUP BY 1, 2
@@ -250,7 +250,7 @@ async def nonjoiner_pool_emails(
         -- whole window rather than just the latest registration.
         unsubscribed AS (
             SELECT DISTINCT LOWER(s.email) AS email
-            FROM webinargeek_subscribers s
+            FROM webinar_registrants s
             JOIN win w ON w.broadcast_id = s.broadcast_id
             WHERE s.email IS NOT NULL AND s.unsubscribed_at IS NOT NULL
         ),

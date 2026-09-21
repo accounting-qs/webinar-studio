@@ -5,6 +5,8 @@ import {
   fetchStatisticsWebinar,
   fetchStatisticsWebinarList,
   syncWgSubscribers,
+  syncZoomWebinar,
+  platformOf,
   triggerGhlWebinarSync,
   fetchWebinars,
   type ApiStatisticsRow,
@@ -117,7 +119,7 @@ const sSendSp = `${L_SEND} ${Z_ROW} ${BG_SPECIAL}`;
 const ENTITY_COLOR: Record<string, string> = {
   "GHL Contact": "bg-violet-500/15 text-violet-500 border-violet-500/30",
   "GHL Opportunity": "bg-sky-500/15 text-sky-500 border-sky-500/30",
-  "WebinarGeek Subscriber": "bg-emerald-500/15 text-emerald-500 border-emerald-500/30",
+  "Webinar Registrant": "bg-emerald-500/15 text-emerald-500 border-emerald-500/30",
   "Planning Assignment": "bg-amber-500/15 text-amber-500 border-amber-500/30",
   "Webinar": "bg-zinc-500/15 text-zinc-400 border-zinc-500/30",
   "Computed": "bg-zinc-500/15 text-zinc-400 border-zinc-500/30",
@@ -1067,10 +1069,18 @@ export function StatisticsPage() {
     try {
       const parts: string[] = [];
       if (summary.broadcastId) {
-        await syncWgSubscribers(summary.broadcastId);
-        parts.push("WG sync started");
+        // Which platform is derived from the id itself — Zoom broadcast ids are
+        // namespaced `zoom:`, WebinarGeek's are bare numerics.
+        const isZoom = platformOf(summary.broadcastId) === "zoom";
+        if (isZoom) {
+          await syncZoomWebinar(summary.broadcastId);
+          parts.push("Zoom sync started");
+        } else {
+          await syncWgSubscribers(summary.broadcastId);
+          parts.push("WG sync started");
+        }
       } else {
-        parts.push("WG: no broadcast linked");
+        parts.push("No webinar linked");
       }
       // GHL sync is keyed on webinar number — both variants of the same
       // number share the same GHL pull, so this triggers either variant's
@@ -1424,7 +1434,7 @@ export function StatisticsPage() {
                     const dateLabel = w.date ? new Date(w.date).toLocaleDateString() : "—";
                     const titleLabel = w.title ? ` · ${w.title}` : "";
                     const variantLabel = w.variantLabel ? ` · ${w.variantLabel}` : "";
-                    const noBroadcast = !summary?.broadcastId ? " · no WG broadcast" : "";
+                    const noBroadcast = !summary?.broadcastId ? " · no webinar linked" : "";
                     return (
                       <option key={w.id} value={w.id}>
                         #{w.number}{variantLabel} · {dateLabel}{titleLabel}{noBroadcast}

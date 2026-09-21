@@ -187,7 +187,17 @@ The pool for webinar **W** is built in five steps:
    Without this, a broadcast synced ahead of time — `wg_sync` can be run manually — would
    dump all of its registrants into the next pool as fake no-shows and reset their
    invite counters.
-2. **Stack** — every `webinargeek_subscribers` row across those broadcasts, deduped on
+
+   > **Zoom webinars** land in the same tables (`webinar_broadcasts` /
+   > `webinar_registrants`, `provider = 'zoom'`), so every formula below applies
+   > unchanged. Two Zoom-specific caveats: `watched_replay` is always NULL, because
+   > Zoom exposes no recording-view analytics — replay-only viewers therefore cannot
+   > be detected and will read as non-joiners; and Zoom has no unsubscribe concept, so
+   > `unsubscribed_at` is never set and the `wg_unsub` blocklist source does not grow
+   > from Zoom-era webinars (GHL's `ghl_dnd` is unaffected). A Zoom webinar is also
+   > stamped as aired only once its participants report exists, which can lag the
+   > session end by tens of minutes.
+2. **Stack** — every `webinar_registrants` row across those broadcasts, deduped on
    `LOWER(email)` and collapsed per webinar number (joining either A/B variant of a
    number counts as joining that webinar).
 3. **Keep the latest registration** — **every registration restarts the counter**, so only

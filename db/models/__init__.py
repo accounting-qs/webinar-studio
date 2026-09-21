@@ -26,7 +26,7 @@ from db.models.uploads import (  # noqa: F401
 )
 from db.models.costs import CostLog  # noqa: F401
 from db.models.connectors import (  # noqa: F401
-    ConnectorCredential, WebinarGeekWebinar, WebinarGeekSubscriber,
+    ConnectorCredential, WebinarBroadcast, WebinarRegistrant,
 )
 from db.models.ghl import (  # noqa: F401
     GHLAppointment, GHLCalendar, GHLContact, GHLContactCustomFields,

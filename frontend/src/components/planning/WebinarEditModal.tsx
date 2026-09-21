@@ -2,8 +2,9 @@
 
 import { useEffect, useState } from "react";
 import {
-  fetchWgCredentials, fetchWgWebinars, refreshWgWebinars, updateWebinar,
-  type ApiWebinar, type ApiWgCredential, type WgWebinar,
+  fetchWgCredentials, fetchWgWebinars, fetchZoomWebinars, platformOf,
+  refreshWgWebinars, refreshZoomWebinars, updateWebinar,
+  type ApiWebinar, type ApiWgCredential, type WebinarPlatform, type WgWebinar,
 } from "@/lib/api";
 
 /** Flat, camelCase editable view of a webinar — both Planning and Statistics
@@ -34,7 +35,7 @@ function fmtDate(iso: string | null): string {
   return isNaN(d.getTime()) ? "" : d.toLocaleDateString();
 }
 
-/** Shared "Edit Webinar" modal — WebinarGeek account/broadcast picker, the
+/** Shared "Edit Webinar" modal — webinar platform + broadcast picker, the
  * Nonjoiner source (previous webinar), and the basic webinar fields. Used by
  * the Planning and Statistics pages. Saves with one PUT and hands the updated
  * row back via onSaved. */
@@ -47,6 +48,9 @@ export function WebinarEditModal({
   onSaved: (updated: ApiWebinar) => void;
 }) {
   const [edit, setEdit] = useState<EditableWebinar>(webinar);
+  // Derived from the linked broadcast id rather than persisted: a stored copy
+  // would desynchronise the moment someone re-links the webinar.
+  const [platform, setPlatform] = useState<WebinarPlatform>(platformOf(webinar.broadcastId));
   const [creds, setCreds] = useState<ApiWgCredential[]>([]);
   const [broadcasts, setBroadcasts] = useState<WgWebinar[]>([]);
   const [bcLoading, setBcLoading] = useState(false);
@@ -61,11 +65,23 @@ export function WebinarEditModal({
     return () => { document.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
   }, [onClose]);
 
-  const loadBroadcasts = async (credId: string | undefined, refresh: boolean) => {
+  const loadBroadcasts = async (
+    plat: WebinarPlatform, credId: string | undefined, refresh: boolean,
+  ) => {
     setBcLoading(true);
     try {
-      if (refresh) { try { await refreshWgWebinars(); } catch (e) { console.error("WG refresh failed", e); } }
-      const { broadcasts } = await fetchWgWebinars({ credential_id: credId, limit: 500 });
+      if (refresh) {
+        try {
+          await (plat === "zoom" ? refreshZoomWebinars() : refreshWgWebinars());
+        } catch (e) {
+          // A refresh failure is not fatal — fall through and show whatever is
+          // already cached rather than an empty picker.
+          console.error(`${plat} refresh failed`, e);
+        }
+      }
+      const { broadcasts } = plat === "zoom"
+        ? await fetchZoomWebinars({ limit: 500 })
+        : await fetchWgWebinars({ credential_id: credId, limit: 500 });
       setBroadcasts(broadcasts);
     } catch (e) {
       console.error("Failed to load broadcasts", e);
@@ -82,7 +98,7 @@ export function WebinarEditModal({
       try { list = (await fetchWgCredentials()).credentials; } catch (e) { console.error("Failed to load WG credentials", e); }
       setCreds(list);
       const credId = webinar.webinargeekCredentialId || list.find((c) => c.name === "default")?.id;
-      loadBroadcasts(credId, true);
+      loadBroadcasts(platformOf(webinar.broadcastId), credId, true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -147,23 +163,45 @@ export function WebinarEditModal({
           </div>
 
           <div>
-            <label className={LABEL_CLS}>WebinarGeek Account</label>
-            <select value={edit.webinargeekCredentialId}
+            <label className={LABEL_CLS}>Platform</label>
+            <select value={platform}
               onChange={(e) => {
-                const credId = e.target.value;
-                setEdit({ ...edit, webinargeekCredentialId: credId, broadcastId: "" });
-                loadBroadcasts(credId || creds.find((c) => c.name === "default")?.id, false);
+                const next = e.target.value as WebinarPlatform;
+                setPlatform(next);
+                // Clear the link: an id from the other platform would point at
+                // a broadcast this webinar can no longer sync.
+                setEdit({
+                  ...edit,
+                  broadcastId: "",
+                  webinargeekCredentialId: next === "zoom" ? "" : edit.webinargeekCredentialId,
+                });
+                loadBroadcasts(next, creds.find((c) => c.name === "default")?.id, false);
               }}
               className={SELECT_CLS}>
-              <option value="">Default credential</option>
-              {creds.filter((c) => c.name !== "default").map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
+              <option value="webinargeek">WebinarGeek</option>
+              <option value="zoom">Zoom</option>
             </select>
           </div>
+          {platform === "webinargeek" && (
+            <div>
+              <label className={LABEL_CLS}>WebinarGeek Account</label>
+              <select value={edit.webinargeekCredentialId}
+                onChange={(e) => {
+                  const credId = e.target.value;
+                  setEdit({ ...edit, webinargeekCredentialId: credId, broadcastId: "" });
+                  loadBroadcasts("webinargeek", credId || creds.find((c) => c.name === "default")?.id, false);
+                }}
+                className={SELECT_CLS}>
+                <option value="">Default credential</option>
+                {creds.filter((c) => c.name !== "default").map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <label className={LABEL_CLS + " flex items-center gap-2"}>
-              WebinarGeek Broadcast
+              {platform === "zoom" ? "Zoom Webinar" : "WebinarGeek Broadcast"}
               {bcLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
             </label>
             <select value={edit.broadcastId} disabled={bcLoading}
@@ -183,7 +221,11 @@ export function WebinarEditModal({
                 </option>
               ))}
             </select>
-            <div className="mt-1.5 text-[10px] text-zinc-500">Subscribers auto-sync once, ~2h after the broadcast start time. Picking a broadcast fills the date above (still editable).</div>
+            <div className="mt-1.5 text-[10px] text-zinc-500">
+              {platform === "zoom"
+                ? "Registrants and attendance auto-sync once, ~45m after the webinar ends (Zoom only publishes the attendance report after the session finishes). Replay views are not tracked on Zoom. Picking a webinar fills the date above (still editable)."
+                : "Subscribers auto-sync once, ~2h after the broadcast start time. Picking a broadcast fills the date above (still editable)."}
+            </div>
           </div>
 
           <div>

@@ -1,4 +1,10 @@
-"""Connector models: API credentials and WebinarGeek data cache."""
+"""Connector models: API credentials and the shared webinar-platform data cache.
+
+webinar_broadcasts / webinar_registrants are provider-neutral: WebinarGeek and
+Zoom both write into them, discriminated by the `provider` column. Everything
+downstream joins on (LOWER(email), webinars.broadcast_id) and does not care
+which platform produced a row.
+"""
 
 from db.models._common import (
     Base, Boolean, DateTime, ForeignKey, Index, Integer, JSONB,
@@ -23,6 +29,10 @@ class ConnectorCredential(Base):
     location_id: Mapped[Optional[str]] = mapped_column(Text)
     # GHL-only: pipeline used for opportunity streaming. Null elsewhere.
     pipeline_id: Mapped[Optional[str]] = mapped_column(Text)
+    # Zoom-only: the non-secret half of Server-to-Server OAuth. The client
+    # secret lives in api_key so masking/deletion stay provider-agnostic.
+    client_id: Mapped[Optional[str]] = mapped_column(Text)
+    account_id: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -31,12 +41,24 @@ class ConnectorCredential(Base):
     )
 
 
-class WebinarGeekWebinar(Base):
-    __tablename__ = "webinargeek_webinars"
+class WebinarBroadcast(Base):
+    __tablename__ = "webinar_broadcasts"
 
-    broadcast_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    broadcast_id: Mapped[str] = mapped_column(Text, primary_key=True)
     webinar_id: Mapped[Optional[str]] = mapped_column(String(64))
-    # Which WebinarGeek credential most recently surfaced this broadcast.
+    # Which platform produced this row: 'webinargeek' | 'zoom'. Load-bearing —
+    # the WebinarGeek picker, its sync-all count and run_sync_all all filter on
+    # it so they never pick up a Zoom broadcast (and never hand one to the
+    # WebinarGeek API key).
+    provider: Mapped[str] = mapped_column(Text, nullable=False, server_default="webinargeek")
+    # Zoom only. The per-instance UUID the participants report is keyed by.
+    # NULL until the webinar has actually aired — it does not exist before
+    # then, which is why broadcast_id cannot carry it. Resolved once, at sync
+    # time, and never re-resolved.
+    platform_instance_id: Mapped[Optional[str]] = mapped_column(Text)
+    # Zoom only. Parsed out of broadcast_id so SQL never has to string-split.
+    occurrence_id: Mapped[Optional[str]] = mapped_column(Text)
+    # Which provider credential most recently surfaced this broadcast.
     # Stamped during refresh; rows synced before migration 042 stay NULL
     # until the next refresh.
     credential_id: Mapped[Optional[str]] = mapped_column(
@@ -58,13 +80,16 @@ class WebinarGeekWebinar(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class WebinarGeekSubscriber(Base):
-    __tablename__ = "webinargeek_subscribers"
+class WebinarRegistrant(Base):
+    __tablename__ = "webinar_registrants"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     broadcast_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("webinargeek_webinars.broadcast_id", ondelete="CASCADE"), nullable=False,
+        Text, ForeignKey("webinar_broadcasts.broadcast_id", ondelete="CASCADE"), nullable=False,
     )
+    # Redundant with the FK, but the ~20 raw-SQL sites join on broadcast_id
+    # alone and provenance is otherwise invisible when reading rows directly.
+    provider: Mapped[str] = mapped_column(Text, nullable=False, server_default="webinargeek")
     subscriber_id: Mapped[Optional[str]] = mapped_column(String(64))
     email: Mapped[str] = mapped_column(Text, nullable=False)
     first_name: Mapped[Optional[str]] = mapped_column(Text)
@@ -91,7 +116,7 @@ class WebinarGeekSubscriber(Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint("broadcast_id", "email", name="uq_wg_subs_broadcast_email"),
-        Index("ix_wg_subs_broadcast", "broadcast_id"),
-        Index("ix_wg_subs_email", "email"),
+        UniqueConstraint("broadcast_id", "email", name="uq_webinar_registrants_broadcast_email"),
+        Index("ix_webinar_registrants_broadcast", "broadcast_id"),
+        Index("ix_webinar_registrants_email", "email"),
     )

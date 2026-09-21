@@ -3612,3 +3612,153 @@ export async function deleteMcpConnector(id: string): Promise<void> {
   });
   if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to revoke MCP connector"));
 }
+
+/* ── Connectors: Zoom ──────────────────────────────────────────────────── */
+
+export interface ZoomScope {
+  scope: string;
+  classic: string;
+  why: string;
+}
+
+export interface ZoomCredentialStatus {
+  configured: boolean;
+  account_id?: string | null;
+  client_id?: string | null;
+  client_secret_masked?: string | null;
+  /** Which Zoom account the credentials resolve to; only set right after a save. */
+  account_email?: string | null;
+  /** Rendered on the setup page — a missing scope is the usual failure. */
+  scopes: ZoomScope[];
+}
+
+/**
+ * A cached Zoom webinar. Same shape as WgWebinar so the webinar pickers can
+ * treat both platforms identically. `replay_viewers_count` is always 0: Zoom
+ * exposes no recording-view analytics, so replay is not counted.
+ */
+export type ZoomWebinar = WgWebinar;
+export type ZoomRegistrant = WgSubscriber;
+
+export async function fetchZoomStatus(): Promise<ZoomCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/zoom`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to load Zoom status"));
+  return res.json();
+}
+
+export async function saveZoomCredential(data: {
+  account_id: string;
+  client_id: string;
+  client_secret: string;
+}): Promise<ZoomCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/zoom`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to save Zoom credentials"));
+  return res.json();
+}
+
+export async function deleteZoomCredential(): Promise<void> {
+  const res = await fetch(`${API_URL}/connectors/zoom`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to disconnect Zoom"));
+}
+
+export async function fetchZoomWebinars(opts?: {
+  limit?: number;
+  offset?: number;
+  q?: string;
+}): Promise<{ broadcasts: ZoomWebinar[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  if (opts?.offset != null) params.set("offset", String(opts.offset));
+  if (opts?.q) params.set("q", opts.q);
+  const res = await fetch(
+    `${API_URL}/connectors/zoom/webinars${params.toString() ? `?${params}` : ""}`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to load Zoom webinars"));
+  return res.json();
+}
+
+export async function refreshZoomWebinars(): Promise<{ count: number }> {
+  const res = await fetch(`${API_URL}/connectors/zoom/webinars/refresh`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to refresh Zoom webinars"));
+  return res.json();
+}
+
+export async function syncZoomWebinar(broadcastId: string): Promise<{
+  broadcast_id: string;
+  run_id: string;
+  status: string;
+}> {
+  const res = await fetch(
+    `${API_URL}/connectors/zoom/webinars/${encodeURIComponent(broadcastId)}/sync`,
+    { method: "POST", headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start Zoom sync"));
+  return res.json();
+}
+
+export async function syncAllZoomWebinars(): Promise<{
+  run_id: string;
+  status: string;
+  broadcasts_queued: number;
+}> {
+  const res = await fetch(`${API_URL}/connectors/zoom/webinars/sync-all`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to start Zoom sync-all"));
+  return res.json();
+}
+
+export async function fetchZoomRegistrants(opts: {
+  broadcast_id?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ subscribers: ZoomRegistrant[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts.broadcast_id) params.set("broadcast_id", opts.broadcast_id);
+  if (opts.q) params.set("q", opts.q);
+  if (opts.limit != null) params.set("limit", String(opts.limit));
+  if (opts.offset != null) params.set("offset", String(opts.offset));
+  const res = await fetch(`${API_URL}/connectors/zoom/registrants?${params}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to load Zoom registrants"));
+  return res.json();
+}
+
+/**
+ * Direct CSV link. Mirrors wgSubscribersCsvUrl — the browser hits the API
+ * directly so the download streams rather than buffering through JS.
+ */
+export function zoomRegistrantsCsvUrl(opts: { broadcast_id?: string; q?: string }): string {
+  const params = new URLSearchParams();
+  if (opts.broadcast_id) params.set("broadcast_id", opts.broadcast_id);
+  if (opts.q) params.set("q", opts.q);
+  return `${API_URL}/connectors/zoom/registrants/export?${params}`;
+}
+
+/**
+ * Which platform a webinar is linked to, derived from its broadcast id rather
+ * than stored separately — a second source of truth would desynchronise the
+ * moment someone re-links a webinar. Zoom ids are namespaced `zoom:<id>`;
+ * WebinarGeek ids are bare numerics.
+ */
+export type WebinarPlatform = "webinargeek" | "zoom";
+
+export const ZOOM_ID_PREFIX = "zoom:";
+
+export function platformOf(broadcastId: string | null | undefined): WebinarPlatform {
+  return broadcastId?.startsWith(ZOOM_ID_PREFIX) ? "zoom" : "webinargeek";
+}

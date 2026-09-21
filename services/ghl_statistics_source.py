@@ -1,6 +1,6 @@
 """GoHighLevelStatisticsSource — compute per-webinar metrics from synced GHL tables.
 
-Joins ghl_contact / ghl_opportunity / webinargeek_subscribers / webinar_list_assignments
+Joins ghl_contact / ghl_opportunity / webinar_registrants / webinar_list_assignments
 against the Planning `webinars` table to produce the same
 raw-metric shape as WorkbookMockStatisticsSource (then the existing
 compute_derived_metrics() in services.statistics derives the ratios).
@@ -8,7 +8,7 @@ compute_derived_metrics() in services.statistics derives the ratios).
 Invited numbers come from the app (Planning assignments), not GHL. Group A
 (sales) comes from ghl_opportunity keyed on Webinar Source Number v2.
 Yes/Maybe/Self Reg counts come from parsing GHL contact text fields.
-Attendance / watch time comes from webinargeek_subscribers joined by email.
+Attendance / watch time comes from webinar_registrants joined by email.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from sqlalchemy.orm import selectinload
 
 from db.models import (
     Contact, GHLContact, GHLWebinarStats, OutreachSender, Webinar,
-    WebinarContactMembership, WebinarGeekSubscriber, WebinarListAssignment,
+    WebinarContactMembership, WebinarRegistrant, WebinarListAssignment,
 )
 from db.session import AsyncSessionLocal
 from services.nonjoiners import nonjoiner_pool_emails
@@ -139,13 +139,13 @@ async def _fetch_wg_broadcast_totals(db: AsyncSession, broadcast_id: str) -> dic
     """Return WG broadcast cache totals (subscriptions_count, live_viewers_count,
     replay_viewers_count) for the given broadcast, or None when no row exists.
     Used to source authoritative regs/attended for the webinar parent row —
-    the synced `webinargeek_subscribers` table omits no-email registrants.
+    the synced `webinar_registrants` table omits no-email registrants.
     """
     from sqlalchemy import text as sa_text
     r = await db.execute(sa_text(
         """
         SELECT subscriptions_count, live_viewers_count, replay_viewers_count
-        FROM webinargeek_webinars WHERE broadcast_id = :bid
+        FROM webinar_broadcasts WHERE broadcast_id = :bid
         """
     ).bindparams(bid=broadcast_id))
     row = r.mappings().one_or_none()
@@ -393,7 +393,7 @@ async def _count_attended_for_broadcast_filtered(
     min_minutes: int | None = None,
     require_sms_tag: bool = False,
 ) -> int:
-    """Count contacts attended a webinar (via webinargeek_subscribers join on email)
+    """Count contacts attended a webinar (via webinar_registrants join on email)
     with optional filters: invite response pattern (yes/maybe), self-reg date window,
     minimum minutes_viewing, SMS click tag.
     """
@@ -404,21 +404,21 @@ async def _count_attended_for_broadcast_filtered(
         select(func.count(func.distinct(GHLContact.ghl_contact_id)))
         .select_from(GHLContact)
         .join(
-            WebinarGeekSubscriber,
-            func.lower(WebinarGeekSubscriber.email) == func.lower(GHLContact.email),
+            WebinarRegistrant,
+            func.lower(WebinarRegistrant.email) == func.lower(GHLContact.email),
         )
-        .where(WebinarGeekSubscriber.broadcast_id == broadcast_id)
+        .where(WebinarRegistrant.broadcast_id == broadcast_id)
     )
 
     # Attended = watched_live=True OR minutes_viewing > 0
     attended_filter = or_(
-        WebinarGeekSubscriber.watched_live.is_(True),
-        WebinarGeekSubscriber.minutes_viewing > 0,
+        WebinarRegistrant.watched_live.is_(True),
+        WebinarRegistrant.minutes_viewing > 0,
     )
     q = q.where(attended_filter)
 
     if min_minutes is not None:
-        q = q.where(WebinarGeekSubscriber.minutes_viewing >= min_minutes)
+        q = q.where(WebinarRegistrant.minutes_viewing >= min_minutes)
 
     if invite_response_pattern:
         q = q.where(
@@ -451,14 +451,14 @@ async def _count_broadcast_attendees(
         )
 
     q = select(func.count()).where(
-        WebinarGeekSubscriber.broadcast_id == broadcast_id,
+        WebinarRegistrant.broadcast_id == broadcast_id,
         or_(
-            WebinarGeekSubscriber.watched_live.is_(True),
-            WebinarGeekSubscriber.minutes_viewing > 0,
+            WebinarRegistrant.watched_live.is_(True),
+            WebinarRegistrant.minutes_viewing > 0,
         ),
     )
     if min_minutes is not None:
-        q = q.where(WebinarGeekSubscriber.minutes_viewing >= min_minutes)
+        q = q.where(WebinarRegistrant.minutes_viewing >= min_minutes)
     result = await db.execute(q)
     return int(result.scalar() or 0)
 
@@ -787,7 +787,7 @@ class GoHighLevelStatisticsSource:
             # Override registration/attendance totals with the WG broadcast
             # cache when available. Both the per-list count and the
             # webinar-wide query only see contacts we've synced (rows in
-            # webinargeek_subscribers); WG's broadcast row carries the
+            # webinar_registrants); WG's broadcast row carries the
             # authoritative `subscriptions_count` / `live_viewers_count`
             # which also covers no-email registrants who never get synced.
             if w.broadcast_id:
@@ -1118,7 +1118,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND c.resp = 'maybe' AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}))                                    AS self_reg_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({sr_pred}) AND wgs.minutes_viewing >= 10)      AS self_reg_10m
-                FROM webinargeek_subscribers wgs
+                FROM webinar_registrants wgs
                 JOIN nj_emails_cte njx ON njx.email = LOWER(wgs.email)
                 LEFT JOIN njcsv c ON c.email = LOWER(wgs.email)
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
@@ -1460,7 +1460,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND {wg_maybe_pred} AND wgs.minutes_viewing >= 30) AS maybe_30m,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}))                               AS self_reg_attended,
                     COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE {ATT} AND ({wg_sr_pred}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
-                FROM webinargeek_subscribers wgs
+                FROM webinar_registrants wgs
                 LEFT JOIN planned p ON p.email = LOWER(wgs.email)
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
                 {wg_nj_join_sql}
@@ -1487,7 +1487,7 @@ class GoHighLevelStatisticsSource:
 
                 # totalRegs / totalAttended on NLD reflect the WG-vs-planned
                 # gap: anything WG reports (including no-email registrants
-                # that never sync into webinargeek_subscribers) that we
+                # that never sync into webinar_registrants) that we
                 # couldn't attribute to a planned list. Falls back to the
                 # synced-only unplanned count when WG cache is missing.
                 wg_totals_nld = await _fetch_wg_broadcast_totals(db, broadcast_id)
@@ -1501,7 +1501,7 @@ class GoHighLevelStatisticsSource:
                         SELECT
                           COUNT(DISTINCT LOWER(wgs.email)) AS planned_regs,
                           COUNT(DISTINCT LOWER(wgs.email)) FILTER (WHERE wgs.watched_live = TRUE OR wgs.minutes_viewing > 0) AS planned_attended
-                        FROM webinargeek_subscribers wgs
+                        FROM webinar_registrants wgs
                         JOIN planned p ON p.email = LOWER(wgs.email)
                         WHERE wgs.broadcast_id = :bid
                         """
@@ -1820,7 +1820,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND {maybe_pred} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT LOWER(c.email)) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
-                FROM webinargeek_subscribers wgs
+                FROM webinar_registrants wgs
                 JOIN contacts c ON LOWER(c.email) = LOWER(wgs.email)
                 JOIN webinar_contact_memberships m
                   ON m.contact_id = c.id AND m.webinar_id = CAST(:wid AS uuid)
@@ -1969,7 +1969,7 @@ class GoHighLevelStatisticsSource:
         the data behind the "By List Source" tab.
 
         Mirrors _compute_per_list_metrics' definitions of registered
-        (webinargeek_subscribers presence), attended (watched_live OR
+        (webinar_registrants presence), attended (watched_live OR
         minutes_viewing>0 / >=10) and booked (opp.webinar_source_number OR
         ghl_contact.booked_call_webinar_series = N), but groups by
         contacts.lead_list_name instead of assignment_id, then rolls the raw
@@ -2039,7 +2039,7 @@ class GoHighLevelStatisticsSource:
                 FROM contacts c
                 JOIN webinar_contact_memberships m ON m.contact_id = c.id
             LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-                JOIN webinargeek_subscribers wgs
+                JOIN webinar_registrants wgs
                     ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
                 WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
                 GROUP BY 1
@@ -2281,7 +2281,7 @@ class GoHighLevelStatisticsSource:
                     FROM contacts c
                     JOIN webinar_contact_memberships m ON m.contact_id = c.id
                     LEFT JOIN webinar_list_assignments wla ON wla.id = m.assignment_id
-                    JOIN webinargeek_subscribers wgs
+                    JOIN webinar_registrants wgs
                         ON LOWER(wgs.email) = LOWER(c.email) AND wgs.broadcast_id = :bid
                     WHERE m.webinar_id = CAST(:wid AS uuid) AND {cold}
                 ) t
@@ -2548,7 +2548,7 @@ class GoHighLevelStatisticsSource:
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND {maybe_pred_wg} AND g.has_sms_click_tag = TRUE) AS maybe_sms,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter})) AS self_reg_attended,
                     COUNT(DISTINCT g.ghl_contact_id) FILTER (WHERE {ATT} AND ({wg_window_filter}) AND wgs.minutes_viewing >= 10) AS self_reg_10m
-                FROM webinargeek_subscribers wgs
+                FROM webinar_registrants wgs
                 LEFT JOIN ghl_contact g ON LOWER(g.email) = LOWER(wgs.email)
                 WHERE wgs.broadcast_id = :bid
             """

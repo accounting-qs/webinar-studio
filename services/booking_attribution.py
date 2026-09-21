@@ -136,7 +136,7 @@ async def rebuild_attributions(
     attended_by_email: dict[str, list[dict]] = {}
     if emails:
         for r in (await db.execute(sa_text(
-            "SELECT lower(email), broadcast_id FROM webinargeek_subscribers "
+            "SELECT lower(email), broadcast_id FROM webinar_registrants "
             "WHERE lower(email) = ANY(:emails) AND (watched_live = TRUE OR COALESCE(minutes_viewing,0) > 0)"
         ), {"emails": emails})).all():
             w = by_broadcast.get(r[1])

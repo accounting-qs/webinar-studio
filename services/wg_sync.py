@@ -23,7 +23,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
-from db.models import BlocklistEntry, ConnectorCredential, Webinar, WebinarGeekSubscriber, WebinarGeekWebinar
+from db.models import BlocklistEntry, ConnectorCredential, Webinar, WebinarRegistrant, WebinarBroadcast
 from db.session import AsyncSessionLocal
 from integrations import webinargeek_client as wg
 from services.ghl_sync import _heartbeat, _sync_run
@@ -60,12 +60,12 @@ async def _get_api_key_default(db) -> str | None:
 
 async def _resolve_api_key_for_broadcast(db, broadcast_id: str) -> str:
     # Authoritative: the credential that surfaced this broadcast on the
-    # last refresh (stamped on webinargeek_webinars.credential_id).
+    # last refresh (stamped on webinar_broadcasts.credential_id).
     wb_cred = (await db.execute(
         select(ConnectorCredential)
-        .join(WebinarGeekWebinar, WebinarGeekWebinar.credential_id == ConnectorCredential.id)
+        .join(WebinarBroadcast, WebinarBroadcast.credential_id == ConnectorCredential.id)
         .where(
-            WebinarGeekWebinar.broadcast_id == broadcast_id,
+            WebinarBroadcast.broadcast_id == broadcast_id,
             ConnectorCredential.provider == PROVIDER,
         )
         .limit(1)
@@ -97,6 +97,7 @@ def _subscriber_values(broadcast_id: str, s: dict) -> dict:
     minutes = int(wd // 60) if isinstance(wd, (int, float)) else None
     return {
         "broadcast_id": broadcast_id,
+        "provider": PROVIDER,
         "subscriber_id": str(s.get("id")) if s.get("id") is not None else None,
         "email": (s.get("email") or "").strip(),
         "first_name": s.get("firstname"),
@@ -131,7 +132,7 @@ async def _upsert_one_broadcast(db, api_key: str, broadcast_id: str) -> int:
         values = _subscriber_values(broadcast_id, s)
         if not values["email"]:
             continue
-        stmt = pg_insert(WebinarGeekSubscriber).values(**values)
+        stmt = pg_insert(WebinarRegistrant).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["broadcast_id", "email"],
             set_={k: v for k, v in values.items() if k not in ("broadcast_id", "email")},
@@ -176,7 +177,7 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
             async with AsyncSessionLocal() as db:
                 api_key = await _resolve_api_key_for_broadcast(db, broadcast_id)
                 wb = (await db.execute(
-                    select(WebinarGeekWebinar).where(WebinarGeekWebinar.broadcast_id == broadcast_id)
+                    select(WebinarBroadcast).where(WebinarBroadcast.broadcast_id == broadcast_id)
                 )).scalar_one_or_none()
                 if not wb:
                     raise RuntimeError(f"Broadcast {broadcast_id} not cached — refresh first")
@@ -211,7 +212,7 @@ async def run_due_broadcast_autosyncs() -> int:
     """Auto-sync subscribers for any planned webinar whose linked WebinarGeek
     broadcast started >= AUTO_SYNC_DELAY ago and hasn't been auto-synced yet.
 
-    Keys off the broadcast's actual start time (webinargeek_webinars.starts_at),
+    Keys off the broadcast's actual start time (webinar_broadcasts.starts_at),
     not the planned Webinar.date. Fires exactly once per webinar — stamps
     Webinar.broadcast_auto_synced_at only on success, so a transient failure
     (API error, or "already syncing" from a concurrent manual run) is retried on
@@ -223,12 +224,12 @@ async def run_due_broadcast_autosyncs() -> int:
     async with AsyncSessionLocal() as db:
         due = (await db.execute(
             select(Webinar.id, Webinar.broadcast_id)
-            .join(WebinarGeekWebinar, WebinarGeekWebinar.broadcast_id == Webinar.broadcast_id)
+            .join(WebinarBroadcast, WebinarBroadcast.broadcast_id == Webinar.broadcast_id)
             .where(
                 Webinar.broadcast_id.isnot(None),
                 Webinar.broadcast_auto_synced_at.is_(None),
-                WebinarGeekWebinar.starts_at.isnot(None),
-                WebinarGeekWebinar.starts_at <= cutoff,
+                WebinarBroadcast.starts_at.isnot(None),
+                WebinarBroadcast.starts_at <= cutoff,
             )
         )).all()
 
@@ -267,7 +268,12 @@ async def run_sync_all(trigger: SyncTrigger = "manual") -> str:
     async with _sync_all_lock:
         async with _sync_run("wg:all", trigger) as state:
             async with AsyncSessionLocal() as db:
-                rows = (await db.execute(select(WebinarGeekWebinar))).scalars().all()
+                # Must stay provider-scoped: webinar_broadcasts also holds
+                # Zoom rows, and syncing one with a WebinarGeek API key would
+                # fail per-broadcast and pollute the umbrella run's errors.
+                rows = (await db.execute(
+                    select(WebinarBroadcast).where(WebinarBroadcast.provider == PROVIDER)
+                )).scalars().all()
             state.expected_total = len(rows)
             await _heartbeat(state)
 
