@@ -63,6 +63,10 @@ RETRY_AFTER_CAP_SECONDS = 60
 # Guard against a pathological cursor loop.
 MAX_PAGES = 500
 
+# How many hosts the setup check will try before concluding that nobody has a
+# webinar licence. Bounded so a large account cannot turn a click into a crawl.
+WEBINAR_LICENCE_SCAN_LIMIT = 25
+
 
 class ZoomError(Exception):
     """Any non-retryable failure talking to Zoom."""
@@ -97,6 +101,18 @@ class ZoomScopeError(ZoomError):
 _MISSING_SCOPES_RE = re.compile(r"does not contain scopes\s*:\s*\[([^\]]*)\]", re.I)
 
 
+def is_webinar_plan_missing(body: str) -> bool:
+    """True for Zoom's per-USER "Webinar plan is missing" 400.
+
+    This is not an account-level problem and not a scope problem: Zoom assigns
+    webinar licences per user, so an account that owns the Webinar plan still
+    returns this for every user who has not been given one. Most users on a
+    typical account have not. Treating it as a failure would abort the whole
+    refresh on the first unlicensed colleague.
+    """
+    return "webinar plan is missing" in (body or "").lower()
+
+
 def parse_missing_scopes(body: str) -> list[str]:
     """Pull the scope names out of Zoom's 4711 body.
 
@@ -112,8 +128,13 @@ def parse_missing_scopes(body: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Token minting / caching
 # ---------------------------------------------------------------------------
-# {f"{account_id}:{client_id}": (access_token, expires_at_epoch)}
-_token_cache: dict[str, tuple[str, float]] = {}
+# {f"{account_id}:{client_id}": (access_token, expires_at_epoch, granted_scope_str)}
+#
+# The scope string comes straight from Zoom's token response, so it is the
+# authoritative list of what the app was actually granted. That is what lets the
+# setup page mark each scope done or missing up front, instead of only finding
+# out when a call fails.
+_token_cache: dict[str, tuple[str, float, str]] = {}
 _token_lock = asyncio.Lock()
 
 
@@ -125,7 +146,7 @@ def invalidate_token(account_id: str, client_id: str) -> None:
     _token_cache.pop(_cache_key(account_id, client_id), None)
 
 
-async def _mint_token(account_id: str, client_id: str, client_secret: str) -> tuple[str, float]:
+async def _mint_token(account_id: str, client_id: str, client_secret: str) -> tuple[str, float, str]:
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -150,7 +171,7 @@ async def _mint_token(account_id: str, client_id: str, client_secret: str) -> tu
     if not token:
         raise ZoomError("Token response contained no access_token")
     expires_at = time.time() + float(data.get("expires_in") or 3600)
-    return token, expires_at
+    return token, expires_at, (data.get("scope") or "")
 
 
 async def get_access_token(
@@ -168,9 +189,17 @@ async def get_access_token(
             cached = _token_cache.get(key)
             if cached and cached[1] - TOKEN_SKEW_SECONDS > time.time():
                 return cached[0]
-        token, expires_at = await _mint_token(account_id, client_id, client_secret)
-        _token_cache[key] = (token, expires_at)
+        token, expires_at, scope = await _mint_token(account_id, client_id, client_secret)
+        _token_cache[key] = (token, expires_at, scope)
         return token
+
+
+def granted_scopes(account_id: str, client_id: str) -> list[str]:
+    """Scopes Zoom reported on the cached token. Empty when nothing is cached."""
+    cached = _token_cache.get(_cache_key(account_id, client_id))
+    if not cached:
+        return []
+    return [s for s in (cached[2] or "").replace(",", " ").split() if s]
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +374,7 @@ async def check_connection(
         "account_email": None,
         "checks": [],
         "missing_scopes": [],
+        "granted_scopes": [],
         "ok": False,
     }
 
@@ -353,6 +383,10 @@ async def check_connection(
         # Force a fresh mint so a cached token cannot mask bad credentials.
         await session._token(force=True)
         out["credentials_ok"] = True
+        # Authoritative: Zoom returns the granted scope list with the token, so
+        # the page can show each scope done/missing without waiting for a call
+        # to fail.
+        out["granted_scopes"] = granted_scopes(account_id, client_id)
     except ZoomError as e:
         out["credential_error"] = str(e)
         return out
@@ -373,18 +407,49 @@ async def check_connection(
         out["checks"].append(entry)
         return None
 
-    users = await probe("List hosts on the account", "/users", {"page_size": 1})
+    users = await probe("List hosts on the account", "/users", {"page_size": 100})
     if users:
         rows = users.get("users") or []
         if rows:
             out["account_email"] = rows[0].get("email")
-            uid = rows[0].get("id")
-            if uid:
-                await probe(
-                    "List that host's webinars",
-                    f"/users/{uid}/webinars",
-                    {"type": "scheduled", "page_size": 1},
-                )
+
+        # Webinar licences are per user, so the first host in the list is very
+        # often not the one who runs webinars. Scan for a licensed host instead
+        # of judging the whole account by an arbitrary colleague.
+        entry = {"name": "Find a host with a webinar licence", "endpoint": "/users/{id}/webinars",
+                 "ok": False, "missing_scopes": [], "error": None}
+        checked = 0
+        unlicensed = 0
+        for u in rows[:WEBINAR_LICENCE_SCAN_LIMIT]:
+            uid = u.get("id")
+            if not uid:
+                continue
+            checked += 1
+            try:
+                await session.get(f"/users/{uid}/webinars", {"type": "scheduled", "page_size": 1})
+            except ZoomScopeError as e:
+                entry["missing_scopes"] = e.missing_scopes
+                entry["error"] = str(e)
+                break
+            except ZoomError as e:
+                if is_webinar_plan_missing(str(e)):
+                    unlicensed += 1
+                    continue
+                entry["error"] = str(e)
+                break
+            entry["ok"] = True
+            entry["endpoint"] = f"{u.get('email') or uid} can list webinars"
+            break
+
+        if not entry["ok"] and not entry["error"] and unlicensed:
+            entry["error"] = (
+                f"None of the {checked} host(s) checked has a Zoom webinar licence assigned. "
+                "The account plan is not the issue — in Zoom, go to User Management → Users, "
+                "open the person who runs your webinars, and enable the Webinar licence for them."
+            )
+        elif not entry["ok"] and not entry["error"]:
+            entry["error"] = "No hosts returned by /users."
+        out["checks"].append(entry)
 
     seen: list[str] = []
     for c in out["checks"]:
@@ -406,10 +471,28 @@ async def list_users(session: ZoomSession) -> list[dict[str, Any]]:
     return await session.paged("/users", "users", {"status": "active"})
 
 
-async def list_webinars(session: ZoomSession, user_id: str, kind: str = "scheduled") -> list[dict[str, Any]]:
-    return await session.paged(
-        f"/users/{user_id}/webinars", "webinars", {"type": kind}, allow_404=True
-    )
+async def list_webinars(
+    session: ZoomSession, user_id: str, kind: str = "scheduled"
+) -> list[dict[str, Any]]:
+    """Webinars for one host.
+
+    A host with no webinar licence returns 400 "Webinar plan is missing", which
+    is normal on any account where not everyone runs webinars — so it yields []
+    rather than raising. Without this the refresh aborted on the first
+    unlicensed colleague and returned nothing at all.
+
+    The setup check does its own licence scan (see check_connection) because it
+    needs to tell "nobody is licensed" apart from "licensed but no webinars".
+    """
+    try:
+        return await session.paged(
+            f"/users/{user_id}/webinars", "webinars", {"type": kind}, allow_404=True
+        )
+    except ZoomError as e:
+        if is_webinar_plan_missing(str(e)):
+            logger.debug("Zoom: skipping user %s — no webinar licence", user_id)
+            return []
+        raise
 
 
 async def get_webinar(session: ZoomSession, webinar_id: str) -> Optional[dict[str, Any]]:

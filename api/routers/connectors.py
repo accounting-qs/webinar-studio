@@ -214,6 +214,9 @@ class ZoomCredentialStatus(BaseModel):
     credential_error: Optional[str] = None
     checks: list[ZoomCheck] = []
     missing_scopes: list[str] = []
+    # What Zoom actually granted, read off the token response — lets the setup
+    # page mark every scope done/missing without waiting for a call to fail.
+    granted_scopes: list[str] = []
     tested: bool = False
 
 
@@ -1080,6 +1083,7 @@ def _zoom_status_from_check(row: Optional[ConnectorCredential], check: dict) -> 
     st.credentials_ok = check.get("credentials_ok")
     st.credential_error = check.get("credential_error")
     st.missing_scopes = check.get("missing_scopes") or []
+    st.granted_scopes = check.get("granted_scopes") or []
     st.checks = [ZoomCheck(**c) for c in (check.get("checks") or [])]
     return st
 

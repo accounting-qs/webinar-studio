@@ -3649,6 +3649,8 @@ export interface ZoomCredentialStatus {
   credential_error?: string | null;
   checks: ZoomCheck[];
   missing_scopes: string[];
+  /** What Zoom actually granted, straight off the token response. */
+  granted_scopes: string[];
   tested: boolean;
 }
 

@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, ".")
 
 from integrations.zoom_client import (  # noqa: E402
-    ZoomScopeError, duration_units_suspect, encode_uuid, merge_watch_seconds,
-    parse_dt, parse_missing_scopes,
+    ZoomScopeError, duration_units_suspect, encode_uuid, is_webinar_plan_missing,
+    merge_watch_seconds, parse_dt, parse_missing_scopes,
 )
 
 failures = []
@@ -109,6 +109,18 @@ e = ZoomScopeError("/users/me", real, parse_missing_scopes(real))
 check("error names the scopes", "user:read:user:admin" in str(e), True)
 check("error carries them structurally", e.missing_scopes[0], "user:read:user:admin")
 check("scope-less fallback still readable", "missing a scope" in str(ZoomScopeError("/x")), True)
+
+print("is_webinar_plan_missing (per-USER licence, not an account plan problem)")
+# The exact body prod returned for a host with no webinar licence. Note Zoom
+# sends it as HTTP 400 with an unrelated-looking "code":200.
+plan = ('{"code":200,"message":"Webinar plan is missing. You must subscribe to the '
+        'webinar plan and enable webinars for this user in order to perform this action: -CxPi."}')
+check("real body detected", is_webinar_plan_missing(plan), True)
+check("case insensitive", is_webinar_plan_missing("WEBINAR PLAN IS MISSING"), True)
+check("unrelated 400 not swallowed", is_webinar_plan_missing('{"message":"Invalid webinar id"}'), False)
+check("scope error not confused with it", is_webinar_plan_missing(real), False)
+check("empty", is_webinar_plan_missing(""), False)
+check("none", is_webinar_plan_missing(None), False)
 
 if failures:
     print("\nFAILED:")

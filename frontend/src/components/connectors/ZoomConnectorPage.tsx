@@ -203,6 +203,7 @@ function ConfigTab({
   const scopes = view?.scopes ?? [];
   const scopeList = scopes.map((s) => s.scope).join("\n");
   const missingScopes = view?.missing_scopes ?? [];
+  const granted = view?.granted_scopes ?? [];
   const tested = !!view?.tested;
   const credsOk = view?.credentials_ok === true;
   const credStatus: FieldStatus = !tested ? "unknown" : credsOk ? "ok" : "bad";
@@ -311,42 +312,45 @@ function ConfigTab({
           <CopyButton value={scopeList} label="Copy all" className="text-[11px] px-2 py-1" />
         </div>
         <p className="text-xs text-zinc-500 mb-3">
-          Zoom shows either the granular or the classic names depending on how old the app is —
-          add whichever set your Scopes tab offers.
+          Status fills in once you hit <strong>Test connection</strong> below — it is read from
+          Zoom itself, so it reflects what the app really has. Older Zoom apps grant a broader
+          name (e.g. <code className="font-mono">webinar:read:admin</code>) which counts for every
+          webinar row.
         </p>
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead>
               <tr className="text-left text-zinc-500 border-b border-zinc-200 dark:border-zinc-800">
+                <th className="py-1.5 pr-3 font-medium w-16">Status</th>
                 <th className="py-1.5 pr-3 font-medium">Scope</th>
-                <th className="py-1.5 pr-3 font-medium">Classic</th>
                 <th className="py-1.5 font-medium">What it&apos;s for</th>
               </tr>
             </thead>
             <tbody>
               {scopes.map((s) => {
-                // Zoom names the scopes it wanted; flag those rows so the fix is
-                // obvious instead of leaving the user to diff two lists by eye.
-                const missing = missingScopes.includes(s.scope) || missingScopes.includes(s.classic);
+                // An older Zoom app grants the classic name instead of the
+                // granular one, so either satisfies the row.
+                const have = granted.includes(s.scope) || granted.includes(s.classic);
+                const named = missingScopes.includes(s.scope) || missingScopes.includes(s.classic);
+                const state: "unknown" | "ok" | "bad" =
+                  named ? "bad" : !tested || granted.length === 0 ? "unknown" : have ? "ok" : "bad";
                 return (
                   <tr
                     key={s.scope}
                     className={
                       "border-b border-zinc-100 dark:border-zinc-900 " +
-                      (missing ? "bg-red-500/5" : "")
+                      (state === "bad" ? "bg-red-500/5" : "")
                     }
                   >
+                    <td className="py-1.5 pr-3 whitespace-nowrap">
+                      {state === "ok" && <span className="text-emerald-500 text-[11px]">✓ added</span>}
+                      {state === "bad" && <span className="text-red-500 text-[11px]">✕ missing</span>}
+                      {state === "unknown" && <span className="text-zinc-400 text-[11px]">—</span>}
+                    </td>
                     <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-800 dark:text-zinc-200 whitespace-nowrap">
                       <span className="inline-flex items-center gap-1.5">
-                        {missing && <span className="text-red-500" title="Zoom says this one is missing">●</span>}
                         {s.scope}
                         <CopyButton value={s.scope} />
-                      </span>
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-500 whitespace-nowrap">
-                      <span className="inline-flex items-center gap-1.5">
-                        {s.classic}
-                        <CopyButton value={s.classic} />
                       </span>
                     </td>
                     <td className="py-1.5 text-zinc-600 dark:text-zinc-400">{s.why}</td>
