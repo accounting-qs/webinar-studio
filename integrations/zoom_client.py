@@ -419,7 +419,7 @@ async def check_connection(
         entry = {"name": "Find a host with a webinar licence", "endpoint": "/users/{id}/webinars",
                  "ok": False, "missing_scopes": [], "error": None}
         checked = 0
-        unlicensed = 0
+        unlicensed: list[str] = []
         for u in rows[:WEBINAR_LICENCE_SCAN_LIMIT]:
             uid = u.get("id")
             if not uid:
@@ -433,7 +433,7 @@ async def check_connection(
                 break
             except ZoomError as e:
                 if is_webinar_plan_missing(str(e)):
-                    unlicensed += 1
+                    unlicensed.append(u.get("email") or uid)
                     continue
                 entry["error"] = str(e)
                 break
@@ -442,10 +442,14 @@ async def check_connection(
             break
 
         if not entry["ok"] and not entry["error"] and unlicensed:
+            # Name them. The first version of this message said only "Webinar
+            # plan is missing", which read as a claim about the whole account
+            # and sent the reader to check a plan that was never the problem.
+            who = ", ".join(unlicensed[:10]) + ("…" if len(unlicensed) > 10 else "")
             entry["error"] = (
-                f"None of the {checked} host(s) checked has a Zoom webinar licence assigned. "
-                "The account plan is not the issue — in Zoom, go to User Management → Users, "
-                "open the person who runs your webinars, and enable the Webinar licence for them."
+                f"Checked {checked} host(s) and none has a Zoom webinar licence: {who}. "
+                "This is per user, not the account plan — in Zoom go to User Management → "
+                "Users, open whoever runs your webinars, Edit, and tick Zoom Webinars."
             )
         elif not entry["ok"] and not entry["error"]:
             entry["error"] = "No hosts returned by /users."
