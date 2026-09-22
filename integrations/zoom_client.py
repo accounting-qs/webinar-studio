@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -72,18 +73,40 @@ class ZoomAuthError(ZoomError):
 
 
 class ZoomScopeError(ZoomError):
-    """Authenticated but forbidden: the app is missing a scope.
+    """Authenticated, but the app is missing a scope for this call.
 
-    Carries the path so the UI can name the call that failed instead of showing
-    a generic 403 — a missing scope is by far the most common setup mistake.
+    Zoom reports this as HTTP 400 with code 4711 (not 403), and helpfully names
+    the scopes it wanted. Those are parsed out and carried on `missing_scopes`
+    so the UI can tell the user exactly what to add rather than showing a raw
+    error — a missing scope is by far the most common setup mistake.
     """
 
-    def __init__(self, path: str, detail: str = "") -> None:
+    def __init__(self, path: str, detail: str = "", missing_scopes: Optional[list[str]] = None) -> None:
         self.path = path
         self.detail = detail
-        super().__init__(
-            f"Zoom denied {path} (403). The app is missing a scope for this call. {detail}".strip()
-        )
+        self.missing_scopes = missing_scopes or []
+        if self.missing_scopes:
+            wanted = " or ".join(self.missing_scopes)
+            msg = f"Zoom denied {path}: the app is missing the scope {wanted}."
+        else:
+            msg = f"Zoom denied {path}: the app is missing a scope for this call. {detail}".strip()
+        super().__init__(msg)
+
+
+# Zoom: {"code":4711,"message":"Invalid access token, does not contain scopes:[a, b]."}
+_MISSING_SCOPES_RE = re.compile(r"does not contain scopes\s*:\s*\[([^\]]*)\]", re.I)
+
+
+def parse_missing_scopes(body: str) -> list[str]:
+    """Pull the scope names out of Zoom's 4711 body.
+
+    Parsing beats hardcoding an endpoint->scope map: Zoom states exactly what it
+    wanted, so this stays correct even for calls added later.
+    """
+    m = _MISSING_SCOPES_RE.search(body or "")
+    if not m:
+        return []
+    return [s.strip() for s in m.group(1).split(",") if s.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +244,15 @@ class ZoomSession:
             if resp.status_code == 401:
                 raise ZoomAuthError("Zoom rejected the access token (401) after a refresh.")
 
-            if resp.status_code == 403:
-                raise ZoomScopeError(path, resp.text[:200])
+            if resp.status_code in (400, 403):
+                # Zoom returns missing-scope as 400/code 4711, not 403. Treating
+                # it as a generic failure reported a setup problem as a network
+                # problem, so check for it on both.
+                body = resp.text or ""
+                missing = parse_missing_scopes(body)
+                if missing or resp.status_code == 403 or '"code":4711' in body.replace(" ", ""):
+                    raise ZoomScopeError(path, body[:300], missing)
+                raise ZoomError(f"{path} returned {resp.status_code}: {body[:200]}")
 
             if resp.status_code == 404:
                 if allow_404:
@@ -290,15 +320,80 @@ def encode_uuid(uuid: str) -> str:
     return once
 
 
-async def verify_credentials(
+async def check_connection(
     account_id: str, client_id: str, client_secret: str
 ) -> dict[str, Any]:
-    """Mint a token and confirm the API answers. Returns the owning account user."""
+    """Mint a token, then probe the calls the sync actually makes.
+
+    Reports credentials and scopes SEPARATELY, because they fail for different
+    reasons and have different fixes:
+
+    - Minting a token exercises all three values at once (account id, client id,
+      client secret). If it succeeds, all three are correct — there is no way for
+      one to be wrong and the mint to still work. That is what lets the UI say
+      which half of the setup is done.
+    - A scope problem happens only after a good token, so it can never be
+      confused with a bad credential.
+
+    Probes `/users` rather than `/users/me`: listing hosts is what
+    refresh_webinars genuinely needs, so verifying it proves something useful,
+    and it avoids requiring `user:read:user:admin` for a health check alone.
+    """
+    out: dict[str, Any] = {
+        "credentials_ok": False,
+        "credential_error": None,
+        "account_email": None,
+        "checks": [],
+        "missing_scopes": [],
+        "ok": False,
+    }
+
     session = ZoomSession(account_id, client_id, client_secret)
-    # Force a fresh mint so a stale cache entry can't mask bad credentials.
-    await session._token(force=True)
-    me = await session.get("/users/me")
-    return me or {}
+    try:
+        # Force a fresh mint so a cached token cannot mask bad credentials.
+        await session._token(force=True)
+        out["credentials_ok"] = True
+    except ZoomError as e:
+        out["credential_error"] = str(e)
+        return out
+
+    async def probe(name: str, endpoint: str, params: Optional[dict[str, Any]] = None):
+        entry = {"name": name, "endpoint": endpoint, "ok": False,
+                 "missing_scopes": [], "error": None}
+        try:
+            data = await session.get(endpoint, params)
+            entry["ok"] = True
+            out["checks"].append(entry)
+            return data
+        except ZoomScopeError as e:
+            entry["missing_scopes"] = e.missing_scopes
+            entry["error"] = str(e)
+        except ZoomError as e:
+            entry["error"] = str(e)
+        out["checks"].append(entry)
+        return None
+
+    users = await probe("List hosts on the account", "/users", {"page_size": 1})
+    if users:
+        rows = users.get("users") or []
+        if rows:
+            out["account_email"] = rows[0].get("email")
+            uid = rows[0].get("id")
+            if uid:
+                await probe(
+                    "List that host's webinars",
+                    f"/users/{uid}/webinars",
+                    {"type": "scheduled", "page_size": 1},
+                )
+
+    seen: list[str] = []
+    for c in out["checks"]:
+        for s in c["missing_scopes"]:
+            if s not in seen:
+                seen.append(s)
+    out["missing_scopes"] = seen
+    out["ok"] = out["credentials_ok"] and all(c["ok"] for c in out["checks"]) and bool(out["checks"])
+    return out
 
 
 async def list_users(session: ZoomSession) -> list[dict[str, Any]]:

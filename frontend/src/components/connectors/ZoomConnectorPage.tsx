@@ -11,6 +11,7 @@ import {
   saveZoomCredential,
   syncAllZoomWebinars,
   syncZoomWebinar,
+  testZoomConnection,
   zoomRegistrantsCsvUrl,
   type ZoomCredentialStatus,
   type ZoomRegistrant,
@@ -18,6 +19,37 @@ import {
 } from "@/lib/api";
 
 type Tab = "config" | "webinars" | "registrants";
+
+/** Copy button that confirms in place — on a setup page you are pasting from,
+ *  silent copying leaves you unsure whether it worked. */
+function CopyButton({ value, label = "Copy", className = "" }: {
+  value: string; label?: string; className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+        } catch {
+          return; // clipboard blocked (insecure context) — say nothing rather than lie
+        }
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      }}
+      className={
+        "px-2 py-0.5 text-[10px] rounded border transition-colors whitespace-nowrap " +
+        (copied
+          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
+          : "border-zinc-300 dark:border-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800") +
+        (className ? " " + className : "")
+      }
+    >
+      {copied ? "Copied" : label}
+    </button>
+  );
+}
 
 function ZoomIcon({ className }: { className?: string }) {
   return (
@@ -162,9 +194,18 @@ function ConfigTab({
   const [clientId, setClientId] = useState(status?.client_id ?? "");
   const [clientSecret, setClientSecret] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  // Result of the last save/test — what drives the per-field and per-scope
+  // status. Falls back to `status` so a page reload still shows the basics.
+  const [result, setResult] = useState<ZoomCredentialStatus | null>(null);
 
-  const scopes = status?.scopes ?? [];
+  const view = result ?? status;
+  const scopes = view?.scopes ?? [];
   const scopeList = scopes.map((s) => s.scope).join("\n");
+  const missingScopes = view?.missing_scopes ?? [];
+  const tested = !!view?.tested;
+  const credsOk = view?.credentials_ok === true;
+  const credStatus: FieldStatus = !tested ? "unknown" : credsOk ? "ok" : "bad";
 
   async function handleSave() {
     setSaving(true);
@@ -175,11 +216,37 @@ function ConfigTab({
         client_secret: clientSecret.trim(),
       });
       setClientSecret("");
+      setResult(res);
       onSaved(res, res.account_email);
     } catch (e) {
+      setResult(null);
       onError(e instanceof Error ? e.message : "Failed to save Zoom credentials");
     } finally {
       setSaving(false);
+    }
+  }
+
+  /** Everything Zoom needs to work: secrets accepted AND every probe passed. */
+  function allGood(s: ZoomCredentialStatus): boolean {
+    return s.credentials_ok === true
+      && (s.missing_scopes?.length ?? 0) === 0
+      && (s.checks?.length ?? 0) > 0
+      && s.checks.every((c) => c.ok);
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const res = await testZoomConnection();
+      setResult(res);
+      // The detail lives in the status panel below; the banner just says which
+      // way it went, so a partial pass is not announced as a flat success.
+      if (allGood(res)) onSaved(res, res.account_email);
+      else onError("Zoom is not fully connected yet — see the status below.");
+    } catch (e) {
+      onError(e instanceof Error ? e.message : "Zoom test failed");
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -237,12 +304,7 @@ function ConfigTab({
           <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
             2 · Add these scopes
           </h2>
-          <button
-            onClick={() => navigator.clipboard?.writeText(scopeList)}
-            className="text-[11px] px-2 py-1 rounded border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-          >
-            Copy all
-          </button>
+          <CopyButton value={scopeList} label="Copy all" className="text-[11px] px-2 py-1" />
         </div>
         <p className="text-xs text-zinc-500 mb-3">
           Zoom shows either the granular or the classic names depending on how old the app is —
@@ -258,17 +320,35 @@ function ConfigTab({
               </tr>
             </thead>
             <tbody>
-              {scopes.map((s) => (
-                <tr key={s.scope} className="border-b border-zinc-100 dark:border-zinc-900">
-                  <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-800 dark:text-zinc-200 whitespace-nowrap">
-                    {s.scope}
-                  </td>
-                  <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-500 whitespace-nowrap">
-                    {s.classic}
-                  </td>
-                  <td className="py-1.5 text-zinc-600 dark:text-zinc-400">{s.why}</td>
-                </tr>
-              ))}
+              {scopes.map((s) => {
+                // Zoom names the scopes it wanted; flag those rows so the fix is
+                // obvious instead of leaving the user to diff two lists by eye.
+                const missing = missingScopes.includes(s.scope) || missingScopes.includes(s.classic);
+                return (
+                  <tr
+                    key={s.scope}
+                    className={
+                      "border-b border-zinc-100 dark:border-zinc-900 " +
+                      (missing ? "bg-red-500/5" : "")
+                    }
+                  >
+                    <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-800 dark:text-zinc-200 whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1.5">
+                        {missing && <span className="text-red-500" title="Zoom says this one is missing">●</span>}
+                        {s.scope}
+                        <CopyButton value={s.scope} />
+                      </span>
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-[11px] text-zinc-500 whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1.5">
+                        {s.classic}
+                        <CopyButton value={s.classic} />
+                      </span>
+                    </td>
+                    <td className="py-1.5 text-zinc-600 dark:text-zinc-400">{s.why}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -290,21 +370,64 @@ function ConfigTab({
           3 · Connect
         </h2>
         <div className="space-y-3">
-          <Field label="Account ID" value={accountId} onChange={setAccountId} placeholder="abc123XYZ_defGHI" />
-          <Field label="Client ID" value={clientId} onChange={setClientId} placeholder="AbCdEfGhIjKlMnOp" />
+          <Field label="Account ID" value={accountId} onChange={setAccountId}
+            placeholder="abc123XYZ_defGHI" status={credStatus} />
+          <Field label="Client ID" value={clientId} onChange={setClientId}
+            placeholder="AbCdEfGhIjKlMnOp" status={credStatus} />
           <Field
             label="Client Secret"
             value={clientSecret}
             onChange={setClientSecret}
             type="password"
-            placeholder={status?.client_secret_masked ?? "••••••••"}
+            placeholder={view?.client_secret_masked ?? "••••••••"}
+            status={credStatus}
             hint={
-              status?.configured
+              view?.configured
                 ? "Stored. Leave blank to keep the current secret — type a new one to replace it."
                 : undefined
             }
           />
         </div>
+
+        {tested && (
+          <div className="mt-4 rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden">
+            <StatusRow
+              ok={credsOk}
+              label="Credentials"
+              detail={
+                credsOk
+                  ? "Account ID, Client ID and Client Secret all accepted by Zoom."
+                  : view?.credential_error
+                    || "Zoom rejected them. One of the three is wrong, or the app is not Activated."
+              }
+            />
+            {/* Zoom mints a token from all three secrets at once, so it cannot
+                say which single value is wrong — but a successful mint does
+                prove all three are right. */}
+            {credsOk && (view?.checks ?? []).map((c) => (
+              <StatusRow
+                key={c.endpoint}
+                ok={c.ok}
+                label={c.name}
+                detail={
+                  c.ok
+                    ? c.endpoint
+                    : c.missing_scopes.length
+                      ? `Missing scope: ${c.missing_scopes.join(" or ")}`
+                      : c.error || "Failed"
+                }
+                extra={c.missing_scopes.length ? c.missing_scopes[0] : undefined}
+              />
+            ))}
+            {credsOk && missingScopes.length > 0 && (
+              <div className="px-3 py-2 text-[11px] text-zinc-600 dark:text-zinc-400 bg-amber-500/5 border-t border-zinc-200 dark:border-zinc-800">
+                Add the flagged scope{missingScopes.length === 1 ? "" : "s"} above in the Zoom
+                Marketplace, click <strong>Activate your app</strong> again, then hit{" "}
+                <strong>Test connection</strong>. No need to re-enter the secret.
+              </div>
+            )}
+          </div>
+        )}
         <div className="flex items-center gap-2 mt-4">
           <button
             onClick={handleSave}
@@ -313,7 +436,16 @@ function ConfigTab({
           >
             {saving ? "Verifying…" : status?.configured ? "Update credentials" : "Connect Zoom"}
           </button>
-          {status?.configured && (
+          {view?.configured && (
+            <button
+              onClick={handleTest}
+              disabled={testing || saving}
+              className="px-3 py-1.5 text-xs font-medium rounded-md border border-zinc-300 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </button>
+          )}
+          {view?.configured && (
             <button
               onClick={handleDisconnect}
               className="px-3 py-1.5 text-xs font-medium rounded-md border border-red-500/30 text-red-500 hover:bg-red-500/10"
@@ -331,6 +463,26 @@ function ConfigTab({
   );
 }
 
+/** "unknown" until a check has run — an untested field must not claim to be
+ *  good, and must not be accused of being wrong either. */
+type FieldStatus = "unknown" | "ok" | "bad";
+
+function StatusRow({ ok, label, detail }: {
+  ok: boolean; label: string; detail: string; extra?: string;
+}) {
+  return (
+    <div className="flex items-start gap-2 px-3 py-2 border-b last:border-b-0 border-zinc-200 dark:border-zinc-800">
+      <span className={"mt-0.5 text-xs " + (ok ? "text-emerald-500" : "text-red-500")}>
+        {ok ? "✓" : "✕"}
+      </span>
+      <div className="min-w-0">
+        <div className="text-xs text-zinc-800 dark:text-zinc-200">{label}</div>
+        <div className="text-[11px] text-zinc-500 break-words">{detail}</div>
+      </div>
+    </div>
+  );
+}
+
 function Field({
   label,
   value,
@@ -338,6 +490,7 @@ function Field({
   placeholder,
   type = "text",
   hint,
+  status = "unknown",
 }: {
   label: string;
   value: string;
@@ -345,16 +498,38 @@ function Field({
   placeholder?: string;
   type?: string;
   hint?: string;
+  status?: FieldStatus;
 }) {
   return (
     <div>
-      <label className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-1">{label}</label>
+      <label className="block text-[10px] uppercase tracking-wide text-zinc-500 mb-1">
+        <span className="inline-flex items-center gap-1.5">
+          {label}
+          {status === "ok" && (
+            <span className="text-emerald-500 normal-case tracking-normal" title="Accepted by Zoom">
+              ✓ accepted
+            </span>
+          )}
+          {status === "bad" && (
+            <span className="text-red-500 normal-case tracking-normal" title="Zoom rejected the credentials">
+              ✕ check this
+            </span>
+          )}
+        </span>
+      </label>
       <input
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full px-2.5 py-1.5 text-xs rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 font-mono"
+        className={
+          "w-full px-2.5 py-1.5 text-xs rounded-md border bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 font-mono " +
+          (status === "ok"
+            ? "border-emerald-500/40"
+            : status === "bad"
+              ? "border-red-500/40"
+              : "border-zinc-300 dark:border-zinc-700")
+        }
       />
       {hint && <p className="mt-1 text-[10px] text-zinc-500">{hint}</p>}
     </div>

@@ -3621,15 +3621,44 @@ export interface ZoomScope {
   why: string;
 }
 
+export interface ZoomCheck {
+  name: string;
+  endpoint: string;
+  ok: boolean;
+  missing_scopes: string[];
+  error?: string | null;
+}
+
 export interface ZoomCredentialStatus {
   configured: boolean;
   account_id?: string | null;
   client_id?: string | null;
   client_secret_masked?: string | null;
-  /** Which Zoom account the credentials resolve to; only set right after a save. */
+  /** Which Zoom account the credentials resolve to; only set after a check. */
   account_email?: string | null;
   /** Rendered on the setup page — a missing scope is the usual failure. */
   scopes: ZoomScope[];
+
+  /**
+   * Credentials and scopes are reported separately because they fail for
+   * different reasons. Minting a token exercises all three secrets at once, so
+   * `credentials_ok` true means every one of them is correct even when a scope
+   * is still missing.
+   */
+  credentials_ok?: boolean | null;
+  credential_error?: string | null;
+  checks: ZoomCheck[];
+  missing_scopes: string[];
+  tested: boolean;
+}
+
+export async function testZoomConnection(): Promise<ZoomCredentialStatus> {
+  const res = await fetch(`${API_URL}/connectors/zoom/test`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Zoom test failed"));
+  return res.json();
 }
 
 /**

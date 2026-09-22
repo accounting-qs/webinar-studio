@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, ".")
 
 from integrations.zoom_client import (  # noqa: E402
-    duration_units_suspect, encode_uuid, merge_watch_seconds, parse_dt,
+    ZoomScopeError, duration_units_suspect, encode_uuid, merge_watch_seconds,
+    parse_dt, parse_missing_scopes,
 )
 
 failures = []
@@ -92,6 +93,22 @@ check("agreement is fine", duration_units_suspect(1800, 1800), False)
 check("small drift is fine", duration_units_suspect(1800, 1750), False)
 check("minutes-for-seconds caught", duration_units_suspect(30, 1800), True)
 check("zero reported is not flagged", duration_units_suspect(0, 1800), False)
+
+print("parse_missing_scopes (Zoom reports missing scopes as HTTP 400 / code 4711)")
+# The exact body prod returned when the app lacked the scope for /users/me.
+real = '{"code":4711,"message":"Invalid access token, does not contain scopes:[user:read:user:admin, user:read:user]."}'
+check("real 4711 body", parse_missing_scopes(real), ["user:read:user:admin", "user:read:user"])
+check("single scope", parse_missing_scopes('does not contain scopes:[webinar:read:admin].'), ["webinar:read:admin"])
+check("no brackets -> empty", parse_missing_scopes("some other failure"), [])
+check("empty body -> empty", parse_missing_scopes(""), [])
+check("none -> empty", parse_missing_scopes(None), [])
+check("spacing tolerated", parse_missing_scopes("does not contain scopes : [ a:b , c:d ]"), ["a:b", "c:d"])
+
+# The message must name the scope, since that IS the fix the user has to apply.
+e = ZoomScopeError("/users/me", real, parse_missing_scopes(real))
+check("error names the scopes", "user:read:user:admin" in str(e), True)
+check("error carries them structurally", e.missing_scopes[0], "user:read:user:admin")
+check("scope-less fallback still readable", "missing a scope" in str(ZoomScopeError("/x")), True)
 
 if failures:
     print("\nFAILED:")

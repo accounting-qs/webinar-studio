@@ -185,8 +185,16 @@ ZOOM_SCOPES: list[dict[str, str]] = [
     {"scope": "report:read:webinar:admin", "classic": "report:read:admin",
      "why": "Webinar-level totals — not called by the sync today, comes with report:read:admin anyway"},
     {"scope": "user:read:list_users:admin", "classic": "user:read:admin",
-     "why": "Find every host on the account, not just the app owner"},
+     "why": "Find every host on the account, not just the app owner — also what Test connection checks"},
 ]
+
+
+class ZoomCheck(BaseModel):
+    name: str
+    endpoint: str
+    ok: bool
+    missing_scopes: list[str] = []
+    error: Optional[str] = None
 
 
 class ZoomCredentialStatus(BaseModel):
@@ -198,6 +206,15 @@ class ZoomCredentialStatus(BaseModel):
     # show more than "connected".
     account_email: Optional[str] = None
     scopes: list[dict[str, str]] = []
+
+    # Credentials and scopes are reported separately: minting a token exercises
+    # all three secrets at once, so a good mint proves that half of the setup
+    # regardless of whether any scope is missing.
+    credentials_ok: Optional[bool] = None
+    credential_error: Optional[str] = None
+    checks: list[ZoomCheck] = []
+    missing_scopes: list[str] = []
+    tested: bool = False
 
 
 class SetZoomCredentialRequest(BaseModel):
@@ -1057,12 +1074,25 @@ async def get_zoom_status(db: AsyncSession = Depends(get_db)):
     return _zoom_status(await _zoom_credential(db))
 
 
+def _zoom_status_from_check(row: Optional[ConnectorCredential], check: dict) -> ZoomCredentialStatus:
+    st = _zoom_status(row, account_email=check.get("account_email"))
+    st.tested = True
+    st.credentials_ok = check.get("credentials_ok")
+    st.credential_error = check.get("credential_error")
+    st.missing_scopes = check.get("missing_scopes") or []
+    st.checks = [ZoomCheck(**c) for c in (check.get("checks") or [])]
+    return st
+
+
 @router.put("/zoom", response_model=ZoomCredentialStatus)
 async def set_zoom_credential(body: SetZoomCredentialRequest, db: AsyncSession = Depends(get_db)):
     """Verify the credentials against Zoom, then store them.
 
-    Verifying first means a typo or an un-activated app is reported at the point
-    of entry rather than as a mysteriously empty webinar list later.
+    A valid-but-under-scoped app still gets SAVED. Minting a token proves all
+    three secrets are right, and refusing to store them would force the user to
+    re-paste the secret after every scope fix in the Zoom console. The response
+    reports the scope gap instead, and Test connection re-checks without
+    re-typing anything.
     """
     account_id = body.account_id.strip()
     client_id = body.client_id.strip()
@@ -1073,22 +1103,15 @@ async def set_zoom_credential(body: SetZoomCredentialRequest, db: AsyncSession =
             detail="Account ID, Client ID and Client Secret are all required",
         )
 
-    try:
-        me = await zc.verify_credentials(account_id, client_id, client_secret)
-    except zc.ZoomScopeError as e:
-        # Authenticated but missing a scope — name the call so the fix is obvious.
+    check = await zc.check_connection(account_id, client_id, client_secret)
+    if not check["credentials_ok"]:
+        # The token did not mint: one of the three values is wrong, or the app
+        # was never activated. Nothing worth storing.
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Connected, but Zoom denied {e.path}. Add the missing scope to the "
-                f"Server-to-Server OAuth app (see the scope list on this page), then "
-                f"re-activate the app and try again."
-            ),
-        ) from e
-    except zc.ZoomAuthError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except zc.ZoomError as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach Zoom: {e}") from e
+            detail=check.get("credential_error")
+            or "Zoom rejected the credentials. Check the three values, and that the app is Activated.",
+        )
 
     stmt = pg_insert(ConnectorCredential).values(
         provider=ZOOM_PROVIDER,
@@ -1109,7 +1132,29 @@ async def set_zoom_credential(body: SetZoomCredentialRequest, db: AsyncSession =
     await db.commit()
 
     row = await _zoom_credential(db)
-    return _zoom_status(row, account_email=me.get("email"))
+    return _zoom_status_from_check(row, check)
+
+
+@router.post("/zoom/test", response_model=ZoomCredentialStatus)
+async def test_zoom_connection(db: AsyncSession = Depends(get_db)):
+    """Re-check the stored credentials against Zoom without re-entering them.
+
+    The point of this existing separately from PUT: fixing a scope happens in
+    the Zoom console, not here, so the user needs a way to re-verify that does
+    not make them paste the client secret again (which the UI cannot show them
+    back, since only a masked form is ever returned).
+    """
+    row = await _zoom_credential(db)
+    if not row or not row.api_key or not row.account_id or not row.client_id:
+        raise HTTPException(status_code=400, detail="Zoom is not connected yet")
+
+    # Drop any cached bearer so a scope added seconds ago in the Zoom console is
+    # actually picked up — a cached token carries the OLD scope set for up to an
+    # hour, which would make a correct fix look like it had not worked.
+    zc.invalidate_token(row.account_id, row.client_id)
+
+    check = await zc.check_connection(row.account_id, row.client_id, row.api_key)
+    return _zoom_status_from_check(row, check)
 
 
 @router.delete("/zoom")
