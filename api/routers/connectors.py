@@ -743,6 +743,7 @@ async def list_broadcasts(
 
     synced_counts = dict((await db.execute(
         select(WebinarRegistrant.broadcast_id, func.count())
+        .where(WebinarRegistrant.provider == PROVIDER)
         .group_by(WebinarRegistrant.broadcast_id)
     )).all())
 
@@ -879,7 +880,12 @@ async def sync_broadcast_subscribers(broadcast_id: str, db: AsyncSession = Depen
     the user navigates away.
     """
     wb = (await db.execute(
-        select(WebinarBroadcast).where(WebinarBroadcast.broadcast_id == broadcast_id)
+        select(WebinarBroadcast).where(
+            WebinarBroadcast.broadcast_id == broadcast_id,
+            # Refuse a Zoom id here: it would be posted to the WebinarGeek API
+            # with a WebinarGeek key and fail confusingly.
+            WebinarBroadcast.provider == PROVIDER,
+        )
     )).scalar_one_or_none()
     if not wb:
         raise HTTPException(status_code=404, detail="Broadcast not cached — refresh first")
@@ -947,8 +953,13 @@ async def sync_all_broadcasts(db: AsyncSession = Depends(get_db)):
 # Subscribers
 # ---------------------------------------------------------------------------
 def _subscriber_query(broadcast_id: Optional[str], q: Optional[str]):
-    stmt = select(WebinarRegistrant)
-    count_stmt = select(func.count()).select_from(WebinarRegistrant)
+    # webinar_registrants is shared with Zoom — scope to this provider or the
+    # WebinarGeek subscribers tab and its CSV export start listing Zoom people.
+    stmt = select(WebinarRegistrant).where(WebinarRegistrant.provider == PROVIDER)
+    count_stmt = (
+        select(func.count()).select_from(WebinarRegistrant)
+        .where(WebinarRegistrant.provider == PROVIDER)
+    )
     if broadcast_id:
         stmt = stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)
         count_stmt = count_stmt.where(WebinarRegistrant.broadcast_id == broadcast_id)

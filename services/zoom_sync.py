@@ -33,7 +33,7 @@ from sqlalchemy import select, update
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from db.models import ConnectorCredential, Webinar, WebinarBroadcast, WebinarRegistrant
+from db.models import ConnectorCredential, GHLSyncRun, Webinar, WebinarBroadcast, WebinarRegistrant
 from db.session import AsyncSessionLocal
 from integrations import zoom_client as zc
 from services.ghl_sync import _heartbeat, _sync_run
@@ -394,7 +394,16 @@ async def resolve_instance_uuid(
 # ---------------------------------------------------------------------------
 # The sync
 # ---------------------------------------------------------------------------
-async def _sync_one(db, session: zc.ZoomSession, bc: WebinarBroadcast) -> tuple[int, bool]:
+# Rows between progress heartbeats during the upsert loop. Each row is its own
+# round trip, so a big webinar spends minutes in here; without heartbeats the
+# Sync page shows 0 the whole time and the stale-run sweeper has nothing to
+# distinguish "working" from "died".
+_HEARTBEAT_EVERY = 250
+
+
+async def _sync_one(
+    db, session: zc.ZoomSession, bc: WebinarBroadcast, state=None
+) -> tuple[int, bool]:
     """Sync one cached Zoom broadcast. Returns (rows_written, report_seen)."""
     webinar_id, occurrence_id = parse_broadcast_id(bc.broadcast_id)
 
@@ -426,7 +435,11 @@ async def _sync_one(db, session: zc.ZoomSession, bc: WebinarBroadcast) -> tuple[
 
     rows = build_rows(bc.broadcast_id, regs, by_email)
 
-    for row in rows.values():
+    if state is not None:
+        state.expected_total = len(rows)
+        await _heartbeat(state)
+
+    for i, row in enumerate(rows.values(), 1):
         stmt = pg_insert(WebinarRegistrant).values(**row)
         set_cols = {
             k: v for k, v in row.items()
@@ -436,6 +449,11 @@ async def _sync_one(db, session: zc.ZoomSession, bc: WebinarBroadcast) -> tuple[
         await db.execute(stmt.on_conflict_do_update(
             index_elements=["broadcast_id", "email"], set_=set_cols,
         ))
+        if state is not None and i % _HEARTBEAT_EVERY == 0:
+            state.contacts_synced = i
+            # Also the cancellation point: _heartbeat raises CancelledError when
+            # the run has been cancelled, so a long sync can be stopped.
+            await _heartbeat(state)
 
     bc.subscriptions_count = len(regs)
     if report_seen:
@@ -470,7 +488,7 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
                     raise RuntimeError(f"Zoom webinar {broadcast_id} is not cached — refresh first")
 
                 try:
-                    count, _ = await _sync_one(db, session, bc)
+                    count, _ = await _sync_one(db, session, bc, state)
                 except zc.ZoomError as e:
                     raise RuntimeError(f"Zoom API error: {e}") from e
 
@@ -619,6 +637,20 @@ async def refresh_webinars() -> int:
 # ---------------------------------------------------------------------------
 # Scheduled auto-sync
 # ---------------------------------------------------------------------------
+async def _run_succeeded(run_id: str) -> bool:
+    """Did this sync_run finish clean?
+
+    `_sync_run` catches exceptions, marks the run failed and does NOT re-raise,
+    so a caller that only uses try/except cannot tell. Stamping the one-shot
+    marker on a failed run would stop the webinar being retried, ever.
+    """
+    async with AsyncSessionLocal() as db:
+        status = (await db.execute(
+            select(GHLSyncRun.status).where(GHLSyncRun.id == run_id)
+        )).scalar_one_or_none()
+    return status == "completed"
+
+
 async def run_due_broadcast_autosyncs() -> int:
     """Auto-sync Zoom-linked webinars whose session has ended.
 
@@ -651,11 +683,20 @@ async def run_due_broadcast_autosyncs() -> int:
     synced = 0
     for webinar_id, broadcast_id in due:
         try:
-            await run_broadcast_sync(broadcast_id, trigger="scheduled")
+            run_id = await run_broadcast_sync(broadcast_id, trigger="scheduled")
         except Exception as exc:
             logger.warning(
                 "Zoom auto-sync: %s (webinar %s) failed, will retry: %s",
                 broadcast_id, webinar_id, exc,
+            )
+            continue
+
+        # `_sync_run` records a failure on the row but does not re-raise, so
+        # returning normally is not proof of success — read the row back.
+        if not await _run_succeeded(run_id):
+            logger.warning(
+                "Zoom auto-sync: %s run %s did not complete; not stamping",
+                broadcast_id, run_id,
             )
             continue
 

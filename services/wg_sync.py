@@ -23,7 +23,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from api.routers.outreach._helpers import LLOYD_USER_ID, mark_contacts_blocklisted
-from db.models import BlocklistEntry, ConnectorCredential, Webinar, WebinarRegistrant, WebinarBroadcast
+from db.models import BlocklistEntry, ConnectorCredential, GHLSyncRun, Webinar, WebinarRegistrant, WebinarBroadcast
 from db.session import AsyncSessionLocal
 from integrations import webinargeek_client as wg
 from services.ghl_sync import _heartbeat, _sync_run
@@ -176,11 +176,19 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
         async with _sync_run(f"wg:{broadcast_id}", trigger) as state:
             async with AsyncSessionLocal() as db:
                 api_key = await _resolve_api_key_for_broadcast(db, broadcast_id)
+                # Last line of defence. If a non-WebinarGeek id reaches here
+                # it would be posted to the WebinarGeek API with a WebinarGeek
+                # key; fail fast and legibly instead.
                 wb = (await db.execute(
-                    select(WebinarBroadcast).where(WebinarBroadcast.broadcast_id == broadcast_id)
+                    select(WebinarBroadcast).where(
+                        WebinarBroadcast.broadcast_id == broadcast_id,
+                        WebinarBroadcast.provider == PROVIDER,
+                    )
                 )).scalar_one_or_none()
                 if not wb:
-                    raise RuntimeError(f"Broadcast {broadcast_id} not cached — refresh first")
+                    raise RuntimeError(
+                        f"Broadcast {broadcast_id} is not a cached WebinarGeek broadcast"
+                    )
 
                 try:
                     count = await _upsert_one_broadcast(db, api_key, broadcast_id)
@@ -208,6 +216,20 @@ async def run_broadcast_sync(broadcast_id: str, trigger: SyncTrigger = "manual")
 AUTO_SYNC_DELAY = timedelta(hours=2)
 
 
+async def _run_succeeded(run_id: str) -> bool:
+    """Did this sync_run actually finish clean?
+
+    `_sync_run` catches exceptions, records them on the row and marks the run
+    failed — but it does not re-raise. Callers that only wrap the call in
+    try/except therefore treat a failure as a success.
+    """
+    async with AsyncSessionLocal() as db:
+        status = (await db.execute(
+            select(GHLSyncRun.status).where(GHLSyncRun.id == run_id)
+        )).scalar_one_or_none()
+    return status == "completed"
+
+
 async def run_due_broadcast_autosyncs() -> int:
     """Auto-sync subscribers for any planned webinar whose linked WebinarGeek
     broadcast started >= AUTO_SYNC_DELAY ago and hasn't been auto-synced yet.
@@ -228,6 +250,10 @@ async def run_due_broadcast_autosyncs() -> int:
             .where(
                 Webinar.broadcast_id.isnot(None),
                 Webinar.broadcast_auto_synced_at.is_(None),
+                # webinar_broadcasts is shared with Zoom. Without this the
+                # WebinarGeek scheduler picked up Zoom webinars and posted their
+                # ids to the WebinarGeek API, which 400s.
+                WebinarBroadcast.provider == PROVIDER,
                 WebinarBroadcast.starts_at.isnot(None),
                 WebinarBroadcast.starts_at <= cutoff,
             )
@@ -236,13 +262,25 @@ async def run_due_broadcast_autosyncs() -> int:
     synced = 0
     for webinar_id, broadcast_id in due:
         try:
-            await run_broadcast_sync(broadcast_id, trigger="scheduled")
+            run_id = await run_broadcast_sync(broadcast_id, trigger="scheduled")
         except Exception as exc:
             logger.warning(
                 "auto-sync: broadcast %s (webinar %s) failed, will retry: %s",
                 broadcast_id, webinar_id, exc,
             )
             continue
+
+        # `_sync_run` marks a run failed but does NOT re-raise, so returning
+        # normally is not evidence of success — read the row back. Without this
+        # a failed sync still stamped the one-shot marker, which permanently
+        # stopped the webinar from ever being retried.
+        if not await _run_succeeded(run_id):
+            logger.warning(
+                "auto-sync: broadcast %s (webinar %s) run %s did not complete; not stamping",
+                broadcast_id, webinar_id, run_id,
+            )
+            continue
+
         # Stamp only after a successful sync → one-shot.
         async with AsyncSessionLocal() as db:
             await db.execute(
