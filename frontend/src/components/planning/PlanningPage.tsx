@@ -22,6 +22,7 @@ import {
 } from "@/lib/api";
 import { REGION_COUNTRIES, REGION_ORDER, normCountry, COUNTRIES, collapseCountriesForLabel } from "@/lib/locations";
 import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
+import { BroadcastPicker, toOptions as toPickerOptions } from "./BroadcastPicker";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
 import { SendersEditModal } from "./SendersEditModal";
@@ -1030,6 +1031,11 @@ export function PlanningPage() {
   /** Broadcasts for the new-webinar dropdown, scoped to the selected
    * WebinarGeek account (mirrors the Edit modal's account filtering). */
   const [newWebinarBroadcasts, setNewWebinarBroadcasts] = useState<WgWebinar[]>([]);
+  const newWebinarPickerOptions = useMemo(
+    () => toPickerOptions(newWebinarBroadcasts, newWebinarPlatform),
+    [newWebinarBroadcasts, newWebinarPlatform],
+  );
+
   const [newWebinarBcLoading, setNewWebinarBcLoading] = useState(false);
 
   // Edit Webinar modal state (shared WebinarEditModal manages its own internals)
@@ -4127,24 +4133,16 @@ export function PlanningPage() {
                   {newWebinarPlatform === "zoom" ? "Zoom Webinar" : "WebinarGeek Broadcast"}
                   {newWebinarBcLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
                 </label>
-                <select
+                <BroadcastPicker
                   value={newWebinarBroadcastId}
-                  disabled={newWebinarBcLoading}
-                  onChange={(e) => {
-                    const bid = e.target.value;
+                  options={newWebinarPickerOptions}
+                  loading={newWebinarBcLoading}
+                  onChange={(bid) => {
                     const b = newWebinarBroadcasts.find((x) => x.broadcast_id === bid);
                     setNewWebinarBroadcastId(bid);
                     if (b?.starts_at) setNewWebinarDate(new Date(b.starts_at).toISOString().slice(0, 10));
                   }}
-                  className="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-violet-500/50 transition-colors disabled:opacity-60"
-                >
-                  <option value="">— None —</option>
-                  {newWebinarBroadcasts.map((b) => (
-                    <option key={b.broadcast_id} value={b.broadcast_id}>
-                      {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""} · {b.broadcast_id}
-                    </option>
-                  ))}
-                </select>
+                />
                 <div className="mt-1.5 text-[10px] text-zinc-500">
                   {newWebinarPlatform === "zoom"
                     ? "Registrants and attendance sync automatically once the webinar has ended. Replay views are not tracked on Zoom. Picking one fills the date above (still editable)."

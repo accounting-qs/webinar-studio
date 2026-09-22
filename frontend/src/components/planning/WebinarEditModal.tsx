@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { BroadcastPicker, toOptions } from "./BroadcastPicker";
 import {
   fetchWgCredentials, fetchWgWebinars, fetchZoomWebinars, platformOf,
   refreshWgWebinars, refreshZoomWebinars, updateWebinar,
@@ -55,6 +56,11 @@ export function WebinarEditModal({
   const [broadcasts, setBroadcasts] = useState<WgWebinar[]>([]);
   const [bcLoading, setBcLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const pickerOptions = useMemo(
+    () => toOptions(broadcasts, platform),
+    [broadcasts, platform],
+  );
 
   // Escape to close + body scroll lock.
   useEffect(() => {
@@ -204,23 +210,21 @@ export function WebinarEditModal({
               {platform === "zoom" ? "Zoom Webinar" : "WebinarGeek Broadcast"}
               {bcLoading && <span className="text-zinc-500 normal-case font-normal tracking-normal">loading…</span>}
             </label>
-            <select value={edit.broadcastId} disabled={bcLoading}
-              onChange={(e) => {
-                const bid = e.target.value;
+            <BroadcastPicker
+              value={edit.broadcastId}
+              options={pickerOptions}
+              loading={bcLoading}
+              onChange={(bid) => {
                 const b = broadcasts.find((x) => x.broadcast_id === bid);
-                setEdit({ ...edit, broadcastId: bid, isoDate: b?.starts_at ? new Date(b.starts_at).toISOString().slice(0, 10) : edit.isoDate });
+                setEdit({
+                  ...edit,
+                  broadcastId: bid,
+                  isoDate: b?.starts_at
+                    ? new Date(b.starts_at).toISOString().slice(0, 10)
+                    : edit.isoDate,
+                });
               }}
-              className={SELECT_CLS + " disabled:opacity-60"}>
-              <option value="">— None —</option>
-              {edit.broadcastId && !broadcasts.some((b) => b.broadcast_id === edit.broadcastId) && (
-                <option value={edit.broadcastId}>Current · {edit.broadcastId}</option>
-              )}
-              {broadcasts.map((b) => (
-                <option key={b.broadcast_id} value={b.broadcast_id}>
-                  {(b.internal_title || b.name || `Broadcast ${b.broadcast_id}`)}{b.starts_at ? ` · ${new Date(b.starts_at).toLocaleDateString()}` : ""} · {b.broadcast_id}
-                </option>
-              ))}
-            </select>
+            />
             <div className="mt-1.5 text-[10px] text-zinc-500">
               {platform === "zoom"
                 ? "Registrants and attendance auto-sync once, ~45m after the webinar ends (Zoom only publishes the attendance report after the session finishes). Replay views are not tracked on Zoom. Picking a webinar fills the date above (still editable)."
