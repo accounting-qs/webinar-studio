@@ -207,6 +207,14 @@ function ConfigTab({
   const credsOk = view?.credentials_ok === true;
   const credStatus: FieldStatus = !tested ? "unknown" : credsOk ? "ok" : "bad";
 
+  /** Everything Zoom needs to work: secrets accepted AND every probe passed. */
+  function allGood(s: ZoomCredentialStatus): boolean {
+    return s.credentials_ok === true
+      && (s.missing_scopes?.length ?? 0) === 0
+      && (s.checks?.length ?? 0) > 0
+      && s.checks.every((c) => c.ok);
+  }
+
   async function handleSave() {
     setSaving(true);
     try {
@@ -217,21 +225,17 @@ function ConfigTab({
       });
       setClientSecret("");
       setResult(res);
-      onSaved(res, res.account_email);
+      // Saving now succeeds even when a scope is missing (the secrets are
+      // valid, so they are worth keeping) — so the banner must not call that
+      // "connected". The status panel below carries the detail either way.
+      if (allGood(res)) onSaved(res, res.account_email);
+      else onError("Credentials accepted, but Zoom is not fully connected yet — see the status below.");
     } catch (e) {
       setResult(null);
       onError(e instanceof Error ? e.message : "Failed to save Zoom credentials");
     } finally {
       setSaving(false);
     }
-  }
-
-  /** Everything Zoom needs to work: secrets accepted AND every probe passed. */
-  function allGood(s: ZoomCredentialStatus): boolean {
-    return s.credentials_ok === true
-      && (s.missing_scopes?.length ?? 0) === 0
-      && (s.checks?.length ?? 0) > 0
-      && s.checks.every((c) => c.ok);
   }
 
   async function handleTest() {
