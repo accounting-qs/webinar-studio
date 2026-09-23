@@ -509,6 +509,15 @@ export function VariationsModal({
                           {onPickForList ? "Picked for list" : "Picked"}
                         </span>
                       )}
+                      {/* Read-only internal-name chip where naming isn't editable (e.g. Planning pick modal) */}
+                      {activeTab === "description" && !onUpdateInternalName && v.internalName && (
+                        <span
+                          title="Internal name"
+                          className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/60 text-zinc-600 dark:text-zinc-300 max-w-[160px] truncate"
+                        >
+                          {v.internalName}
+                        </span>
+                      )}
                       {activeTab === "description" && onUpdateInternalName && (
                         nameEditingId === v.id ? (
                           <input
