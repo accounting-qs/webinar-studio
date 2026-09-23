@@ -58,6 +58,7 @@ from integrations import webinargeek_client as wg
 from integrations import openai_client as oai
 from integrations import ghl_client as ghl
 from integrations import zoom_client as zc
+from integrations import skarpe_client as skarpe
 from services import wg_sync, zoom_sync
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ GHL_PROVIDER = "ghl"
 ZOOM_PROVIDER = "zoom"
 ANTHROPIC_PROVIDER = "anthropic"
 RESEND_PROVIDER = "resend"
+SKARPE_PROVIDER = "skarpe"
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +464,230 @@ async def delete_wg_credential(credential_id: str, db: AsyncSession = Depends(ge
     # variants will fall back to the default credential automatically.
     await db.delete(row)
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Skarpe credentials — multi-instance (staging + production workspaces)
+# ---------------------------------------------------------------------------
+# Pure N-row model: no 'default' row. Each row is one Skarpe workspace —
+# internal name + API key + the MCP endpoint the key belongs to (staging and
+# production run on different hosts, and a key only works on its own).
+class SkarpeCredentialOut(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    api_key_masked: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    # Populated on create/update from the verification whoami, so the UI can
+    # show the workspace immediately without a second round trip.
+    key_name: Optional[str] = None
+    timezone: Optional[str] = None
+
+
+class SkarpeCredentialListResponse(BaseModel):
+    credentials: list[SkarpeCredentialOut]
+
+
+class SkarpeCredentialCreate(BaseModel):
+    name: str
+    base_url: str
+    api_key: str
+
+
+class SkarpeCredentialUpdate(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+class SkarpeCredentialInfo(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    key_name: Optional[str] = None
+    permissions: list[str] = []
+    can_launch_campaigns: bool = False
+    timezone: Optional[str] = None
+
+
+def _skarpe_cred_out(row: ConnectorCredential, who: Optional[dict] = None) -> SkarpeCredentialOut:
+    return SkarpeCredentialOut(
+        id=row.id,
+        name=row.name,
+        base_url=row.base_url or "",
+        api_key_masked=_mask(row.api_key),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        key_name=(who or {}).get("key_name"),
+        timezone=(who or {}).get("timezone"),
+    )
+
+
+def _clean_skarpe_base_url(raw: str) -> str:
+    url = raw.strip().rstrip("/")
+    if not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="base_url must start with https://")
+    return url
+
+
+async def _verify_skarpe(base_url: str, api_key: str) -> dict:
+    try:
+        return await skarpe.verify_credentials(base_url, api_key)
+    except skarpe.SkarpeAuthError:
+        raise HTTPException(status_code=400, detail="Invalid Skarpe API key")
+    except skarpe.SkarpeError as e:
+        raise HTTPException(status_code=502, detail=f"Skarpe unreachable: {e}")
+
+
+async def _get_skarpe_credential(db: AsyncSession, credential_id: str) -> ConnectorCredential:
+    row = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.id == credential_id,
+            ConnectorCredential.provider == SKARPE_PROVIDER,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Skarpe credential not found")
+    if not row.base_url:
+        raise HTTPException(status_code=400, detail="Skarpe credential has no base_url")
+    return row
+
+
+@router.get("/skarpe/credentials", response_model=SkarpeCredentialListResponse)
+async def list_skarpe_credentials(db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(
+        select(ConnectorCredential)
+        .where(ConnectorCredential.provider == SKARPE_PROVIDER)
+        .order_by(ConnectorCredential.name)
+    )).scalars().all()
+    return SkarpeCredentialListResponse(credentials=[_skarpe_cred_out(r) for r in rows])
+
+
+@router.post("/skarpe/credentials", response_model=SkarpeCredentialOut, status_code=201)
+async def create_skarpe_credential(body: SkarpeCredentialCreate, db: AsyncSession = Depends(get_db)):
+    name = body.name.strip()
+    api_key = body.api_key.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    base_url = _clean_skarpe_base_url(body.base_url)
+
+    who = await _verify_skarpe(base_url, api_key)
+
+    existing = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.provider == SKARPE_PROVIDER,
+            ConnectorCredential.name == name,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Credential named '{name}' already exists")
+
+    row = ConnectorCredential(
+        provider=SKARPE_PROVIDER, name=name, api_key=api_key, base_url=base_url,
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+    return _skarpe_cred_out(row, who)
+
+
+@router.put("/skarpe/credentials/{credential_id}", response_model=SkarpeCredentialOut)
+async def update_skarpe_credential(
+    credential_id: str,
+    body: SkarpeCredentialUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    row = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.id == credential_id,
+            ConnectorCredential.provider == SKARPE_PROVIDER,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Credential not found")
+
+    if body.name is not None:
+        new_name = body.name.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        if new_name != row.name:
+            clash = (await db.execute(
+                select(ConnectorCredential).where(
+                    ConnectorCredential.provider == SKARPE_PROVIDER,
+                    ConnectorCredential.name == new_name,
+                )
+            )).scalar_one_or_none()
+            if clash:
+                raise HTTPException(status_code=409, detail=f"Credential named '{new_name}' already exists")
+            row.name = new_name
+
+    new_base_url = _clean_skarpe_base_url(body.base_url) if body.base_url is not None else None
+    new_key = None
+    if body.api_key is not None:
+        new_key = body.api_key.strip()
+        if not new_key:
+            raise HTTPException(status_code=400, detail="api_key cannot be empty")
+
+    who = None
+    if new_base_url is not None or new_key is not None:
+        # Verify the effective (url, key) pair that would be stored.
+        who = await _verify_skarpe(new_base_url or row.base_url, new_key or row.api_key)
+        if new_base_url is not None:
+            row.base_url = new_base_url
+        if new_key is not None:
+            row.api_key = new_key
+
+    row.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    await db.refresh(row)
+    return _skarpe_cred_out(row, who)
+
+
+@router.delete("/skarpe/credentials/{credential_id}")
+async def delete_skarpe_credential(credential_id: str, db: AsyncSession = Depends(get_db)):
+    row = (await db.execute(
+        select(ConnectorCredential).where(
+            ConnectorCredential.id == credential_id,
+            ConnectorCredential.provider == SKARPE_PROVIDER,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    # skarpe_campaigns.credential_id is ON DELETE SET NULL: history survives.
+    await db.delete(row)
+    return {"deleted": True}
+
+
+@router.get("/skarpe/credentials/{credential_id}/info", response_model=SkarpeCredentialInfo)
+async def get_skarpe_credential_info(credential_id: str, db: AsyncSession = Depends(get_db)):
+    """Live whoami for one instance — workspace name, permissions, timezone."""
+    row = await _get_skarpe_credential(db, credential_id)
+    who = await _verify_skarpe(row.base_url, row.api_key)
+    return SkarpeCredentialInfo(
+        id=row.id,
+        name=row.name,
+        base_url=row.base_url,
+        key_name=who.get("key_name"),
+        permissions=who.get("permissions") or [],
+        can_launch_campaigns=bool(who.get("can_launch_campaigns")),
+        timezone=who.get("timezone"),
+    )
+
+
+@router.get("/skarpe/credentials/{credential_id}/sending-accounts")
+async def list_skarpe_sending_accounts(credential_id: str, db: AsyncSession = Depends(get_db)):
+    """Passthrough of the workspace's sending mailboxes."""
+    row = await _get_skarpe_credential(db, credential_id)
+    try:
+        accounts = await skarpe.list_sending_accounts(row.base_url, row.api_key)
+    except skarpe.SkarpeAuthError:
+        raise HTTPException(status_code=400, detail="Invalid Skarpe API key")
+    except skarpe.SkarpeError as e:
+        raise HTTPException(status_code=502, detail=f"Skarpe unreachable: {e}")
+    return {"accounts": accounts}
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,10 @@ class ConnectorCredential(Base):
     # secret lives in api_key so masking/deletion stay provider-agnostic.
     client_id: Mapped[Optional[str]] = mapped_column(Text)
     account_id: Mapped[Optional[str]] = mapped_column(Text)
+    # Skarpe-only: the MCP endpoint this key belongs to. Skarpe keys are bound
+    # to one host (staging vs production backend), so the URL travels with the
+    # credential. Null for providers with a hardcoded base URL.
+    base_url: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

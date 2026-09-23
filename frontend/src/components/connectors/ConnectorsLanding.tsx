@@ -10,6 +10,7 @@ import {
   fetchGhlConnectorStatus,
   fetchResendStatus,
   fetchMcpConnectors,
+  fetchSkarpeCredentials,
   type WgCredentialStatus,
   type OpenAiCredentialStatus,
   type AnthropicCredentialStatus,
@@ -28,6 +29,7 @@ export function ConnectorsLanding() {
   const [ghl, setGhl] = useState<Status>("loading");
   const [resend, setResend] = useState<Status>("loading");
   const [mcp, setMcp] = useState<Status>("loading");
+  const [skarpe, setSkarpe] = useState<Status>("loading");
 
   useEffect(() => {
     fetchWgStatus()
@@ -51,6 +53,9 @@ export function ConnectorsLanding() {
     fetchMcpConnectors()
       .then((s: McpConnectorList) => setMcp(s.configured ? "connected" : "not_connected"))
       .catch(() => setMcp("not_connected"));
+    fetchSkarpeCredentials()
+      .then((s) => setSkarpe(s.credentials.length > 0 ? "connected" : "not_connected"))
+      .catch(() => setSkarpe("not_connected"));
   }, []);
 
   return (
@@ -102,6 +107,17 @@ export function ConnectorsLanding() {
           icon={
             <svg className="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          }
+        />
+        <ConnectorCard
+          href="/connectors/skarpe"
+          name="Skarpe"
+          description="Create draft calendar-invitation campaigns from assigned lists on the Planning page."
+          status={skarpe}
+          icon={
+            <svg className="w-5 h-5 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
             </svg>
           }
         />

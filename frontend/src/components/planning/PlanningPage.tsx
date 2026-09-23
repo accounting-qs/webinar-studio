@@ -25,6 +25,7 @@ import { WebinarEditModal, type EditableWebinar } from "./WebinarEditModal";
 import { BroadcastPicker, toOptions as toPickerOptions } from "./BroadcastPicker";
 import { VariationsModal, apiCopyToVariant, type CopyVariant } from "../shared/VariationsModal";
 import { ReleaseContactsModal } from "./ReleaseContactsModal";
+import { SkarpeCampaignModal, type SkarpeModalList } from "./SkarpeCampaignModal";
 import { SendersEditModal } from "./SendersEditModal";
 import { ListDistributionModal, type ListDistTarget } from "../statistics/ListDistributionModal";
 
@@ -981,6 +982,9 @@ export function PlanningPage() {
   }, [senderFilterId]);
   const [showCopyModal, setShowCopyModal] = useState(false);
   const [copyModalLists, setCopyModalLists] = useState<PlannedList[]>([]);
+  // Non-null while the "Create Draft Campaigns in Skarpe" modal is open —
+  // a snapshot of the selection, like copyModalLists.
+  const [skarpeModalLists, setSkarpeModalLists] = useState<SkarpeModalList[] | null>(null);
   const [generatingCopies, setGeneratingCopies] = useState(false);
   const [planningCopyModal, setPlanningCopyModal] = useState<{ listId: string; webinarId: string; tab: "title" | "description" } | null>(null);
   const [modalBucketData, setModalBucketData] = useState<{
@@ -1850,6 +1854,23 @@ export function PlanningPage() {
     const lists = webinars.flatMap((w) => w.lists).filter((l) => selectedIds.has(l.id) && !l.isNonjoiners && !l.isNoListData);
     setCopyModalLists(lists);
     setShowCopyModal(true);
+  };
+
+  const openSkarpeModal = () => {
+    // Same selection filter as openCopyModal: special rows (nonjoiners /
+    // no-list-data) have no real contact membership behind them.
+    const snapshot: SkarpeModalList[] = [];
+    for (const w of webinars) {
+      for (const l of w.lists) {
+        if (!selectedIds.has(l.id) || l.isNonjoiners || l.isNoListData) continue;
+        snapshot.push({
+          assignmentId: l.id,
+          fallbackName: l.listName || getDefaultListName(w.lists, l),
+        });
+      }
+    }
+    if (snapshot.length === 0) return;
+    setSkarpeModalLists(snapshot);
   };
 
   const handleGenerateCopies = async () => {
@@ -3822,12 +3843,25 @@ export function PlanningPage() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
             Generate Copies
           </button>
+          <button onClick={openSkarpeModal} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+            Create Draft Campaigns in Skarpe
+          </button>
           <button onClick={handleBulkDelete} className="px-4 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
             Delete
           </button>
           <button onClick={() => setSelectedIds(new Set())} className="text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200 transition-colors">Clear</button>
         </div>
+      )}
+
+      {/* ── Skarpe draft-campaigns modal ───────────────────────────── */}
+      {skarpeModalLists && (
+        <SkarpeCampaignModal
+          lists={skarpeModalLists}
+          onClose={() => setSkarpeModalLists(null)}
+          onDone={() => setSelectedIds(new Set())}
+        />
       )}
 
       {/* ── Copy generation modal ──────────────────────────────────── */}

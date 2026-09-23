@@ -806,6 +806,217 @@ export async function deleteWgCredential(credentialId: string): Promise<{ delete
   return res.json();
 }
 
+/* ── Skarpe connector credentials (multi-instance) ────────────────────── */
+
+export interface ApiSkarpeCredential {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key_masked: string;
+  created_at: string | null;
+  updated_at: string | null;
+  key_name?: string | null;
+  timezone?: string | null;
+}
+
+export interface ApiSkarpeCredentialInfo {
+  id: string;
+  name: string;
+  base_url: string;
+  key_name: string | null;
+  permissions: string[];
+  can_launch_campaigns: boolean;
+  timezone: string | null;
+}
+
+export async function fetchSkarpeCredentials(): Promise<{ credentials: ApiSkarpeCredential[] }> {
+  const res = await fetch(`${API_URL}/connectors/skarpe/credentials`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch Skarpe credentials");
+  return res.json();
+}
+
+export async function createSkarpeCredential(data: {
+  name: string;
+  base_url: string;
+  api_key: string;
+}): Promise<ApiSkarpeCredential> {
+  const res = await fetch(`${API_URL}/connectors/skarpe/credentials`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to create credential");
+  }
+  return res.json();
+}
+
+export async function updateSkarpeCredential(
+  credentialId: string,
+  data: { name?: string; base_url?: string; api_key?: string },
+): Promise<ApiSkarpeCredential> {
+  const res = await fetch(`${API_URL}/connectors/skarpe/credentials/${credentialId}`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to update credential");
+  }
+  return res.json();
+}
+
+export async function deleteSkarpeCredential(credentialId: string): Promise<{ deleted: boolean }> {
+  const res = await fetch(`${API_URL}/connectors/skarpe/credentials/${credentialId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to delete credential");
+  }
+  return res.json();
+}
+
+export async function fetchSkarpeCredentialInfo(credentialId: string): Promise<ApiSkarpeCredentialInfo> {
+  const res = await fetch(`${API_URL}/connectors/skarpe/credentials/${credentialId}/info`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to fetch Skarpe workspace info");
+  }
+  return res.json();
+}
+
+/* ── Skarpe draft campaigns (Planning bulk action) ────────────────────── */
+
+export interface ApiSkarpeSendingAccount {
+  account_id: string;
+  email: string;
+  is_active: boolean;
+  daily_limit: number;
+  is_blocked: boolean;
+  blocked_until: string | null;
+  blocked_reason: string | null;
+}
+
+export interface ApiSkarpePolicy {
+  policy_version: string;
+  policy_hash: string;
+  statements: string[];
+  links: Record<string, string>;
+}
+
+export interface ApiSkarpePrepareItem {
+  assignment_id: string;
+  list_name: string;
+  event_title: string | null;
+  event_description: string | null;
+  event_location: string | null;
+  event_start: string | null;
+  event_end: string | null;
+  matched_webinar: { webinar_number: number | null; title: string | null } | null;
+  assigned_contacts: number;
+  existing_campaign: {
+    skarpe_campaign_id: string;
+    status: string;
+    contacts_pushed: number;
+    app_url: string | null;
+  } | null;
+  warnings: string[];
+}
+
+export interface ApiSkarpePrepareResponse {
+  workspace: {
+    key_name: string | null;
+    permissions: string[];
+    can_launch_campaigns: boolean;
+    timezone: string | null;
+  };
+  sending_accounts: ApiSkarpeSendingAccount[];
+  policy: ApiSkarpePolicy;
+  items: ApiSkarpePrepareItem[];
+}
+
+export async function prepareSkarpeCampaigns(data: {
+  credential_id: string;
+  assignment_ids: string[];
+}): Promise<ApiSkarpePrepareResponse> {
+  const res = await fetch(`${API_URL}/outreach/skarpe/prepare`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to prepare Skarpe campaigns");
+  }
+  return res.json();
+}
+
+export interface SkarpeCampaignItemInput {
+  assignment_id: string;
+  title: string;
+  event_title: string | null;
+  event_description: string | null;
+  event_location: string | null;
+  event_start: string | null;
+  event_end: string | null;
+  webinar_number: number | null;
+}
+
+export interface ApiSkarpeJobItem {
+  title: string;
+  status: "pending" | "creating" | "attaching" | "pushing" | "done" | "error";
+  campaign_id: string | null;
+  app_url: string | null;
+  contacts_total: number;
+  contacts_pushed: number;
+  error: string | null;
+}
+
+export interface ApiSkarpeJob {
+  id: string;
+  status: "running" | "done" | "failed";
+  total: number;
+  done: number;
+  items: Record<string, ApiSkarpeJobItem>;
+}
+
+export async function startSkarpeCampaigns(data: {
+  credential_id: string;
+  items: SkarpeCampaignItemInput[];
+  account_ids: string[];
+  daily_limit: number | null;
+  push_contacts: boolean;
+  policy: {
+    policy_version: string;
+    policy_hash: string;
+    confirmed: boolean;
+    confirmed_by: string;
+  } | null;
+}): Promise<{ job_id: string; total: number }> {
+  const res = await fetch(`${API_URL}/outreach/skarpe/campaigns`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Failed to create Skarpe campaigns");
+  }
+  return res.json();
+}
+
+export async function fetchSkarpeJob(jobId: string): Promise<ApiSkarpeJob> {
+  const res = await fetch(`${API_URL}/outreach/skarpe/jobs/${jobId}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch Skarpe job");
+  return res.json();
+}
+
 export async function deleteWebinar(webinarId: string): Promise<{ deleted: boolean; released: number }> {
   const res = await fetch(`${API_URL}/outreach/webinars/${webinarId}`, {
     method: "DELETE",

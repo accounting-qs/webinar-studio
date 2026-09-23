@@ -355,3 +355,59 @@ class WebinarListExportJob(Base):
         Index("ix_wle_jobs_webinar", "webinar_id"),
         Index("ix_wle_jobs_status", "status"),
     )
+
+
+class SkarpeCampaign(Base):
+    """One draft campaign created in a Skarpe workspace from an assigned list.
+
+    Durable record of the Planning-page "Create Draft Campaigns in Skarpe"
+    bulk action: which credential (workspace) it went to, the Skarpe campaign
+    id, how far the contact push got, and the compliance confirmation that
+    authorized it. The in-memory job dict is just a progress view over these
+    rows — a restart mid-push loses nothing because external_ref (the
+    assignment id) makes draft creation idempotent on Skarpe's side and
+    re-pushed contacts are silently skipped there.
+
+    (credential_id, assignment_id) is unique: one campaign per list per
+    workspace, matching the scope of Skarpe's external_ref dedup.
+    """
+    __tablename__ = "skarpe_campaigns"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    assignment_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("webinar_list_assignments.id", ondelete="CASCADE"), nullable=False)
+    credential_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), ForeignKey("connector_credentials.id", ondelete="SET NULL"))
+    skarpe_campaign_id: Mapped[str] = mapped_column(Text, nullable=False)
+    external_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    # Direct link to the draft in the Skarpe app, as returned by
+    # create_campaign_draft (the app host differs from the API host, so it
+    # cannot be derived from base_url).
+    app_url: Mapped[Optional[str]] = mapped_column(Text)
+    title: Mapped[Optional[str]] = mapped_column(Text)
+    # Skarpe's own webinar grouping number matched via platform ids; NULL when
+    # no campaign for our webinar exists there yet.
+    webinar_number: Mapped[Optional[int]] = mapped_column(Integer)
+    accounts_attached: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    contacts_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Contacts submitted to Skarpe — duplicates/suppressed are skipped there
+    # without being reported, so this counts sent, not created.
+    contacts_pushed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    policy_version: Mapped[Optional[str]] = mapped_column(Text)
+    policy_hash: Mapped[Optional[str]] = mapped_column(Text)
+    policy_confirmed_by: Mapped[Optional[str]] = mapped_column(Text)
+    policy_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'draft_created', 'accounts_attached', "
+            "'pushing_contacts', 'completed', 'failed')",
+            name="ck_skarpe_campaigns_status",
+        ),
+        UniqueConstraint("credential_id", "assignment_id", name="uq_skarpe_campaigns_credential_assignment"),
+        Index("ix_skarpe_campaigns_assignment", "assignment_id"),
+        Index("ix_skarpe_campaigns_credential", "credential_id"),
+    )
