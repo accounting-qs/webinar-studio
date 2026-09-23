@@ -1,17 +1,116 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback, type ReactNode } from "react";
-import type { ApiBucket, ApiCopy } from "@/lib/api";
+import { fetchCopyUsage, type ApiBucket, type ApiCopy, type ApiCopyUsage } from "@/lib/api";
 
 export interface CopyVariant {
   id: string;
   text: string;
   isPrimary: boolean;
   isAssigned?: boolean;
+  /** Short user-set label to tell variants apart (descriptions). */
+  internalName?: string | null;
+  /** Number of webinar lists currently using this copy. */
+  timesUsed?: number;
+  /** Set when the variant is archived (soft-deleted). */
+  deletedAt?: string | null;
 }
 
 export function apiCopyToVariant(c: ApiCopy): CopyVariant {
-  return { id: c.id, text: c.text, isPrimary: c.is_primary, isAssigned: c.is_assigned };
+  return {
+    id: c.id,
+    text: c.text,
+    isPrimary: c.is_primary,
+    isAssigned: c.is_assigned,
+    internalName: c.internal_name ?? null,
+    timesUsed: c.times_used,
+    deletedAt: c.deleted_at ?? null,
+  };
+}
+
+/**
+ * Convert clipboard HTML (Google Docs, Word, web pages) to plain text that
+ * keeps the visual structure: blank lines between paragraphs, one line per
+ * list item with a "1." / "-" marker, <br> as line breaks. Plain textareas
+ * only receive the source's text/plain by default, and Google Docs separates
+ * paragraphs there with a single newline — which collapses all spacing.
+ */
+function htmlToPlainText(html: string): string {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  let out = "";
+
+  // Append a paragraph ("\n\n") or line ("\n") break — but never right after
+  // a freshly written list marker, and without stacking onto existing breaks.
+  const ensureBreak = (sep: "\n" | "\n\n") => {
+    if (!out) return;
+    if (/(^|\n)(\d+\. |- )$/.test(out)) return;
+    out = out.replace(/[ \t]+$/, "");
+    const trailing = out.match(/\n*$/)?.[0].length ?? 0;
+    if (sep.length > trailing) out += "\n".repeat(sep.length - trailing);
+  };
+
+  const walk = (node: Node, ctx: { ol: { n: number } | null; inLi: boolean }) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out += (node.textContent || "").replace(/\s+/g, " ");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+    if (tag === "style" || tag === "script" || tag === "meta" || tag === "title" || tag === "head") return;
+    if (tag === "br") { out += "\n"; return; }
+    if (tag === "ol" || tag === "ul") {
+      ensureBreak(ctx.inLi ? "\n" : "\n\n");
+      const listCtx = { ol: tag === "ol" ? { n: 0 } : null, inLi: ctx.inLi };
+      el.childNodes.forEach((c) => walk(c, listCtx));
+      ensureBreak(ctx.inLi ? "\n" : "\n\n");
+      return;
+    }
+    if (tag === "li") {
+      ensureBreak("\n");
+      if (ctx.ol) { ctx.ol.n += 1; out += `${ctx.ol.n}. `; }
+      else out += "- ";
+      el.childNodes.forEach((c) => walk(c, { ol: ctx.ol, inLi: true }));
+      ensureBreak("\n");
+      return;
+    }
+    const para = tag === "p" || /^h[1-6]$/.test(tag);
+    const block = para || ["div", "section", "article", "blockquote", "pre", "table", "tr", "header", "footer"].includes(tag);
+    // Inside a list item everything stays on the item's line(s).
+    const sep: "\n" | "\n\n" = para && !ctx.inLi ? "\n\n" : "\n";
+    if (block) ensureBreak(sep);
+    el.childNodes.forEach((c) => walk(c, ctx));
+    if (block) ensureBreak(sep);
+  };
+
+  doc.body.childNodes.forEach((c) => walk(c, { ol: null, inLi: false }));
+  return out
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Paste handler for the variant textareas: when the clipboard carries HTML,
+ * insert its structured plain-text conversion at the caret instead of the
+ * (formatting-collapsed) default text/plain payload.
+ */
+function handleRichPaste(
+  e: React.ClipboardEvent<HTMLTextAreaElement>,
+  setValue: (next: string) => void,
+) {
+  const html = e.clipboardData?.getData("text/html");
+  if (!html) return;
+  const text = htmlToPlainText(html);
+  if (!text) return;
+  e.preventDefault();
+  const ta = e.currentTarget;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  setValue(ta.value.slice(0, start) + text + ta.value.slice(end));
+  const caret = start + text.length;
+  requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = caret; });
 }
 
 function LoadingSpinner() {
@@ -101,6 +200,13 @@ export interface VariationsModalProps {
   onRegenerate: (bucketId: string, type: "title" | "description", copyId: string, feedback: string) => Promise<void>;
   onAddVariant: (bucketId: string, type: "title" | "description", text: string) => Promise<void>;
   onDeleteVariant: (bucketId: string, type: "title" | "description", variantId: string) => Promise<void>;
+  /** Optional: archived (deleted) variants, shown in the expandable Archive section. */
+  archivedTitles?: CopyVariant[];
+  archivedDescriptions?: CopyVariant[];
+  /** Optional: restore an archived variant back to the active list. */
+  onRestoreVariant?: (bucketId: string, type: "title" | "description", variantId: string) => Promise<void>;
+  /** Optional: save a variant's short internal name (shown on descriptions). */
+  onUpdateInternalName?: (bucketId: string, type: "title" | "description", variantId: string, name: string) => Promise<void>;
   /** Optional: planning-page mode. When provided, shows "Pick for this list" button. */
   onPickForList?: (bucketId: string, type: "title" | "description", variantId: string) => void;
   /** Optional: per-tab subtitle shown under bucket name (e.g. "List: Wealth Mgmt · Santi"). */
@@ -122,6 +228,10 @@ export function VariationsModal({
   onRegenerate,
   onAddVariant,
   onDeleteVariant,
+  archivedTitles,
+  archivedDescriptions,
+  onRestoreVariant,
+  onUpdateInternalName,
   onPickForList,
   contextLabel,
   registrationLink = "",
@@ -138,6 +248,14 @@ export function VariationsModal({
   const [addingManual, setAddingManual] = useState(false);
   const [manualText, setManualText] = useState("");
   const [generatingNew, setGeneratingNew] = useState(false);
+  const [showArchive, setShowArchive] = useState(false);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+  const [nameEditingId, setNameEditingId] = useState<string | null>(null);
+  const [nameText, setNameText] = useState("");
+  // Usage side panel: which variant's webinar list is open, and its data
+  const [usageFor, setUsageFor] = useState<CopyVariant | null>(null);
+  const [usageList, setUsageList] = useState<ApiCopyUsage[] | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
   const manualTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -160,11 +278,43 @@ export function VariationsModal({
   }, [addingManual, manualText]);
 
   const variants = activeTab === "title" ? titles : descriptions;
+  const archived = (activeTab === "title" ? archivedTitles : archivedDescriptions) ?? [];
 
   const switchTab = useCallback((tab: "title" | "description") => {
     setActiveTab(tab);
     setSelectedForRegen(new Set());
+    setUsageFor(null);
+    setNameEditingId(null);
   }, []);
+
+  const openUsage = useCallback(async (v: CopyVariant) => {
+    setUsageFor(v);
+    setUsageList(null);
+    setUsageError(null);
+    try {
+      const { usages } = await fetchCopyUsage(v.id);
+      setUsageList(usages);
+    } catch {
+      setUsageError("Failed to load usage");
+    }
+  }, []);
+
+  const handleSaveName = useCallback(async (variantId: string) => {
+    if (!onUpdateInternalName) return;
+    await onUpdateInternalName(bucket.id, activeTab, variantId, nameText.trim());
+    setNameEditingId(null);
+    setNameText("");
+  }, [bucket.id, activeTab, nameText, onUpdateInternalName]);
+
+  const handleRestore = useCallback(async (variantId: string) => {
+    if (!onRestoreVariant) return;
+    setRestoringId(variantId);
+    try {
+      await onRestoreVariant(bucket.id, activeTab, variantId);
+    } finally {
+      setRestoringId(null);
+    }
+  }, [bucket.id, activeTab, onRestoreVariant]);
 
   const toggleRegenSelect = useCallback((id: string) => {
     setSelectedForRegen(prev => {
@@ -254,7 +404,7 @@ export function VariationsModal({
   return (
     <div
       ref={backdropRef}
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      className="fixed inset-0 z-[100] flex items-center justify-center gap-4 bg-black/50 backdrop-blur-sm"
       onClick={(e) => { if (e.target === backdropRef.current) onClose(); }}
     >
       <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-200 dark:border-zinc-800/60 shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
@@ -359,6 +509,51 @@ export function VariationsModal({
                           {onPickForList ? "Picked for list" : "Picked"}
                         </span>
                       )}
+                      {activeTab === "description" && onUpdateInternalName && (
+                        nameEditingId === v.id ? (
+                          <input
+                            value={nameText}
+                            onChange={(e) => setNameText(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") { e.preventDefault(); handleSaveName(v.id); }
+                              if (e.key === "Escape") { setNameEditingId(null); setNameText(""); }
+                            }}
+                            onBlur={() => handleSaveName(v.id)}
+                            placeholder="Internal name…"
+                            autoFocus
+                            className="text-[10px] font-semibold px-1.5 py-0.5 w-32 rounded border border-blue-300 dark:border-blue-500/40 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                          />
+                        ) : v.internalName ? (
+                          <button
+                            onClick={() => { setNameEditingId(v.id); setNameText(v.internalName || ""); }}
+                            title="Edit internal name"
+                            className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/60 text-zinc-600 dark:text-zinc-300 hover:border-blue-300 dark:hover:border-blue-500/40 transition-colors max-w-[160px] truncate"
+                          >
+                            {v.internalName}
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => { setNameEditingId(v.id); setNameText(""); }}
+                            title="Add a short internal name to this variant"
+                            className="text-[10px] font-medium px-1.5 py-0.5 rounded text-zinc-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors"
+                          >
+                            + name
+                          </button>
+                        )
+                      )}
+                      {typeof v.timesUsed === "number" && v.timesUsed > 0 && (
+                        <button
+                          onClick={() => openUsage(v)}
+                          title="Show the webinars where this was used"
+                          className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full transition-colors ${
+                            usageFor?.id === v.id
+                              ? "bg-violet-600 text-white"
+                              : "bg-zinc-200 dark:bg-zinc-700/60 text-zinc-600 dark:text-zinc-300 hover:bg-violet-100 dark:hover:bg-violet-500/20 hover:text-violet-600 dark:hover:text-violet-400"
+                          }`}
+                        >
+                          {v.timesUsed}×
+                        </button>
+                      )}
                       <span className="text-[10px] text-zinc-400 font-mono">{v.text.length} chars{activeTab === "description" ? ` · ${v.text.trim().split(/\s+/).length} words` : ""}</span>
                       <div className="flex-1" />
 
@@ -406,7 +601,7 @@ export function VariationsModal({
                         </button>
                         <button
                           onClick={() => {
-                            if (confirm(`Delete this ${activeTab} variant?`))
+                            if (confirm(`Delete this ${activeTab} variant? It will move to the Archive below.`))
                               onDeleteVariant(bucket.id, activeTab, v.id);
                           }}
                           className="text-[10px] font-medium px-2 py-1 rounded-md text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
@@ -424,6 +619,7 @@ export function VariationsModal({
                       <textarea
                         ref={editTextareaRef}
                         value={editText}
+                        onPaste={(e) => handleRichPaste(e, setEditText)}
                         onChange={(e) => {
                           setEditText(e.target.value);
                           const ta = e.target;
@@ -459,6 +655,7 @@ export function VariationsModal({
               <textarea
                 ref={manualTextareaRef}
                 value={manualText}
+                onPaste={(e) => handleRichPaste(e, setManualText)}
                 onChange={(e) => setManualText(e.target.value)}
                 placeholder={`Type your ${activeTab} text here…`}
                 className="w-full bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700/60 rounded-lg px-3 py-2.5 text-sm text-zinc-800 dark:text-zinc-200 leading-relaxed focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-vertical min-h-[60px] font-sans whitespace-pre-wrap"
@@ -492,6 +689,69 @@ export function VariationsModal({
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
               Add variant manually
             </button>
+          )}
+
+          {/* ── Archive (deleted variants) ─────────────────────────── */}
+          {archived.length > 0 && (
+            <div className="pt-1">
+              <button
+                onClick={() => setShowArchive(s => !s)}
+                className="w-full flex items-center gap-2 py-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors"
+              >
+                <svg className={`w-3 h-3 transition-transform ${showArchive ? "rotate-90" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                Archive ({archived.length})
+                <span className="flex-1 border-t border-dashed border-zinc-200 dark:border-zinc-800" />
+              </button>
+              {showArchive && (
+                <div className="space-y-3 mt-1">
+                  {archived.map((v) => (
+                    <div key={v.id} className="rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700/50 bg-zinc-50/60 dark:bg-zinc-800/20 px-4 py-3 opacity-75">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-zinc-200/70 dark:bg-zinc-700/40 text-zinc-500 dark:text-zinc-400">
+                          Archived
+                        </span>
+                        {v.internalName && (
+                          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700/60 text-zinc-500 dark:text-zinc-400 max-w-[160px] truncate">
+                            {v.internalName}
+                          </span>
+                        )}
+                        {typeof v.timesUsed === "number" && v.timesUsed > 0 && (
+                          <button
+                            onClick={() => openUsage(v)}
+                            title="Show the webinars where this was used"
+                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full transition-colors ${
+                              usageFor?.id === v.id
+                                ? "bg-violet-600 text-white"
+                                : "bg-zinc-200 dark:bg-zinc-700/60 text-zinc-600 dark:text-zinc-300 hover:bg-violet-100 dark:hover:bg-violet-500/20 hover:text-violet-600 dark:hover:text-violet-400"
+                            }`}
+                          >
+                            {v.timesUsed}×
+                          </button>
+                        )}
+                        {v.deletedAt && (
+                          <span className="text-[10px] text-zinc-400">
+                            deleted {new Date(v.deletedAt).toLocaleDateString()}
+                          </span>
+                        )}
+                        <div className="flex-1" />
+                        {onRestoreVariant && (
+                          <button
+                            onClick={() => handleRestore(v.id)}
+                            disabled={restoringId === v.id}
+                            className="text-[10px] font-medium px-2 py-1 rounded-md text-zinc-500 hover:text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 disabled:opacity-50 transition-colors"
+                          >
+                            {restoringId === v.id ? "Restoring…" : "Restore"}
+                          </button>
+                        )}
+                      </div>
+                      <pre className="text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed whitespace-pre-wrap font-sans">
+                        {linkifyCopyText(v.text, registrationLink, unsubscribeLink)}
+                      </pre>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -565,6 +825,63 @@ export function VariationsModal({
           </button>
         </div>
       </div>
+
+      {/* ── Usage side panel ─────────────────────────────────────── */}
+      {usageFor && (
+        <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-200 dark:border-zinc-800/60 shadow-2xl w-80 max-h-[85vh] flex flex-col overflow-hidden animate-in fade-in slide-in-from-right-4 duration-200 shrink-0">
+          <div className="flex items-start gap-2 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800/40 shrink-0">
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">Used in webinars</h3>
+              <p className="text-[11px] text-zinc-500 mt-0.5 truncate" title={usageFor.text}>
+                {usageFor.internalName || `${usageFor.text.slice(0, 60)}${usageFor.text.length > 60 ? "…" : ""}`}
+              </p>
+            </div>
+            <button
+              onClick={() => setUsageFor(null)}
+              className="p-1 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto px-4 py-3">
+            {usageError ? (
+              <p className="text-xs text-red-500 py-4 text-center">{usageError}</p>
+            ) : usageList === null ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-zinc-400 text-xs">
+                <LoadingSpinner /> Loading…
+              </div>
+            ) : usageList.length === 0 ? (
+              <p className="text-xs text-zinc-400 py-4 text-center">Not used on any webinar list.</p>
+            ) : (
+              <div className="space-y-2">
+                {usageList.map((u) => (
+                  <div key={`${u.assignment_id}`} className="rounded-lg border border-zinc-200 dark:border-zinc-800/40 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-zinc-800 dark:text-zinc-200">
+                        W{u.webinar.number}{u.webinar.variant_label ? ` · ${u.webinar.variant_label}` : ""}
+                      </span>
+                      <span className="text-[10px] text-zinc-400">{u.webinar.date}</span>
+                      <span className={`ml-auto text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                        u.webinar.status === "sent"
+                          ? "bg-emerald-100 dark:bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                          : u.webinar.status === "archived"
+                            ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+                            : "bg-amber-100 dark:bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                      }`}>
+                        {u.webinar.status}
+                      </span>
+                    </div>
+                    {u.list_name && (
+                      <p className="text-[11px] text-zinc-500 mt-1 truncate" title={u.list_name}>{u.list_name}</p>
+                    )}
+                    <p className="text-[10px] text-zinc-400 mt-0.5">as {u.used_as.join(" + ")}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

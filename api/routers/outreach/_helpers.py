@@ -557,11 +557,31 @@ async def compute_blocklist_counts_per_assignment(
 
 # ── Serialization helpers ─────────────────────────────────────────────────
 
+async def copy_usage_counts(db, copy_ids: list[str] | None = None) -> dict[str, int]:
+    """How many webinar lists reference each copy (as title or description).
+
+    Pass copy_ids to scope the count; None aggregates every assignment of the
+    user (the table is small, so one grouped pass is cheaper than chunking).
+    """
+    if copy_ids is not None and not copy_ids:
+        return {}
+    counts: dict[str, int] = {}
+    for col in (WebinarListAssignment.title_copy_id, WebinarListAssignment.desc_copy_id):
+        cond = col.in_(copy_ids) if copy_ids is not None else and_(
+            WebinarListAssignment.user_id == LLOYD_USER_ID, col.isnot(None)
+        )
+        result = await db.execute(select(col, sa_func.count()).where(cond).group_by(col))
+        for cid, n in result:
+            counts[cid] = counts.get(cid, 0) + n
+    return counts
+
+
 def bucket_dict(
     b: OutreachBucket,
     include_copies: bool = False,
     assigned_copy_ids: set[str] | None = None,
     blocklist_counts: dict | None = None,
+    usage_counts: dict[str, int] | None = None,
 ) -> dict:
     try:
         all_copies = b.copies or []
@@ -602,24 +622,33 @@ def bucket_dict(
     }
     if include_copies:
         aids = assigned_copy_ids or set()
-        d["titles"] = [copy_dict(c, is_assigned=c.id in aids) for c in sorted(titles, key=lambda x: x.variant_index)]
-        d["descriptions"] = [copy_dict(c, is_assigned=c.id in aids) for c in sorted(descs, key=lambda x: x.variant_index)]
+        uc = usage_counts or {}
+        arch_titles = [c for c in all_copies if c.copy_type == "title" and c.deleted_at]
+        arch_descs = [c for c in all_copies if c.copy_type == "description" and c.deleted_at]
+        d["titles"] = [copy_dict(c, is_assigned=c.id in aids, times_used=uc.get(c.id, 0)) for c in sorted(titles, key=lambda x: x.variant_index)]
+        d["descriptions"] = [copy_dict(c, is_assigned=c.id in aids, times_used=uc.get(c.id, 0)) for c in sorted(descs, key=lambda x: x.variant_index)]
+        d["archived_titles"] = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in sorted(arch_titles, key=lambda x: (x.deleted_at,), reverse=True)]
+        d["archived_descriptions"] = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in sorted(arch_descs, key=lambda x: (x.deleted_at,), reverse=True)]
     return d
 
 
-def copy_dict(c: BucketCopy, is_assigned: bool | None = None) -> dict:
+def copy_dict(c: BucketCopy, is_assigned: bool | None = None, times_used: int | None = None) -> dict:
     d = {
         "id": c.id,
         "bucket_id": c.bucket_id,
         "copy_type": c.copy_type,
         "variant_index": c.variant_index,
         "text": c.text,
+        "internal_name": c.internal_name,
         "is_primary": c.is_primary,
         "ai_feedback": c.ai_feedback,
         "created_at": c.created_at.isoformat() if c.created_at else None,
+        "deleted_at": c.deleted_at.isoformat() if c.deleted_at else None,
     }
     if is_assigned is not None:
         d["is_assigned"] = is_assigned
+    if times_used is not None:
+        d["times_used"] = times_used
     return d
 
 

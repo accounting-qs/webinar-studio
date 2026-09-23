@@ -118,6 +118,8 @@ export interface ApiBucket {
   // included when ?include=copies
   titles?: ApiCopy[];
   descriptions?: ApiCopy[];
+  archived_titles?: ApiCopy[];
+  archived_descriptions?: ApiCopy[];
 }
 
 export interface ApiCopy {
@@ -126,10 +128,29 @@ export interface ApiCopy {
   copy_type: "title" | "description";
   variant_index: number;
   text: string;
+  /** Short user-set label to tell variants apart; null when unnamed. */
+  internal_name?: string | null;
   is_primary: boolean;
   ai_feedback: string | null;
   created_at: string | null;
+  /** Set when the copy is archived (soft-deleted). */
+  deleted_at?: string | null;
   is_assigned?: boolean;
+  /** Number of webinar lists currently using this copy. */
+  times_used?: number;
+}
+
+export interface ApiCopyUsage {
+  assignment_id: string;
+  list_name: string | null;
+  used_as: ("title" | "description")[];
+  webinar: {
+    id: string;
+    number: number;
+    variant_label: string | null;
+    date: string | null;
+    status: string;
+  };
 }
 
 export interface ApiSender {
@@ -305,7 +326,7 @@ export async function updateBucketStatEmpRange(
 
 /* ── Outreach: Copies ──────────────────────────────────────────────────── */
 
-export async function fetchBucketCopies(bucketId: string): Promise<{ bucket_id: string; titles: ApiCopy[]; descriptions: ApiCopy[] }> {
+export async function fetchBucketCopies(bucketId: string): Promise<{ bucket_id: string; titles: ApiCopy[]; descriptions: ApiCopy[]; archived_titles?: ApiCopy[]; archived_descriptions?: ApiCopy[] }> {
   const res = await fetch(`${API_URL}/outreach/buckets/${bucketId}/copies`, { headers: authHeaders() });
   if (!res.ok) throw new Error("Failed to fetch copies");
   return res.json();
@@ -577,7 +598,7 @@ export async function mergeBuckets(data: {
 
 export async function updateCopy(
   copyId: string,
-  data: { text?: string; is_primary?: boolean }
+  data: { text?: string; is_primary?: boolean; internal_name?: string }
 ): Promise<ApiCopy> {
   const res = await fetch(`${API_URL}/outreach/copies/${copyId}`, {
     method: "PUT",
@@ -620,6 +641,21 @@ export async function deleteCopy(copyId: string): Promise<void> {
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to delete copy");
+}
+
+export async function restoreCopy(copyId: string): Promise<ApiCopy> {
+  const res = await fetch(`${API_URL}/outreach/copies/${copyId}/restore`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to restore copy");
+  return res.json();
+}
+
+export async function fetchCopyUsage(copyId: string): Promise<{ copy_id: string; usages: ApiCopyUsage[] }> {
+  const res = await fetch(`${API_URL}/outreach/copies/${copyId}/usage`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to fetch copy usage");
+  return res.json();
 }
 
 /* ── Outreach: Senders ─────────────────────────────────────────────────── */
@@ -937,7 +973,7 @@ export async function fetchCustomLists(): Promise<{ lists: ApiCustomList[] }> {
   return res.json();
 }
 
-export async function fetchCustomListCopies(uploadId: string): Promise<{ upload_id: string; titles: ApiCopy[]; descriptions: ApiCopy[] }> {
+export async function fetchCustomListCopies(uploadId: string): Promise<{ upload_id: string; titles: ApiCopy[]; descriptions: ApiCopy[]; archived_titles?: ApiCopy[]; archived_descriptions?: ApiCopy[] }> {
   const res = await fetch(`${API_URL}/outreach/uploads/${uploadId}/copies`, { headers: authHeaders() });
   if (!res.ok) throw new Error("Failed to fetch custom list copies");
   return res.json();

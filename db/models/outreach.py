@@ -54,6 +54,8 @@ class BucketCopy(Base):
     copy_type: Mapped[str] = mapped_column(String(20), nullable=False)
     variant_index: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Short user-set label ("Nov angle", "ROI hook") to tell variants apart.
+    internal_name: Mapped[Optional[str]] = mapped_column(Text)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     primary_picked_by_user: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     ai_feedback: Mapped[Optional[str]] = mapped_column(Text)

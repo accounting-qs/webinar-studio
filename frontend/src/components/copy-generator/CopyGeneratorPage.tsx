@@ -10,6 +10,7 @@ import {
   updateCopy as apiUpdateCopy,
   regenerateCopy as apiRegenerateCopy,
   deleteCopy as apiDeleteCopy,
+  restoreCopy as apiRestoreCopy,
   mergeBuckets as apiMergeBuckets,
   updateBucket as apiUpdateBucket,
   MergeBlockedError,
@@ -247,6 +248,8 @@ function CustomListsCopySection() {
   const [modalTab, setModalTab] = useState<"title" | "description">("title");
   const [modalTitles, setModalTitles] = useState<CopyVariant[]>([]);
   const [modalDescs, setModalDescs] = useState<CopyVariant[]>([]);
+  const [modalArchTitles, setModalArchTitles] = useState<CopyVariant[]>([]);
+  const [modalArchDescs, setModalArchDescs] = useState<CopyVariant[]>([]);
   const [modalBucket, setModalBucket] = useState<import("@/lib/api").ApiBucket | null>(null);
   const [generating, setGenerating] = useState<string | null>(null);
 
@@ -263,6 +266,8 @@ function CustomListsCopySection() {
     setModalTab(tab);
     setModalTitles(copies.titles.map(apiCopyToVariant));
     setModalDescs(copies.descriptions.map(apiCopyToVariant));
+    setModalArchTitles((copies.archived_titles || []).map(apiCopyToVariant));
+    setModalArchDescs((copies.archived_descriptions || []).map(apiCopyToVariant));
     setModalBucket({
       id: cl.id,
       name: cl.name,
@@ -331,8 +336,40 @@ function CustomListsCopySection() {
   const handleModalDelete = async (bucketId: string, type: "title" | "description", variantId: string) => {
     const { deleteCopy } = await import("@/lib/api");
     await deleteCopy(variantId);
-    if (type === "title") setModalTitles(prev => prev.filter(v => v.id !== variantId));
-    else setModalDescs(prev => prev.filter(v => v.id !== variantId));
+    // Soft-delete server-side — move the variant into the Archive section
+    const source = type === "title" ? modalTitles : modalDescs;
+    const deleted = source.find(v => v.id === variantId);
+    const item = deleted ? { ...deleted, isPrimary: false, deletedAt: new Date().toISOString() } : null;
+    if (type === "title") {
+      setModalTitles(prev => prev.filter(v => v.id !== variantId));
+      if (item) setModalArchTitles(prev => [item, ...prev]);
+    } else {
+      setModalDescs(prev => prev.filter(v => v.id !== variantId));
+      if (item) setModalArchDescs(prev => [item, ...prev]);
+    }
+  };
+
+  const handleModalRestore = async (bucketId: string, type: "title" | "description", variantId: string) => {
+    const { restoreCopy } = await import("@/lib/api");
+    const source = type === "title" ? modalArchTitles : modalArchDescs;
+    const archivedVariant = source.find(v => v.id === variantId);
+    const restored = await restoreCopy(variantId);
+    const variant: CopyVariant = { ...apiCopyToVariant(restored), timesUsed: archivedVariant?.timesUsed };
+    if (type === "title") {
+      setModalArchTitles(prev => prev.filter(v => v.id !== variantId));
+      setModalTitles(prev => [...prev, variant]);
+    } else {
+      setModalArchDescs(prev => prev.filter(v => v.id !== variantId));
+      setModalDescs(prev => [...prev, variant]);
+    }
+  };
+
+  const handleModalUpdateName = async (bucketId: string, type: "title" | "description", variantId: string, name: string) => {
+    const { updateCopy } = await import("@/lib/api");
+    const updated = await updateCopy(variantId, { internal_name: name });
+    const apply = (prev: CopyVariant[]) => prev.map(v => v.id === variantId ? { ...v, internalName: updated.internal_name ?? null } : v);
+    if (type === "title") setModalTitles(apply);
+    else setModalDescs(apply);
   };
 
   if (loading) return <div className="text-center py-12 text-zinc-500">Loading custom lists...</div>;
@@ -389,12 +426,16 @@ function CustomListsCopySection() {
           initialTab={modalTab}
           titles={modalTitles}
           descriptions={modalDescs}
+          archivedTitles={modalArchTitles}
+          archivedDescriptions={modalArchDescs}
           onClose={() => { setModalUploadId(null); setModalBucket(null); }}
           onUpdateVariant={handleModalUpdate}
           onSetPrimary={handleModalSetPrimary}
           onRegenerate={handleModalRegenerate}
           onAddVariant={handleModalAdd}
           onDeleteVariant={handleModalDelete}
+          onRestoreVariant={handleModalRestore}
+          onUpdateInternalName={handleModalUpdateName}
         />
       )}
     </>
@@ -411,6 +452,8 @@ export function CopyGeneratorPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [variantCount, setVariantCount] = useState(3);
   const [generatedCopies, setGeneratedCopies] = useState<Map<string, GeneratedCopy[]>>(new Map());
+  // Archived (soft-deleted) variants per bucket, shown in the modal's Archive section
+  const [archivedCopies, setArchivedCopies] = useState<Map<string, { titles: CopyVariant[]; descriptions: CopyVariant[] }>>(new Map());
   const [statusMap, setStatusMap] = useState<Map<string, GenerationStatus>>(new Map());
   // Maps `${bucketId}-${type}` → latest job info (for retry + error display)
   const [jobMap, setJobMap] = useState<Map<string, JobMeta>>(new Map());
@@ -466,6 +509,16 @@ export function CopyGeneratorPage() {
   const [groupSimilar, setGroupSimilar] = useState(false);
 
   /* ── Load buckets with copies from API on mount ─────────────────────── */
+  const buildArchivedMap = (apiBuckets: ApiBucket[]) => {
+    const map = new Map<string, { titles: CopyVariant[]; descriptions: CopyVariant[] }>();
+    for (const b of apiBuckets) {
+      const titles = (b.archived_titles || []).map(apiCopyToVariant);
+      const descriptions = (b.archived_descriptions || []).map(apiCopyToVariant);
+      if (titles.length > 0 || descriptions.length > 0) map.set(b.id, { titles, descriptions });
+    }
+    return map;
+  };
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -476,6 +529,7 @@ export function CopyGeneratorPage() {
         ]);
         if (cancelled) return;
         setBuckets(apiBuckets);
+        setArchivedCopies(buildArchivedMap(apiBuckets));
 
         // Restore generated copies from API data
         const restored = new Map<string, GeneratedCopy[]>();
@@ -741,6 +795,7 @@ export function CopyGeneratorPage() {
     // Refresh buckets + drop merged ones from state
     const { buckets: refreshed } = await fetchBuckets(true);
     setBuckets(refreshed);
+    setArchivedCopies(buildArchivedMap(refreshed));
     setGeneratedCopies(prev => {
       const next = new Map(prev);
       for (const id of sourceIds) next.delete(id);
@@ -806,6 +861,7 @@ export function CopyGeneratorPage() {
         // so the effect re-runs at most once after this callback returns.
         if (refreshedBuckets) {
           setBuckets(refreshedBuckets);
+          setArchivedCopies(buildArchivedMap(refreshedBuckets));
           const touched = new Set(newlyDone.map(d => d.bucketId));
           const fresh = refreshedBuckets;
           setGeneratedCopies(prev => {
@@ -980,6 +1036,8 @@ export function CopyGeneratorPage() {
   }, []);
 
   const handleDeleteVariant = useCallback(async (bucketId: string, type: "title" | "description", variantId: string) => {
+    const deleted = (generatedCopies.get(bucketId) || [])
+      .find(c => c.type === type)?.variants.find(v => v.id === variantId);
     try {
       await apiDeleteCopy(variantId);
       setGeneratedCopies(prev => {
@@ -997,8 +1055,69 @@ export function CopyGeneratorPage() {
         next.set(bucketId, copies);
         return next;
       });
+      // The delete is a soft-delete server-side — mirror it by moving the
+      // variant into the Archive section.
+      if (deleted) {
+        setArchivedCopies(prev => {
+          const next = new Map(prev);
+          const entry = next.get(bucketId) ?? { titles: [], descriptions: [] };
+          const item = { ...deleted, isPrimary: false, deletedAt: new Date().toISOString() };
+          next.set(bucketId, type === "title"
+            ? { ...entry, titles: [item, ...entry.titles] }
+            : { ...entry, descriptions: [item, ...entry.descriptions] });
+          return next;
+        });
+      }
     } catch (err) {
       console.error("Failed to delete variant:", err);
+    }
+  }, [generatedCopies]);
+
+  const handleRestoreVariant = useCallback(async (bucketId: string, type: "title" | "description", variantId: string) => {
+    const entry = archivedCopies.get(bucketId);
+    const archivedVariant = (type === "title" ? entry?.titles : entry?.descriptions)?.find(v => v.id === variantId);
+    try {
+      const restored = await apiRestoreCopy(variantId);
+      setArchivedCopies(prev => {
+        const next = new Map(prev);
+        const e = next.get(bucketId);
+        if (!e) return prev;
+        next.set(bucketId, type === "title"
+          ? { ...e, titles: e.titles.filter(v => v.id !== variantId) }
+          : { ...e, descriptions: e.descriptions.filter(v => v.id !== variantId) });
+        return next;
+      });
+      const variant: CopyVariant = { ...apiCopyToVariant(restored), timesUsed: archivedVariant?.timesUsed };
+      setGeneratedCopies(prev => {
+        const next = new Map(prev);
+        const existing = next.get(bucketId) || [];
+        const found = existing.find(c => c.type === type);
+        if (found) {
+          next.set(bucketId, existing.map(c => c.type === type ? { ...c, variants: [...c.variants, variant] } : c));
+        } else {
+          next.set(bucketId, [...existing, { bucketId, type, variants: [variant], generatedAt: restored.created_at || "" }]);
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to restore variant:", err);
+    }
+  }, [archivedCopies]);
+
+  const handleUpdateInternalName = useCallback(async (bucketId: string, type: "title" | "description", variantId: string, name: string) => {
+    try {
+      const updated = await apiUpdateCopy(variantId, { internal_name: name });
+      setGeneratedCopies(prev => {
+        const next = new Map(prev);
+        const copies = (next.get(bucketId) || []).map(c => {
+          if (c.type !== type) return c;
+          return { ...c, variants: c.variants.map(v => v.id === variantId ? { ...v, internalName: updated.internal_name ?? null } : v) };
+        });
+        next.set(bucketId, copies);
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to update internal name:", err);
     }
   }, []);
 
@@ -1569,12 +1688,16 @@ export function CopyGeneratorPage() {
           initialTab={modalState.tab}
           titles={getCopies(modalState.bucketId, "title")}
           descriptions={getCopies(modalState.bucketId, "description")}
+          archivedTitles={archivedCopies.get(modalState.bucketId)?.titles ?? []}
+          archivedDescriptions={archivedCopies.get(modalState.bucketId)?.descriptions ?? []}
           onClose={() => setModalState(null)}
           onUpdateVariant={updateVariantText}
           onSetPrimary={setPrimaryVariant}
           onRegenerate={handleRegenerate}
           onAddVariant={handleAddVariant}
           onDeleteVariant={handleDeleteVariant}
+          onRestoreVariant={handleRestoreVariant}
+          onUpdateInternalName={handleUpdateInternalName}
         />
       )}
 

@@ -49,6 +49,7 @@ class CopyCreate(BaseModel):
 class CopyUpdate(BaseModel):
     text: str | None = None
     is_primary: bool | None = None
+    internal_name: str | None = None
 
 class CopyRegenerateRequest(BaseModel):
     feedback: str

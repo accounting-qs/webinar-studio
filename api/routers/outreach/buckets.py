@@ -18,8 +18,9 @@ from sqlalchemy.orm import selectinload
 from api.auth import require_auth
 from api.routers.outreach._helpers import (
     LLOYD_USER_ID, NO_LOCATION_SENTINEL, bucket_dict, claimable_conditions,
-    compute_blocklist_counts_per_bucket, copy_dict, country_filter_conditions,
-    employee_count_filter, invite_count_filter, reuse_cutoff_to_ts,
+    compute_blocklist_counts_per_bucket, copy_dict, copy_usage_counts,
+    country_filter_conditions, employee_count_filter, invite_count_filter,
+    reuse_cutoff_to_ts,
 )
 from api.schemas import (
     BucketCreate, BucketMergeRequest, BucketUpdate, CopyBulkGenerateRequest,
@@ -94,12 +95,17 @@ async def list_buckets(
 
     blocklist_counts = await compute_blocklist_counts_per_bucket(db, bucket_ids)
 
+    usage_counts: dict[str, int] = {}
+    if include == "copies" and bucket_ids:
+        usage_counts = await copy_usage_counts(db)
+
     return {"buckets": [
         bucket_dict(
             b,
             include_copies=(include == "copies"),
             assigned_copy_ids=assigned_copy_ids,
             blocklist_counts=blocklist_counts.get(b.id),
+            usage_counts=usage_counts,
         )
         for b in buckets
     ]}
@@ -908,13 +914,21 @@ async def get_bucket_copies(
         select(BucketCopy).where(
             BucketCopy.bucket_id == bucket_id,
             BucketCopy.user_id == LLOYD_USER_ID,
-            BucketCopy.deleted_at.is_(None),
         ).order_by(BucketCopy.copy_type, BucketCopy.variant_index)
     )
     copies = result.scalars().all()
-    titles = [copy_dict(c) for c in copies if c.copy_type == "title"]
-    descriptions = [copy_dict(c) for c in copies if c.copy_type == "description"]
-    return {"bucket_id": bucket_id, "titles": titles, "descriptions": descriptions}
+    uc = await copy_usage_counts(db, [c.id for c in copies])
+    active = [c for c in copies if not c.deleted_at]
+    archived = sorted((c for c in copies if c.deleted_at), key=lambda c: c.deleted_at, reverse=True)
+    titles = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in active if c.copy_type == "title"]
+    descriptions = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in active if c.copy_type == "description"]
+    return {
+        "bucket_id": bucket_id,
+        "titles": titles,
+        "descriptions": descriptions,
+        "archived_titles": [copy_dict(c, times_used=uc.get(c.id, 0)) for c in archived if c.copy_type == "title"],
+        "archived_descriptions": [copy_dict(c, times_used=uc.get(c.id, 0)) for c in archived if c.copy_type == "description"],
+    }
 
 
 @router.post("/buckets/{bucket_id}/copies", status_code=201)
@@ -1062,6 +1076,10 @@ async def update_copy(
     if body.text is not None:
         copy.text = body.text
 
+    if body.internal_name is not None:
+        # Empty string clears the label (the field is omitted when untouched).
+        copy.internal_name = body.internal_name.strip() or None
+
     if body.is_primary is True:
         await db.execute(
             update(BucketCopy).where(
@@ -1136,6 +1154,69 @@ async def regenerate_copy(
     db.add(new_copy)
     await db.flush()
     return copy_dict(new_copy)
+
+
+@router.get("/copies/{copy_id}/usage")
+async def get_copy_usage(
+    copy_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Webinars (via their list assignments) where this copy is picked as
+    title or description — the drill-down behind the usage-count badge."""
+    from db.models import Webinar
+
+    result = await db.execute(
+        select(WebinarListAssignment, Webinar)
+        .join(Webinar, Webinar.id == WebinarListAssignment.webinar_id)
+        .options(selectinload(WebinarListAssignment.bucket))
+        .where(
+            WebinarListAssignment.user_id == LLOYD_USER_ID,
+            or_(
+                WebinarListAssignment.title_copy_id == copy_id,
+                WebinarListAssignment.desc_copy_id == copy_id,
+            ),
+        )
+        .order_by(Webinar.date.desc(), WebinarListAssignment.display_order)
+    )
+    usages = []
+    for a, w in result.all():
+        used_as = []
+        if a.title_copy_id == copy_id:
+            used_as.append("title")
+        if a.desc_copy_id == copy_id:
+            used_as.append("description")
+        usages.append({
+            "assignment_id": a.id,
+            "list_name": a.list_name or (a.bucket.name if a.bucket else None),
+            "used_as": used_as,
+            "webinar": {
+                "id": w.id,
+                "number": w.number,
+                "variant_label": w.variant_label,
+                "date": w.date.isoformat() if w.date else None,
+                "status": w.status,
+            },
+        })
+    return {"copy_id": copy_id, "usages": usages}
+
+
+@router.post("/copies/{copy_id}/restore")
+async def restore_copy(
+    copy_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """Un-archive a soft-deleted copy. It comes back non-primary."""
+    result = await db.execute(
+        select(BucketCopy).where(BucketCopy.id == copy_id, BucketCopy.user_id == LLOYD_USER_ID)
+    )
+    copy = result.scalar_one_or_none()
+    if not copy:
+        raise HTTPException(404, "Copy not found")
+    copy.deleted_at = None
+    await db.flush()
+    return copy_dict(copy)
 
 
 @router.delete("/copies/{copy_id}", status_code=204)

@@ -397,19 +397,27 @@ async def get_custom_list_copies(
 ):
     """Get title and description copies for a custom list (by upload_id)."""
     from db.models import BucketCopy
-    from api.routers.outreach._helpers import copy_dict
+    from api.routers.outreach._helpers import copy_dict, copy_usage_counts
 
     result = await db.execute(
         select(BucketCopy).where(
             BucketCopy.upload_id == upload_id,
             BucketCopy.bucket_id.is_(None),
-            BucketCopy.deleted_at.is_(None),
         ).order_by(BucketCopy.copy_type, BucketCopy.variant_index)
     )
     copies = result.scalars().all()
-    titles = [copy_dict(c) for c in copies if c.copy_type == "title"]
-    descriptions = [copy_dict(c) for c in copies if c.copy_type == "description"]
-    return {"upload_id": upload_id, "titles": titles, "descriptions": descriptions}
+    uc = await copy_usage_counts(db, [c.id for c in copies])
+    active = [c for c in copies if not c.deleted_at]
+    archived = sorted((c for c in copies if c.deleted_at), key=lambda c: c.deleted_at, reverse=True)
+    titles = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in active if c.copy_type == "title"]
+    descriptions = [copy_dict(c, times_used=uc.get(c.id, 0)) for c in active if c.copy_type == "description"]
+    return {
+        "upload_id": upload_id,
+        "titles": titles,
+        "descriptions": descriptions,
+        "archived_titles": [copy_dict(c, times_used=uc.get(c.id, 0)) for c in archived if c.copy_type == "title"],
+        "archived_descriptions": [copy_dict(c, times_used=uc.get(c.id, 0)) for c in archived if c.copy_type == "description"],
+    }
 
 
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
