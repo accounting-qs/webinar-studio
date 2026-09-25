@@ -2382,10 +2382,10 @@ export function PlanningPage() {
                 { label: "Lists", value: globalStats.totalLists, color: "text-zinc-800 dark:text-zinc-200", loading: loadingWebinars, warn: null },
                 { label: "Volume", value: globalStats.totalVolume.toLocaleString(), color: "text-violet-400", loading: loadingWebinars, warn: null },
                 { label: "Available", value: globalStats.availableBuckets.toLocaleString(), color: "text-amber-400", loading: loadingBuckets, warn: null },
-                { label: "Good Avail", value: goodAvail ? goodAvail.total.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
-                { label: "Good US+CA", value: goodAvail ? goodAvail.us_ca.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
-                { label: "Good EU", value: goodAvail ? goodAvail.europe.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
-                { label: "Good No-loc", value: goodAvail ? goodAvail.no_location.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Qual Avail", value: goodAvail ? goodAvail.total.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Qual US+CA", value: goodAvail ? goodAvail.us_ca.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Qual EU", value: goodAvail ? goodAvail.europe.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
+                { label: "Qual No-loc", value: goodAvail ? goodAvail.no_location.toLocaleString() : "—", color: goodColor, loading: loadingGoodAvail, warn: goodAvailError },
                 { label: "Accounts", value: globalStats.totalAccounts, color: "text-emerald-400", loading: loadingWebinars, warn: null },
               ].map((s) => (
                 <div key={s.label}

@@ -1123,9 +1123,11 @@ export async function fetchBucketEligible(
   return { remaining: data.buckets ?? {}, totals: data.totals ?? {} };
 }
 
-export interface GoodAvailGeoRow { total: number; us_ca: number; europe: number; no_location: number; }
-/** Same fresh-claimable counts split by bucket grade ('none' = no grade set);
- *  the 'bad' grade is in the breakdown but not in the headline fields. */
+/** usa/canada are the split the details modal shows; us_ca stays their sum
+ *  because the header chips and headline read the combined figure. */
+export interface GoodAvailGeoRow { total: number; usa: number; canada: number; us_ca: number; europe: number; no_location: number; }
+/** Same fresh-claimable counts split by bucket grade ('none' = no grade set).
+ *  The headline fields are the "Qualified" subset: good + medium only. */
 export interface GoodAvailable extends GoodAvailGeoRow {
   breakdown?: Record<"good" | "medium" | "bad" | "none", GoodAvailGeoRow>;
 }

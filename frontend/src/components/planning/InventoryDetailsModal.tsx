@@ -2,9 +2,9 @@
 
 import { type GoodAvailable, type GoodAvailGeoRow } from "@/lib/api";
 
-/** Detail view behind the Planning header's Good-Avail chips: the same fresh
- *  "ideal" inventory, split by bucket grade (good/medium/bad/no grade) x
- *  location (US+Canada, Europe, no location, rest of world). */
+/** Detail view behind the Planning header's Qual-Avail chips: the same fresh
+ *  "Qualified" inventory, split by bucket grade (good/medium/bad/no grade) x
+ *  location (USA, Canada, Europe, no location, rest of world). */
 export default function InventoryDetailsModal({
   data,
   loading,
@@ -23,16 +23,25 @@ export default function InventoryDetailsModal({
     { key: "none", label: "No grade", color: "text-zinc-500 dark:text-zinc-400" },
   ];
   const breakdown = data?.breakdown ?? null;
-  const other = (r: GoodAvailGeoRow) => Math.max(0, r.total - r.us_ca - r.europe - r.no_location);
-  const sum = (pick: (r: GoodAvailGeoRow) => number) =>
-    breakdown ? grades.reduce((s, g) => s + pick(breakdown[g.key]), 0) : 0;
+  const other = (r: GoodAvailGeoRow) =>
+    Math.max(0, r.total - r.usa - r.canada - r.europe - r.no_location);
+  const geoCols: { label: string; pick: (r: GoodAvailGeoRow) => number }[] = [
+    { label: "Total", pick: (r) => r.total },
+    { label: "USA", pick: (r) => r.usa },
+    { label: "Canada", pick: (r) => r.canada },
+    { label: "Europe", pick: (r) => r.europe },
+    { label: "No location", pick: (r) => r.no_location },
+    { label: "Other", pick: other },
+  ];
+  const sumGrades = (keys: ("good" | "medium" | "bad" | "none")[], pick: (r: GoodAvailGeoRow) => number) =>
+    breakdown ? keys.reduce((s, g) => s + pick(breakdown[g]), 0) : 0;
   const fmt = (n: number) => n.toLocaleString();
 
   const headline = [
-    { label: "Good Avail", value: data?.total },
-    { label: "Good US+CA", value: data?.us_ca },
-    { label: "Good EU", value: data?.europe },
-    { label: "Good No-loc", value: data?.no_location },
+    { label: "Qual Avail", value: data?.total },
+    { label: "Qual US+CA", value: data?.us_ca },
+    { label: "Qual EU", value: data?.europe },
+    { label: "Qual No-loc", value: data?.no_location },
   ];
 
   return (
@@ -40,7 +49,7 @@ export default function InventoryDetailsModal({
       className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800/60 rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800/60 rounded-2xl shadow-2xl w-full max-w-3xl overflow-hidden">
         {/* Header */}
         <div className="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800/40 flex items-center justify-between">
           <div>
@@ -79,11 +88,9 @@ export default function InventoryDetailsModal({
                 <thead>
                   <tr className="bg-zinc-50 dark:bg-zinc-900/60 text-[10px] text-zinc-500 uppercase tracking-wider">
                     <th className="px-3 py-2 text-left font-medium">Grade</th>
-                    <th className="px-3 py-2 text-right font-medium">Total</th>
-                    <th className="px-3 py-2 text-right font-medium">US + Canada</th>
-                    <th className="px-3 py-2 text-right font-medium">Europe</th>
-                    <th className="px-3 py-2 text-right font-medium">No location</th>
-                    <th className="px-3 py-2 text-right font-medium">Other</th>
+                    {geoCols.map((c) => (
+                      <th key={c.label} className="px-3 py-2 text-right font-medium">{c.label}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -92,21 +99,33 @@ export default function InventoryDetailsModal({
                     return (
                       <tr key={g.key} className="border-t border-zinc-200 dark:border-zinc-800/40">
                         <td className={`px-3 py-2 font-semibold ${g.color}`}>{g.label}</td>
-                        <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{fmt(r.total)}</td>
-                        <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-300">{fmt(r.us_ca)}</td>
-                        <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-300">{fmt(r.europe)}</td>
-                        <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-300">{fmt(r.no_location)}</td>
-                        <td className="px-3 py-2 text-right font-mono text-zinc-600 dark:text-zinc-300">{fmt(other(r))}</td>
+                        {geoCols.map((c, i) => (
+                          <td
+                            key={c.label}
+                            className={`px-3 py-2 text-right font-mono ${i === 0 ? "text-zinc-800 dark:text-zinc-200" : "text-zinc-600 dark:text-zinc-300"}`}
+                          >
+                            {fmt(c.pick(r))}
+                          </td>
+                        ))}
                       </tr>
                     );
                   })}
+                  {/* Qualified = Good + Medium: what the teal header numbers count */}
+                  <tr className="border-t border-zinc-200 dark:border-zinc-800/40 bg-teal-500/5">
+                    <td className="px-3 py-2 font-semibold text-teal-600 dark:text-teal-400">Qualified (G+M)</td>
+                    {geoCols.map((c) => (
+                      <td key={c.label} className="px-3 py-2 text-right font-mono font-bold text-teal-600 dark:text-teal-400">
+                        {fmt(sumGrades(["good", "medium"], c.pick))}
+                      </td>
+                    ))}
+                  </tr>
                   <tr className="border-t border-zinc-200 dark:border-zinc-800/40 bg-zinc-50 dark:bg-zinc-900/60">
                     <td className="px-3 py-2 font-semibold text-zinc-900 dark:text-zinc-100">All grades</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">{fmt(sum((r) => r.total))}</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">{fmt(sum((r) => r.us_ca))}</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">{fmt(sum((r) => r.europe))}</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">{fmt(sum((r) => r.no_location))}</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">{fmt(sum(other))}</td>
+                    {geoCols.map((c) => (
+                      <td key={c.label} className="px-3 py-2 text-right font-mono font-bold text-zinc-900 dark:text-zinc-100">
+                        {fmt(sumGrades(["good", "medium", "bad", "none"], c.pick))}
+                      </td>
+                    ))}
                   </tr>
                 </tbody>
               </table>
@@ -121,7 +140,7 @@ export default function InventoryDetailsModal({
 
           <div className="text-[10px] text-zinc-500 space-y-1">
             <p>Counts are never-invited, unassigned, non-blocklisted contacts; the disqualified bucket is excluded and each bucket&apos;s saved Segments employee range is applied where set.</p>
-            <p>The teal &quot;Good Avail&quot; header numbers = Good + Medium + No grade (Bad excluded). &quot;Other&quot; = located outside US+Canada and Europe.</p>
+            <p>The teal &quot;Qual&quot; numbers = Qualified = Good + Medium (Bad and No grade excluded). &quot;Other&quot; = located outside USA, Canada and Europe.</p>
           </div>
         </div>
       </div>

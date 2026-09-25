@@ -644,10 +644,11 @@ async def bucket_eligible_counts(
 # on a letters-only normalization of the effective location, so dirty values like
 # "'United States']" still classify. Turkey/Russia are intentionally left out of
 # Europe (transcontinental) — adjust here if you want them counted.
-_GOOD_GEO_US_CA = {
+_GOOD_GEO_USA = {
     "united states", "united states of america", "usa", "us", "u s a", "u s",
-    "america", "canada",
+    "america",
 }
+_GOOD_GEO_CANADA = {"canada"}
 _GOOD_GEO_EUROPE = {
     "united kingdom", "uk", "great britain", "england", "scotland", "wales",
     "northern ireland", "ireland", "germany", "france", "netherlands",
@@ -675,24 +676,26 @@ async def good_available_counts(
     refresh: bool = Query(False),
     _: str = Depends(require_auth),
 ):
-    """Fresh 'ideal' inventory for the Planning header.
+    """Fresh 'Qualified' inventory for the Planning header.
 
-    Counts claimable contacts in good/medium/unmarked buckets (excludes only
-    'bad' quality and the 'disqualified' bucket), with each bucket's saved
-    Statistics→Segments employee range applied where set — unknown-size contacts
-    are excluded when a range is set, and there's no size restriction when a
-    bucket has no range. 'Fresh' = never invited and not in-flight
-    (last_invited_at IS NULL, assigned_membership_count = 0), the same baseline
-    the bucket 'remaining' uses; blocklisted contacts are excluded.
+    The headline counts claimable contacts in good + medium buckets only
+    ("Qualified" — bad, ungraded and the 'disqualified' bucket excluded), with
+    each bucket's saved Statistics→Segments employee range applied where set —
+    unknown-size contacts are excluded when a range is set, and there's no size
+    restriction when a bucket has no range. 'Fresh' = never invited and not
+    in-flight (last_invited_at IS NULL, assigned_membership_count = 0), the
+    same baseline the bucket 'remaining' uses; blocklisted contacts are
+    excluded.
 
-    Returns the total plus geo splits (US+Canada, Europe, no-location). The three
-    splits are subsets of the total — the rest of the world (APAC/LATAM/etc.) is
-    in the total but in none of the three splits.
+    Returns the total plus geo splits (US+Canada combined, Europe, no-location).
+    The three splits are subsets of the total — the rest of the world
+    (APAC/LATAM/etc.) is in the total but in none of the three splits.
 
     Also returns `breakdown`: the same fresh-claimable counts split by bucket
-    grade (good/medium/bad/none) x geo, for the header's inventory-details
-    modal. The headline fields above stay the good+medium+unmarked subset;
-    `breakdown` additionally covers 'bad' buckets (disqualified stays excluded).
+    grade (good/medium/bad/none) x geo — with USA and Canada as separate
+    fields (us_ca kept as their sum) — for the header's inventory-details
+    modal, which additionally covers 'bad' and ungraded buckets (disqualified
+    stays excluded).
     """
     if refresh:
         # Planning's header refresh button: the operator is explicitly asking for
@@ -738,12 +741,11 @@ async def _good_available_rollup(*, allow_stale: bool = True):
 
 
 async def _build_good_available() -> dict:
-    """Build the Planning header's fresh 'ideal' inventory, in bucket-group chunks
-    so no single statement approaches the 120s cap. The scan covers every grade
-    (grouped by bucket quality x location for the details modal's `breakdown`);
-    the headline fields keep their original semantics — good+medium+unmarked,
-    disqualified excluded, per-bucket employee range applied — by summing only
-    the non-bad rows."""
+    """Build the Planning header's fresh 'Qualified' inventory, in bucket-group
+    chunks so no single statement approaches the 120s cap. The scan covers every
+    grade (grouped by bucket quality x location for the details modal's
+    `breakdown`); the headline fields are the Qualified subset — good + medium
+    only, disqualified excluded, per-bucket employee range applied."""
     from db.session import AsyncSessionLocal as _S
 
     # Per-bucket employee range: apply the saved range where set (excluding
@@ -788,7 +790,7 @@ async def _build_good_available() -> dict:
         chunks.append(cur)
 
     breakdown = {
-        g: {"total": 0, "us_ca": 0, "europe": 0, "no_location": 0}
+        g: {"total": 0, "usa": 0, "canada": 0, "europe": 0, "no_location": 0}
         for g in ("good", "medium", "bad", "none")
     }
     for chunk in chunks:
@@ -815,13 +817,21 @@ async def _build_good_available() -> dict:
             n = _norm_location(loc)
             if not n:
                 row["no_location"] += cnt
-            elif n in _GOOD_GEO_US_CA:
-                row["us_ca"] += cnt
+            elif n in _GOOD_GEO_USA:
+                row["usa"] += cnt
+            elif n in _GOOD_GEO_CANADA:
+                row["canada"] += cnt
             elif n in _GOOD_GEO_EUROPE:
                 row["europe"] += cnt
-    # Headline = the pre-breakdown good-available definition: everything but 'bad'.
+    # us_ca stays on every row: the header chips and headline read the combined
+    # figure even though the modal table shows USA and Canada separately.
+    for row in breakdown.values():
+        row["us_ca"] = row["usa"] + row["canada"]
+    # Headline = "Qualified": good + medium only. (Until 2026-09-25 unmarked
+    # buckets counted too; the operator redefined the teal numbers as the
+    # graded-usable subset.)
     headline = {
-        k: sum(breakdown[g][k] for g in ("good", "medium", "none"))
+        k: sum(breakdown[g][k] for g in ("good", "medium"))
         for k in ("total", "us_ca", "europe", "no_location")
     }
     return {**headline, "breakdown": breakdown}
