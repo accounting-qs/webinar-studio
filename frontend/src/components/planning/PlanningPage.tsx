@@ -28,6 +28,7 @@ import { ReleaseContactsModal } from "./ReleaseContactsModal";
 import { SkarpeCampaignModal, type SkarpeModalList } from "./SkarpeCampaignModal";
 import { SendersEditModal } from "./SendersEditModal";
 import { ListDistributionModal, type ListDistTarget } from "../statistics/ListDistributionModal";
+import InventoryDetailsModal from "./InventoryDetailsModal";
 
 /* ─── Copy link helper ────────────────────────────────────────────────── */
 
@@ -728,6 +729,7 @@ export function PlanningPage() {
    * they're still the best estimate — but the pills are visibly marked so a
    * failed recount never reads as "refreshed, nothing changed". */
   const [goodAvailError, setGoodAvailError] = useState<string | null>(null);
+  const [showInvDetails, setShowInvDetails] = useState(false);
   const [senders, setSenders] = useState<Sender[]>([]);
   const [editingSenders, setEditingSenders] = useState(false);
   const [webinars, setWebinars] = useState<Webinar[]>([]);
@@ -2409,6 +2411,16 @@ export function PlanningPage() {
                 </div>
               ))}
               <button
+                onClick={() => setShowInvDetails(true)}
+                title="Inventory details — grade and location distribution"
+                className="flex items-center justify-center px-2 py-1 rounded-md bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/40 text-zinc-500 hover:text-teal-500 hover:border-teal-500/40 transition-colors"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <path d="M12 16v-4M12 8h.01"/>
+                </svg>
+              </button>
+              <button
                 onClick={handleRefreshStats}
                 disabled={refreshingStats}
                 title={refreshingStats ? "Refreshing inventory…" : "Recount inventory (Good Available takes a while)"}
@@ -4045,6 +4057,16 @@ export function PlanningPage() {
       {/* ── List/bucket distribution modal ─────────────────────────── */}
       {listDist && (
         <ListDistributionModal target={listDist} onClose={() => setListDist(null)} />
+      )}
+
+      {/* ── Inventory details modal (grade x location distribution) ──── */}
+      {showInvDetails && (
+        <InventoryDetailsModal
+          data={goodAvail}
+          loading={loadingGoodAvail}
+          error={goodAvailError}
+          onClose={() => setShowInvDetails(false)}
+        />
       )}
 
       {/* ── New Webinar Modal ──────────────────────────────────────── */}

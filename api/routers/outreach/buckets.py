@@ -688,6 +688,11 @@ async def good_available_counts(
     Returns the total plus geo splits (US+Canada, Europe, no-location). The three
     splits are subsets of the total — the rest of the world (APAC/LATAM/etc.) is
     in the total but in none of the three splits.
+
+    Also returns `breakdown`: the same fresh-claimable counts split by bucket
+    grade (good/medium/bad/none) x geo, for the header's inventory-details
+    modal. The headline fields above stay the good+medium+unmarked subset;
+    `breakdown` additionally covers 'bad' buckets (disqualified stays excluded).
     """
     if refresh:
         # Planning's header refresh button: the operator is explicitly asking for
@@ -734,10 +739,11 @@ async def _good_available_rollup(*, allow_stale: bool = True):
 
 async def _build_good_available() -> dict:
     """Build the Planning header's fresh 'ideal' inventory, in bucket-group chunks
-    so no single statement approaches the 120s cap. Semantics are unchanged from
-    the one-shot query this replaces: the bucket join, the quality/disqualified
-    exclusions and the per-bucket employee range all still apply — the only
-    difference is that the scan is split by bucket_id and merged in process."""
+    so no single statement approaches the 120s cap. The scan covers every grade
+    (grouped by bucket quality x location for the details modal's `breakdown`);
+    the headline fields keep their original semantics — good+medium+unmarked,
+    disqualified excluded, per-bucket employee range applied — by summing only
+    the non-bad rows."""
     from db.session import AsyncSessionLocal as _S
 
     # Per-bucket employee range: apply the saved range where set (excluding
@@ -755,13 +761,14 @@ async def _build_good_available() -> dict:
         sa_func.nullif(sa_func.trim(Contact.country), ""),
         sa_func.nullif(sa_func.trim(Contact.list_location), ""),
     )
+    # All grades qualify for the scan — the per-grade breakdown needs 'bad' too.
+    # The headline good-available fields are summed from the non-bad rows below,
+    # so their semantics are unchanged.
     qualifying = (
         select(OutreachBucket.id, sa_func.greatest(OutreachBucket.remaining_contacts, 1))
         .where(
             OutreachBucket.user_id == LLOYD_USER_ID,
             OutreachBucket.deleted_at.is_(None),
-            # good + medium + unmarked → exclude only 'bad'
-            or_(OutreachBucket.quality.is_(None), OutreachBucket.quality != "bad"),
             sa_func.lower(OutreachBucket.name) != "disqualified",
         )
     )
@@ -780,11 +787,14 @@ async def _build_good_available() -> dict:
     if cur:
         chunks.append(cur)
 
-    total = us_ca = europe = no_location = 0
+    breakdown = {
+        g: {"total": 0, "us_ca": 0, "europe": 0, "no_location": 0}
+        for g in ("good", "medium", "bad", "none")
+    }
     for chunk in chunks:
         async with _S() as s0:
             rows = (await s0.execute(
-                select(loc_expr.label("loc"), sa_func.count())
+                select(OutreachBucket.quality, loc_expr.label("loc"), sa_func.count())
                 .select_from(Contact)
                 .join(OutreachBucket, OutreachBucket.id == Contact.bucket_id)
                 .where(
@@ -796,19 +806,25 @@ async def _build_good_available() -> dict:
                     Contact.assigned_membership_count == 0,
                     emp_ok,
                 )
-                .group_by(loc_expr)
+                .group_by(OutreachBucket.quality, loc_expr)
             )).all()
-        for loc, cnt in rows:
+        for quality, loc, cnt in rows:
             cnt = int(cnt or 0)
-            total += cnt
+            row = breakdown[quality if quality in ("good", "medium", "bad") else "none"]
+            row["total"] += cnt
             n = _norm_location(loc)
             if not n:
-                no_location += cnt
+                row["no_location"] += cnt
             elif n in _GOOD_GEO_US_CA:
-                us_ca += cnt
+                row["us_ca"] += cnt
             elif n in _GOOD_GEO_EUROPE:
-                europe += cnt
-    return {"total": total, "us_ca": us_ca, "europe": europe, "no_location": no_location}
+                row["europe"] += cnt
+    # Headline = the pre-breakdown good-available definition: everything but 'bad'.
+    headline = {
+        k: sum(breakdown[g][k] for g in ("good", "medium", "none"))
+        for k in ("total", "us_ca", "europe", "no_location")
+    }
+    return {**headline, "breakdown": breakdown}
 
 
 @router.post("/buckets", status_code=201)

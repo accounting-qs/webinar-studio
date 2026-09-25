@@ -1123,7 +1123,12 @@ export async function fetchBucketEligible(
   return { remaining: data.buckets ?? {}, totals: data.totals ?? {} };
 }
 
-export interface GoodAvailable { total: number; us_ca: number; europe: number; no_location: number; }
+export interface GoodAvailGeoRow { total: number; us_ca: number; europe: number; no_location: number; }
+/** Same fresh-claimable counts split by bucket grade ('none' = no grade set);
+ *  the 'bad' grade is in the breakdown but not in the headline fields. */
+export interface GoodAvailable extends GoodAvailGeoRow {
+  breakdown?: Record<"good" | "medium" | "bad" | "none", GoodAvailGeoRow>;
+}
 
 /** Fresh "ideal" inventory for the Planning header: claimable contacts in
  *  good/medium/unmarked buckets (excludes 'bad' + the 'disqualified' bucket),
